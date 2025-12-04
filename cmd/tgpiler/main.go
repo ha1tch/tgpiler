@@ -7,8 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-
-	"github.com/ha1tch/tgpiler/transpiler"
 )
 
 const version = "0.1.0"
@@ -22,20 +20,20 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 
 	var (
-		inputDir    = fs.String("d", "", "Read all .sql files from directory")
-		inputDirL   = fs.String("dir", "", "Read all .sql files from directory")
-		output      = fs.String("o", "", "Write to single output file")
-		outputL     = fs.String("output", "", "Write to single output file")
-		outDir      = fs.String("O", "", "Write to output directory (creates if needed)")
-		outDirL     = fs.String("outdir", "", "Write to output directory (creates if needed)")
-		force       = fs.Bool("f", false, "Allow overwriting existing files")
-		forceL      = fs.Bool("force", false, "Allow overwriting existing files")
-		packageName = fs.String("p", "main", "Package name for generated code")
-		packageNameL= fs.String("pkg", "main", "Package name for generated code")
-		showHelp    = fs.Bool("h", false, "Show help")
-		helpL       = fs.Bool("help", false, "Show help")
-		showVer     = fs.Bool("v", false, "Show version")
-		versionL    = fs.Bool("version", false, "Show version")
+		inputDir     = fs.String("d", "", "Read all .sql files from directory")
+		inputDirL    = fs.String("dir", "", "Read all .sql files from directory")
+		output       = fs.String("o", "", "Write to single output file")
+		outputL      = fs.String("output", "", "Write to single output file")
+		outDir       = fs.String("O", "", "Write to output directory (creates if needed)")
+		outDirL      = fs.String("outdir", "", "Write to output directory (creates if needed)")
+		force        = fs.Bool("f", false, "Allow overwriting existing files")
+		forceL       = fs.Bool("force", false, "Allow overwriting existing files")
+		packageName  = fs.String("p", "main", "Package name for generated code")
+		packageNameL = fs.String("pkg", "main", "Package name for generated code")
+		showHelp     = fs.Bool("h", false, "Show help")
+		helpL        = fs.Bool("help", false, "Show help")
+		showVer      = fs.Bool("v", false, "Show version")
+		versionL     = fs.Bool("version", false, "Show version")
 	)
 
 	fs.Usage = func() {
