@@ -208,8 +208,8 @@ tgpiler/
 ```
 
 ## License
-
-MIT License - see [LICENSE](LICENSE)
+GNU GENERAL PUBLIC LICENSE VERSION 3.0
+https://github.com/ha1tch/LICENSE
 
 ## Contributing
 
