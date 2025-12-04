@@ -173,6 +173,24 @@ func (t *transpiler) transpileInfixExpression(e *ast.InfixExpression) (string, e
 				}
 			}
 		}
+
+		// Handle string comparison with NULL - use empty string instead
+		if leftType.isString {
+			if _, ok := e.Right.(*ast.NullLiteral); ok {
+				if op == "=" {
+					return fmt.Sprintf("(%s == \"\")", left), nil
+				}
+				return fmt.Sprintf("(%s != \"\")", left), nil
+			}
+		}
+		if rightType.isString {
+			if _, ok := e.Left.(*ast.NullLiteral); ok {
+				if op == "=" {
+					return fmt.Sprintf("(%s == \"\")", right), nil
+				}
+				return fmt.Sprintf("(%s != \"\")", right), nil
+			}
+		}
 	}
 
 	// Check if either operand is decimal
@@ -193,8 +211,8 @@ func (t *transpiler) transpileInfixExpression(e *ast.InfixExpression) (string, e
 	// But Go's untyped integer literals adapt automatically, so only cast
 	// when both operands are typed expressions with different types
 	isArithmetic := op == "+" || op == "-" || op == "*" || op == "/" || op == "%"
-	_, leftIsLiteral := e.Left.(*ast.IntegerLiteral)
-	_, rightIsLiteral := e.Right.(*ast.IntegerLiteral)
+	leftIsLiteral := isIntegerLiteral(e.Left)
+	rightIsLiteral := isIntegerLiteral(e.Right)
 
 	if isArithmetic && leftType.isNumeric && rightType.isNumeric && !leftIsLiteral && !rightIsLiteral {
 		// Both are typed expressions - promote to the larger type
@@ -405,7 +423,7 @@ func (t *transpiler) inferType(expr ast.Expression) *typeInfo {
 			funcName := normaliseTypeName(id.Value)
 			// For math functions, return type matches argument type
 			switch funcName {
-			case "ABS", "CEILING", "CEIL", "FLOOR", "ROUND":
+			case "ABS", "CEILING", "CEIL", "FLOOR", "ROUND", "POWER", "SQRT":
 				if len(e.Arguments) > 0 {
 					argType := t.inferType(e.Arguments[0])
 					if argType.isDecimal {
@@ -481,6 +499,23 @@ func (t *transpiler) promoteNumericType(type1, type2 string) string {
 		return type1
 	}
 	return type2
+}
+
+// isIntegerLiteral checks if an expression is an integer literal,
+// including negative literals like -1 which are PrefixExpressions.
+func isIntegerLiteral(expr ast.Expression) bool {
+	if _, ok := expr.(*ast.IntegerLiteral); ok {
+		return true
+	}
+	// Check for unary minus on an integer literal (e.g., -1)
+	if prefix, ok := expr.(*ast.PrefixExpression); ok {
+		if prefix.Operator == "-" {
+			if _, ok := prefix.Right.(*ast.IntegerLiteral); ok {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (t *transpiler) transpileFunctionCall(fc *ast.FunctionCall) (string, error) {
@@ -1065,6 +1100,15 @@ func (t *transpiler) transpileIsNullExpression(e *ast.IsNullExpression) (string,
 	expr, err := t.transpileExpression(e.Expr)
 	if err != nil {
 		return "", err
+	}
+
+	// For string types, NULL check becomes empty string check
+	exprType := t.inferType(e.Expr)
+	if exprType.isString {
+		if e.Not {
+			return fmt.Sprintf("(%s != \"\")", expr), nil
+		}
+		return fmt.Sprintf("(%s == \"\")", expr), nil
 	}
 
 	if e.Not {

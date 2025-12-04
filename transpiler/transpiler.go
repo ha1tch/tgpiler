@@ -27,6 +27,7 @@ type transpiler struct {
 	output        strings.Builder
 	indent        int
 	inProcBody    bool
+	inTryBlock    bool // Track if we're inside a TRY block (anonymous function)
 	symbols       *symbolTable
 	outputParams  []*ast.ParameterDef
 	hasReturnCode bool
@@ -381,14 +382,16 @@ func (t *transpiler) transpileDeclare(decl *ast.DeclareStatement) (string, error
 			ti := t.symbols.lookup(varName)
 
 			// Handle NULL initialisation for value types
-			if _, isNull := v.Value.(*ast.NullLiteral); isNull && ti != nil {
+			_, isNull := v.Value.(*ast.NullLiteral)
+			if isNull && ti != nil {
 				valExpr = t.zeroValueForType(ti)
 			}
 
-			if ti != nil && ti.isDecimal {
+			// Only call ensureDecimal/ensureBool if we didn't already handle NULL
+			if ti != nil && ti.isDecimal && !isNull {
 				valExpr = t.ensureDecimal(v.Value, valExpr)
 			}
-			if ti != nil && ti.isBool {
+			if ti != nil && ti.isBool && !isNull {
 				valExpr = t.ensureBool(v.Value, valExpr)
 			}
 			parts = append(parts, fmt.Sprintf("%svar %s %s = %s", prefix, varName, goType, valExpr))
@@ -441,14 +444,16 @@ func (t *transpiler) transpileSet(set *ast.SetStatement) (string, error) {
 	varType := t.inferType(set.Variable)
 
 	// Handle NULL assignment to value types (which can't be nil in Go)
-	if _, isNull := set.Value.(*ast.NullLiteral); isNull {
+	_, isNull := set.Value.(*ast.NullLiteral)
+	if isNull {
 		valExpr = t.zeroValueForType(varType)
 	}
 
-	if varType.isDecimal {
+	// Only call ensureDecimal/ensureBool if we didn't already handle NULL
+	if varType.isDecimal && !isNull {
 		valExpr = t.ensureDecimal(set.Value, valExpr)
 	}
-	if varType.isBool {
+	if varType.isBool && !isNull {
 		valExpr = t.ensureBool(set.Value, valExpr)
 	}
 
@@ -650,7 +655,9 @@ func (t *transpiler) transpileTryCatch(tc *ast.TryCatchStatement) (string, error
 	out.WriteString(t.indentStr())
 	out.WriteString("}()\n")
 
-	// TRY block
+	// TRY block - set flag to handle RETURN statements correctly
+	wasInTryBlock := t.inTryBlock
+	t.inTryBlock = true
 	if tc.TryBlock != nil {
 		for _, stmt := range tc.TryBlock.Statements {
 			s, err := t.transpileStatement(stmt)
@@ -664,6 +671,7 @@ func (t *transpiler) transpileTryCatch(tc *ast.TryCatchStatement) (string, error
 			}
 		}
 	}
+	t.inTryBlock = wasInTryBlock
 
 	t.indent--
 	out.WriteString(t.indentStr())
@@ -673,6 +681,12 @@ func (t *transpiler) transpileTryCatch(tc *ast.TryCatchStatement) (string, error
 }
 
 func (t *transpiler) transpileReturn(ret *ast.ReturnStatement) (string, error) {
+	// Inside a TRY block (anonymous function), just return to exit the IIFE
+	// The actual return values are set via named return parameters
+	if t.inTryBlock {
+		return "return", nil
+	}
+
 	// If we have output params or return code tracking, use buildReturnStatement
 	if len(t.outputParams) > 0 || t.hasReturnCode {
 		return t.buildReturnStatement(ret.Value), nil
