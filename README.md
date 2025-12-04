@@ -208,15 +208,16 @@ tgpiler/
 ```
 ## Author
 This is Copyright (C) 2025 haitch
+
 h@ual.fi
 
 ## License
 GNU GENERAL PUBLIC LICENSE VERSION 3.0
+
 https://github.com/ha1tch/tgpiler?tab=GPL-3.0-1-ov-file#readme
 
 # Disclaimer
-This is a proof-of-concept. It is released for educational purposes only, don't use in production.
+- This is a proof-of-concept. It is released for educational purposes only, don't use in production.
 
 ## Related Projects
-
 - [tsqlparser](https://github.com/ha1tch/tsqlparser) - The T-SQL parser used by this project
