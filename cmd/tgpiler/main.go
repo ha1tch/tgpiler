@@ -24,6 +24,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	var (
 		inputDir     = fs.String("d", "", "Read all .sql files from directory")
 		inputDirL    = fs.String("dir", "", "Read all .sql files from directory")
+		readStdin    = fs.Bool("s", false, "Read from stdin")
+		readStdinL   = fs.Bool("stdin", false, "Read from stdin")
 		output       = fs.String("o", "", "Write to single output file")
 		outputL      = fs.String("output", "", "Write to single output file")
 		outDir       = fs.String("O", "", "Write to output directory (creates if needed)")
@@ -49,6 +51,9 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	// Coalesce short and long flags
 	if *inputDirL != "" {
 		*inputDir = *inputDirL
+	}
+	if *readStdinL {
+		*readStdin = true
 	}
 	if *outputL != "" {
 		*output = *outputL
@@ -90,8 +95,14 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		inputFile = remainingArgs[0]
 	}
 
+	// Show help if no input specified
+	if inputFile == "" && *inputDir == "" && !*readStdin {
+		printUsage(stdout)
+		return 0
+	}
+
 	// Validate flag combinations
-	if err := validateFlags(inputFile, *inputDir, *output, *outDir); err != nil {
+	if err := validateFlags(inputFile, *inputDir, *readStdin, *output, *outDir); err != nil {
 		fmt.Fprintf(stderr, "error: %v\n", err)
 		return 2
 	}
@@ -100,6 +111,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	cfg := &config{
 		inputFile:   inputFile,
 		inputDir:    *inputDir,
+		readStdin:   *readStdin,
 		output:      *output,
 		outDir:      *outDir,
 		force:       *force,
@@ -120,6 +132,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 type config struct {
 	inputFile   string
 	inputDir    string
+	readStdin   bool
 	output      string
 	outDir      string
 	force       bool
@@ -129,10 +142,20 @@ type config struct {
 	stderr      io.Writer
 }
 
-func validateFlags(inputFile, inputDir, output, outDir string) error {
+func validateFlags(inputFile, inputDir string, readStdin bool, output, outDir string) error {
 	// Check for conflicting input modes
-	if inputFile != "" && inputDir != "" {
-		return fmt.Errorf("cannot specify both input file and --dir")
+	inputModes := 0
+	if inputFile != "" {
+		inputModes++
+	}
+	if inputDir != "" {
+		inputModes++
+	}
+	if readStdin {
+		inputModes++
+	}
+	if inputModes > 1 {
+		return fmt.Errorf("cannot combine multiple input modes (file, --dir, --stdin)")
 	}
 
 	// outDir requires inputDir
@@ -154,8 +177,10 @@ func execute(cfg *config) error {
 		return executeDirectory(cfg)
 	case cfg.inputFile != "":
 		return executeSingleFile(cfg)
-	default:
+	case cfg.readStdin:
 		return executeStdin(cfg)
+	default:
+		return fmt.Errorf("no input specified")
 	}
 }
 
@@ -258,15 +283,18 @@ func writeOutput(cfg *config, inputPath, content string) error {
 	return nil
 }
 
+
 func printUsage(w io.Writer) {
 	fmt.Fprint(w, `tgpiler - T-SQL to Go transpiler
 
 Usage:
-  tgpiler [options] [input.sql]
+  tgpiler [options] <input.sql>
+  tgpiler [options] -s < input.sql
+  tgpiler [options] -d <path>
 
 Input (mutually exclusive):
-  (no argument)         Read from stdin
   <file.sql>            Read single file
+  -s, --stdin           Read from stdin
   -d, --dir <path>      Read all .sql files from directory
 
 Output (mutually exclusive):
@@ -281,12 +309,14 @@ Options:
   -v, --version         Show version
 
 Examples:
-  tgpiler < input.sql                    # stdin to stdout
-  tgpiler input.sql                      # file to stdout
-  tgpiler input.sql -o output.go         # file to file
-  tgpiler -d ./sql -O ./go               # directory to directory
-  tgpiler -d ./sql -O ./go -f            # with overwrite
-  tgpiler -p mypackage input.sql         # custom package name
+  tgpiler input.sql                       # file to stdout
+  tgpiler input.sql -o output.go          # file to file
+  tgpiler -s < input.sql                  # stdin to stdout
+  cat input.sql | tgpiler -s              # pipe to stdout
+  tgpiler -s -o output.go < input.sql     # stdin to file
+  tgpiler -d ./sql -O ./go                # directory to directory
+  tgpiler -d ./sql -O ./go -f             # with overwrite
+  tgpiler -p mypackage input.sql          # custom package name
 
 Exit codes:
   0  Success

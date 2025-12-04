@@ -27,14 +27,17 @@ make build
 - [ha1tch/tsqlparser](https://github.com/ha1tch/tsqlparser) - T-SQL parser
 - [shopspring/decimal](https://github.com/shopspring/decimal) - Arbitrary-precision decimals (for generated code using DECIMAL/MONEY types)
 
+
 ## Usage
 
 ```
-tgpiler [options] [input.sql]
+tgpiler [options] <input.sql>
+tgpiler [options] -s < input.sql
+tgpiler [options] -d <path>
 
 Input (mutually exclusive):
-  (no argument)         Read from stdin
   <file.sql>            Read single file
+  -s, --stdin           Read from stdin
   -d, --dir <path>      Read all .sql files from directory
 
 Output (mutually exclusive):
@@ -43,7 +46,7 @@ Output (mutually exclusive):
   -O, --outdir <path>   Write to directory (creates if needed)
 
 Options:
-  -p, --pkg <name>      Package name for generated code (default: main)
+  -p, --pkg <n>      Package name for generated code (default: main)
   -f, --force           Allow overwriting existing files
   -h, --help            Show help
   -v, --version         Show version
@@ -58,11 +61,12 @@ tgpiler input.sql
 # Transpile with custom package name
 tgpiler -p mypackage input.sql -o output.go
 
+# Read from stdin
+tgpiler -s < input.sql
+cat input.sql | tgpiler -s
+
 # Transpile directory of SQL files
 tgpiler -d ./sql -O ./go -p procedures
-
-# Pipe from stdin
-cat input.sql | tgpiler -p handlers > output.go
 ```
 
 ## Testing
