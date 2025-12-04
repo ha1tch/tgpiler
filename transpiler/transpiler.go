@@ -164,7 +164,7 @@ func (t *transpiler) transpileCreateProcedure(proc *ast.CreateProcedureStatement
 	}
 
 	// Function signature
-	funcName := goIdentifier(procName)
+	funcName := goExportedIdentifier(procName)
 	out.WriteString(fmt.Sprintf("func %s(", funcName))
 	out.WriteString(strings.Join(inputParams, ", "))
 	out.WriteString(")")

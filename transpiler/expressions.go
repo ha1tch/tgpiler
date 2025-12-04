@@ -568,8 +568,8 @@ func (t *transpiler) transpileFunctionCall(fc *ast.FunctionCall) (string, error)
 		return "0", nil
 	}
 
-	// Default: output as-is (unknown function)
-	return fmt.Sprintf("%s(%s)", goIdentifier(funcName), strings.Join(args, ", ")), nil
+	// Default: output as-is (unknown function) - use exported name as it's likely a procedure
+	return fmt.Sprintf("%s(%s)", goExportedIdentifier(funcName), strings.Join(args, ", ")), nil
 }
 
 func (t *transpiler) transpileDateAdd(interval, number, date string) (string, error) {

@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/ha1tch/tgpiler/transpiler"
 )
 
 const version = "0.1.0"
