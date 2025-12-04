@@ -209,7 +209,8 @@ tgpiler/
 
 ## License
 GNU GENERAL PUBLIC LICENSE VERSION 3.0
-https://github.com/ha1tch/LICENSE
+
+https://github.com/ha1tch/tgpiler?tab=GPL-3.0-1-ov-file#readme
 
 ## Contributing
 
