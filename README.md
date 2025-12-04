@@ -206,15 +206,16 @@ tgpiler/
 ├── examples/           # Example T-SQL files
 └── README.md
 ```
+## Author
+This is Copyright (C) 2025 haitch
+h@ual.fi
 
 ## License
 GNU GENERAL PUBLIC LICENSE VERSION 3.0
-
 https://github.com/ha1tch/tgpiler?tab=GPL-3.0-1-ov-file#readme
 
-## Contributing
-
-This is a proof-of-concept. Issues and pull requests are welcome.
+# Disclaimer
+This is a proof-of-concept. It is released for educational purposes only, don't use in production.
 
 ## Related Projects
 
