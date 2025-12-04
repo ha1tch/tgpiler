@@ -317,6 +317,32 @@ func (t *transpiler) buildReturnStatement(returnValue ast.Expression) string {
 	return "return " + strings.Join(parts, ", ")
 }
 
+// zeroValueForType returns the Go zero value for a given type.
+// Used when transpiling NULL assignments to value types.
+func (t *transpiler) zeroValueForType(ti *typeInfo) string {
+	if ti == nil {
+		return "nil"
+	}
+	switch ti.goType {
+	case "int32", "int16", "int64", "uint8", "int":
+		return "0"
+	case "float64", "float32":
+		return "0.0"
+	case "string":
+		return `""`
+	case "bool":
+		return "false"
+	case "time.Time":
+		t.imports["time"] = true
+		return "time.Time{}"
+	case "decimal.Decimal":
+		t.imports["github.com/shopspring/decimal"] = true
+		return "decimal.Zero"
+	default:
+		return "nil"
+	}
+}
+
 func (t *transpiler) transpileDeclare(decl *ast.DeclareStatement) (string, error) {
 	var parts []string
 
@@ -351,15 +377,28 @@ func (t *transpiler) transpileDeclare(decl *ast.DeclareStatement) (string, error
 			if err != nil {
 				return "", err
 			}
-			// Check if we need to convert the initialiser to decimal
+			// Check if we need to convert the initialiser to match the variable's type
 			ti := t.symbols.lookup(varName)
+
+			// Handle NULL initialisation for value types
+			if _, isNull := v.Value.(*ast.NullLiteral); isNull && ti != nil {
+				valExpr = t.zeroValueForType(ti)
+			}
+
 			if ti != nil && ti.isDecimal {
 				valExpr = t.ensureDecimal(v.Value, valExpr)
+			}
+			if ti != nil && ti.isBool {
+				valExpr = t.ensureBool(v.Value, valExpr)
 			}
 			parts = append(parts, fmt.Sprintf("%svar %s %s = %s", prefix, varName, goType, valExpr))
 		} else {
 			parts = append(parts, fmt.Sprintf("%svar %s %s", prefix, varName, goType))
 		}
+
+		// Add blank assignment to prevent "declared and not used" errors
+		// This is a common Go idiom for variables that may not be used in all code paths
+		parts = append(parts, fmt.Sprintf("_ = %s", varName))
 	}
 
 	return strings.Join(parts, "\n"+t.indentStr()), nil
@@ -400,8 +439,17 @@ func (t *transpiler) transpileSet(set *ast.SetStatement) (string, error) {
 
 	// Check if we need to convert the value to match the variable's type
 	varType := t.inferType(set.Variable)
+
+	// Handle NULL assignment to value types (which can't be nil in Go)
+	if _, isNull := set.Value.(*ast.NullLiteral); isNull {
+		valExpr = t.zeroValueForType(varType)
+	}
+
 	if varType.isDecimal {
 		valExpr = t.ensureDecimal(set.Value, valExpr)
+	}
+	if varType.isBool {
+		valExpr = t.ensureBool(set.Value, valExpr)
 	}
 
 	return fmt.Sprintf("%s%s = %s", prefix, varExpr, valExpr), nil

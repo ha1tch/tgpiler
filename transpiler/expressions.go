@@ -110,6 +110,14 @@ func (t *transpiler) transpilePrefixExpression(e *ast.PrefixExpression) (string,
 		op = "^" // Bitwise NOT in Go
 	}
 
+	// Handle unary minus on decimal types
+	if op == "-" {
+		rightType := t.inferType(e.Right)
+		if rightType.isDecimal {
+			return fmt.Sprintf("%s.Neg()", right), nil
+		}
+	}
+
 	return fmt.Sprintf("(%s%s)", op, right), nil
 }
 
@@ -129,9 +137,94 @@ func (t *transpiler) transpileInfixExpression(e *ast.InfixExpression) (string, e
 
 	op := strings.ToUpper(e.Operator)
 
+	// Handle BIT/bool comparisons with 0 or 1
+	// @Flag = 1 -> flag, @Flag = 0 -> !flag
+	// @Flag <> 1 -> !flag, @Flag <> 0 -> flag
+	if op == "=" || op == "<>" || op == "!=" {
+		if leftType.isBool {
+			if lit, ok := e.Right.(*ast.IntegerLiteral); ok {
+				if lit.Value == 1 {
+					if op == "=" {
+						return left, nil
+					}
+					return fmt.Sprintf("!%s", left), nil
+				}
+				if lit.Value == 0 {
+					if op == "=" {
+						return fmt.Sprintf("!%s", left), nil
+					}
+					return left, nil
+				}
+			}
+		}
+		if rightType.isBool {
+			if lit, ok := e.Left.(*ast.IntegerLiteral); ok {
+				if lit.Value == 1 {
+					if op == "=" {
+						return right, nil
+					}
+					return fmt.Sprintf("!%s", right), nil
+				}
+				if lit.Value == 0 {
+					if op == "=" {
+						return fmt.Sprintf("!%s", right), nil
+					}
+					return right, nil
+				}
+			}
+		}
+	}
+
 	// Check if either operand is decimal
 	if leftType.isDecimal || rightType.isDecimal {
 		return t.transpileDecimalInfix(left, right, e.Left, e.Right, leftType, rightType, op)
+	}
+
+	// Handle T-SQL BIT toggle pattern: 1 - @BitVar becomes !bitVar
+	// This is a common idiom for toggling a BIT value
+	if op == "-" {
+		if leftLit, ok := e.Left.(*ast.IntegerLiteral); ok && leftLit.Value == 1 && rightType.isBool {
+			return fmt.Sprintf("!%s", right), nil
+		}
+	}
+
+	// Handle mixed integer types in arithmetic operations
+	// Go requires explicit conversion; T-SQL does implicit promotion
+	// But Go's untyped integer literals adapt automatically, so only cast
+	// when both operands are typed expressions with different types
+	isArithmetic := op == "+" || op == "-" || op == "*" || op == "/" || op == "%"
+	_, leftIsLiteral := e.Left.(*ast.IntegerLiteral)
+	_, rightIsLiteral := e.Right.(*ast.IntegerLiteral)
+
+	if isArithmetic && leftType.isNumeric && rightType.isNumeric && !leftIsLiteral && !rightIsLiteral {
+		// Both are typed expressions - promote to the larger type
+		if leftType.goType != rightType.goType {
+			targetType := t.promoteNumericType(leftType.goType, rightType.goType)
+			if targetType != leftType.goType {
+				left = fmt.Sprintf("%s(%s)", targetType, left)
+			}
+			if targetType != rightType.goType {
+				right = fmt.Sprintf("%s(%s)", targetType, right)
+			}
+		}
+	}
+
+	// Handle time.Time comparisons - Go doesn't support comparison operators on structs
+	if leftType.isDateTime || rightType.isDateTime {
+		switch op {
+		case "=":
+			return fmt.Sprintf("%s.Equal(%s)", left, right), nil
+		case "<>", "!=":
+			return fmt.Sprintf("!%s.Equal(%s)", left, right), nil
+		case "<":
+			return fmt.Sprintf("%s.Before(%s)", left, right), nil
+		case ">":
+			return fmt.Sprintf("%s.After(%s)", left, right), nil
+		case "<=":
+			return fmt.Sprintf("!%s.After(%s)", left, right), nil
+		case ">=":
+			return fmt.Sprintf("!%s.Before(%s)", left, right), nil
+		}
 	}
 
 	// Standard operator mapping for non-decimal types
@@ -224,6 +317,35 @@ func (t *transpiler) ensureDecimal(expr ast.Expression, transpiled string) strin
 	return fmt.Sprintf("decimal.NewFromFloat(float64(%s))", transpiled)
 }
 
+// ensureBool converts T-SQL BIT semantics (0/1) to Go bool (false/true).
+func (t *transpiler) ensureBool(expr ast.Expression, transpiled string) string {
+	// Integer literal 0 -> false, 1 -> true
+	if lit, ok := expr.(*ast.IntegerLiteral); ok {
+		if lit.Value == 0 {
+			return "false"
+		}
+		if lit.Value == 1 {
+			return "true"
+		}
+		// Other integer values: treat non-zero as true (T-SQL behaviour)
+		return fmt.Sprintf("(%s != 0)", transpiled)
+	}
+
+	// Already a bool variable/expression
+	ti := t.inferType(expr)
+	if ti.isBool {
+		return transpiled
+	}
+
+	// Numeric expression: convert to bool comparison
+	if ti.isNumeric {
+		return fmt.Sprintf("(%s != 0)", transpiled)
+	}
+
+	// Default: assume it's usable as-is (may be a comparison result)
+	return transpiled
+}
+
 // inferType attempts to determine the type of an expression.
 func (t *transpiler) inferType(expr ast.Expression) *typeInfo {
 	switch e := expr.(type) {
@@ -247,6 +369,9 @@ func (t *transpiler) inferType(expr ast.Expression) *typeInfo {
 		return &typeInfo{goType: "interface{}"}
 	case *ast.MoneyLiteral:
 		return &typeInfo{goType: "decimal.Decimal", isDecimal: true, isNumeric: true}
+	case *ast.PrefixExpression:
+		// Unary operators preserve the type of their operand
+		return t.inferType(e.Right)
 	case *ast.InfixExpression:
 		// For arithmetic, result type depends on operands
 		leftType := t.inferType(e.Left)
@@ -259,13 +384,35 @@ func (t *transpiler) inferType(expr ast.Expression) *typeInfo {
 		if leftType.goType == "float64" || rightType.goType == "float64" {
 			return &typeInfo{goType: "float64", isNumeric: true}
 		}
-		// Otherwise, keep as numeric
+		// For integers, promote to the larger type
 		if leftType.isNumeric && rightType.isNumeric {
-			return &typeInfo{goType: "int64", isNumeric: true}
+			// Integer literals adapt to the other operand's type
+			_, leftIsLiteral := e.Left.(*ast.IntegerLiteral)
+			_, rightIsLiteral := e.Right.(*ast.IntegerLiteral)
+			if leftIsLiteral && !rightIsLiteral {
+				return rightType
+			}
+			if rightIsLiteral && !leftIsLiteral {
+				return leftType
+			}
+			// Both typed - use promoted type
+			promoted := t.promoteNumericType(leftType.goType, rightType.goType)
+			return &typeInfo{goType: promoted, isNumeric: true}
 		}
 	case *ast.FunctionCall:
 		// Some functions have known return types
 		if id, ok := e.Function.(*ast.Identifier); ok {
+			funcName := normaliseTypeName(id.Value)
+			// For math functions, return type matches argument type
+			switch funcName {
+			case "ABS", "CEILING", "CEIL", "FLOOR", "ROUND":
+				if len(e.Arguments) > 0 {
+					argType := t.inferType(e.Arguments[0])
+					if argType.isDecimal {
+						return &typeInfo{goType: "decimal.Decimal", isDecimal: true, isNumeric: true}
+					}
+				}
+			}
 			return t.inferFunctionReturnType(id.Value)
 		}
 	case *ast.CastExpression:
@@ -281,16 +428,16 @@ func (t *transpiler) inferType(expr ast.Expression) *typeInfo {
 // inferFunctionReturnType returns type info for known T-SQL functions.
 func (t *transpiler) inferFunctionReturnType(funcName string) *typeInfo {
 	switch normaliseTypeName(funcName) {
-	case "LEN", "DATALENGTH", "CHARINDEX", "PATINDEX":
-		return &typeInfo{goType: "int64", isNumeric: true}
-	case "UPPER", "LOWER", "LTRIM", "RTRIM", "TRIM", "SUBSTRING", "LEFT", "RIGHT", "REPLACE", "REPLICATE", "REVERSE", "CONCAT", "CONCAT_WS":
+	case "LEN", "DATALENGTH", "CHARINDEX", "PATINDEX", "ASCII", "UNICODE":
+		return &typeInfo{goType: "int32", isNumeric: true}
+	case "UPPER", "LOWER", "LTRIM", "RTRIM", "TRIM", "SUBSTRING", "LEFT", "RIGHT", "REPLACE", "REPLICATE", "REVERSE", "CONCAT", "CONCAT_WS", "NCHAR", "CHAR":
 		return &typeInfo{goType: "string", isString: true}
 	case "ABS", "CEILING", "CEIL", "FLOOR", "ROUND", "POWER", "SQRT", "SIGN":
 		return &typeInfo{goType: "float64", isNumeric: true}
 	case "GETDATE", "SYSDATETIME", "GETUTCDATE", "SYSUTCDATETIME", "DATEADD":
 		return &typeInfo{goType: "time.Time", isDateTime: true}
-	case "DATEDIFF", "YEAR", "MONTH", "DAY":
-		return &typeInfo{goType: "int64", isNumeric: true}
+	case "DATEDIFF", "YEAR", "MONTH", "DAY", "DATEPART":
+		return &typeInfo{goType: "int32", isNumeric: true}
 	default:
 		return &typeInfo{goType: "interface{}"}
 	}
@@ -313,6 +460,27 @@ func (t *transpiler) mapOperator(op string) string {
 	default:
 		return op
 	}
+}
+
+// promoteNumericType returns the wider of two numeric types for arithmetic.
+// Follows T-SQL implicit conversion rules: smaller types promote to larger.
+func (t *transpiler) promoteNumericType(type1, type2 string) string {
+	// Priority order: float64 > int64 > int32 > int16 > uint8
+	priority := map[string]int{
+		"uint8":   1,
+		"int16":   2,
+		"int32":   3,
+		"int64":   4,
+		"float64": 5,
+	}
+
+	p1 := priority[type1]
+	p2 := priority[type2]
+
+	if p1 >= p2 {
+		return type1
+	}
+	return type2
 }
 
 func (t *transpiler) transpileFunctionCall(fc *ast.FunctionCall) (string, error) {
@@ -339,12 +507,12 @@ func (t *transpiler) transpileFunctionCall(fc *ast.FunctionCall) (string, error)
 	case "LEN":
 		t.imports["unicode/utf8"] = true
 		if len(args) == 1 {
-			return fmt.Sprintf("utf8.RuneCountInString(%s)", args[0]), nil
+			return fmt.Sprintf("int32(utf8.RuneCountInString(%s))", args[0]), nil
 		}
 
 	case "DATALENGTH":
 		if len(args) == 1 {
-			return fmt.Sprintf("len(%s)", args[0]), nil
+			return fmt.Sprintf("int32(len(%s))", args[0]), nil
 		}
 
 	case "UPPER":
@@ -399,7 +567,25 @@ func (t *transpiler) transpileFunctionCall(fc *ast.FunctionCall) (string, error)
 		if len(args) >= 2 {
 			// CHARINDEX returns 0 if not found, 1-based index otherwise
 			// strings.Index returns -1 if not found, 0-based index otherwise
-			return fmt.Sprintf("(strings.Index(%s, %s) + 1)", args[1], args[0]), nil
+			return fmt.Sprintf("int32(strings.Index(%s, %s) + 1)", args[1], args[0]), nil
+		}
+
+	case "ASCII":
+		// ASCII(char) returns the ASCII code of the first character
+		if len(args) == 1 {
+			return fmt.Sprintf("int32((%s)[0])", args[0]), nil
+		}
+
+	case "UNICODE":
+		// UNICODE(char) returns the Unicode code point of the first character
+		if len(args) == 1 {
+			return fmt.Sprintf("int32([]rune(%s)[0])", args[0]), nil
+		}
+
+	case "NCHAR", "CHAR":
+		// NCHAR(n) / CHAR(n) returns the character for the given code point
+		if len(args) == 1 {
+			return fmt.Sprintf("string(rune(%s))", args[0]), nil
 		}
 
 	case "REPLACE":
@@ -449,26 +635,45 @@ func (t *transpiler) transpileFunctionCall(fc *ast.FunctionCall) (string, error)
 		}
 
 	case "ABS":
-		t.imports["math"] = true
 		if len(args) == 1 {
+			argType := t.inferType(fc.Arguments[0])
+			if argType.isDecimal {
+				return fmt.Sprintf("%s.Abs()", args[0]), nil
+			}
+			t.imports["math"] = true
 			return fmt.Sprintf("math.Abs(float64(%s))", args[0]), nil
 		}
 
 	case "CEILING", "CEIL":
-		t.imports["math"] = true
 		if len(args) == 1 {
+			argType := t.inferType(fc.Arguments[0])
+			if argType.isDecimal {
+				return fmt.Sprintf("%s.Ceil()", args[0]), nil
+			}
+			t.imports["math"] = true
 			return fmt.Sprintf("math.Ceil(float64(%s))", args[0]), nil
 		}
 
 	case "FLOOR":
-		t.imports["math"] = true
 		if len(args) == 1 {
+			argType := t.inferType(fc.Arguments[0])
+			if argType.isDecimal {
+				return fmt.Sprintf("%s.Floor()", args[0]), nil
+			}
+			t.imports["math"] = true
 			return fmt.Sprintf("math.Floor(float64(%s))", args[0]), nil
 		}
 
 	case "ROUND":
-		t.imports["math"] = true
 		if len(args) >= 1 {
+			argType := t.inferType(fc.Arguments[0])
+			if argType.isDecimal {
+				if len(args) == 1 {
+					return fmt.Sprintf("%s.Round(0)", args[0]), nil
+				}
+				return fmt.Sprintf("%s.Round(%s)", args[0], args[1]), nil
+			}
+			t.imports["math"] = true
 			if len(args) == 1 {
 				return fmt.Sprintf("math.Round(%s)", args[0]), nil
 			}
@@ -477,14 +682,25 @@ func (t *transpiler) transpileFunctionCall(fc *ast.FunctionCall) (string, error)
 		}
 
 	case "POWER":
-		t.imports["math"] = true
 		if len(args) == 2 {
+			argType := t.inferType(fc.Arguments[0])
+			if argType.isDecimal {
+				return fmt.Sprintf("%s.Pow(decimal.NewFromInt(int64(%s)))", args[0], args[1]), nil
+			}
+			t.imports["math"] = true
 			return fmt.Sprintf("math.Pow(float64(%s), float64(%s))", args[0], args[1]), nil
 		}
 
 	case "SQRT":
-		t.imports["math"] = true
 		if len(args) == 1 {
+			argType := t.inferType(fc.Arguments[0])
+			if argType.isDecimal {
+				// decimal doesn't have Sqrt, convert to float and back
+				t.imports["math"] = true
+				t.imports["github.com/shopspring/decimal"] = true
+				return fmt.Sprintf("decimal.NewFromFloat(math.Sqrt(%s.InexactFloat64()))", args[0]), nil
+			}
+			t.imports["math"] = true
 			return fmt.Sprintf("math.Sqrt(float64(%s))", args[0]), nil
 		}
 
@@ -534,6 +750,14 @@ func (t *transpiler) transpileFunctionCall(fc *ast.FunctionCall) (string, error)
 		t.imports["time"] = true
 		if len(args) == 1 {
 			return fmt.Sprintf("(%s).Day()", args[0]), nil
+		}
+
+	case "DATEPART":
+		// DATEPART(interval, date)
+		t.imports["time"] = true
+		if len(args) == 2 {
+			interval := strings.ToLower(strings.Trim(args[0], "\""))
+			return t.transpileDatePart(interval, args[1])
 		}
 
 	case "NEWID":
@@ -609,6 +833,33 @@ func (t *transpiler) transpileDateDiff(interval, start, end string) (string, err
 		return fmt.Sprintf("int((%s).Sub(%s).Seconds())", end, start), nil
 	default:
 		return "", fmt.Errorf("unsupported DATEDIFF interval: %s", interval)
+	}
+}
+
+func (t *transpiler) transpileDatePart(interval, date string) (string, error) {
+	switch strings.ToUpper(interval) {
+	case "YEAR", "YY", "YYYY":
+		return fmt.Sprintf("int32((%s).Year())", date), nil
+	case "MONTH", "MM", "M":
+		return fmt.Sprintf("int32((%s).Month())", date), nil
+	case "DAY", "DD", "D":
+		return fmt.Sprintf("int32((%s).Day())", date), nil
+	case "HOUR", "HH":
+		return fmt.Sprintf("int32((%s).Hour())", date), nil
+	case "MINUTE", "MI", "N":
+		return fmt.Sprintf("int32((%s).Minute())", date), nil
+	case "SECOND", "SS", "S":
+		return fmt.Sprintf("int32((%s).Second())", date), nil
+	case "WEEKDAY", "DW", "W":
+		// T-SQL: Sunday=1, Monday=2, ... Saturday=7
+		// Go: Sunday=0, Monday=1, ... Saturday=6
+		return fmt.Sprintf("int32((%s).Weekday() + 1)", date), nil
+	case "DAYOFYEAR", "DY", "Y":
+		return fmt.Sprintf("int32((%s).YearDay())", date), nil
+	case "QUARTER", "QQ", "Q":
+		return fmt.Sprintf("int32(((%s).Month()-1)/3 + 1)", date), nil
+	default:
+		return "", fmt.Errorf("unsupported DATEPART interval: %s", interval)
 	}
 }
 
@@ -688,7 +939,44 @@ func (t *transpiler) transpileCastExpression(c *ast.CastExpression) (string, err
 		return "", err
 	}
 
-	// Simple type conversion - this is a simplification
+	// Get source type to handle string-to-numeric conversions
+	sourceType := t.inferType(c.Expression)
+
+	// Handle string-to-numeric conversions (need strconv)
+	if sourceType.isString {
+		switch goType {
+		case "int32":
+			t.imports["strconv"] = true
+			// strconv.Atoi returns (int, error) - we wrap in a helper expression
+			// Using ParseInt for explicit int32 control
+			return fmt.Sprintf("func() int32 { v, _ := strconv.ParseInt(%s, 10, 32); return int32(v) }()", expr), nil
+		case "int64":
+			t.imports["strconv"] = true
+			return fmt.Sprintf("func() int64 { v, _ := strconv.ParseInt(%s, 10, 64); return v }()", expr), nil
+		case "float64":
+			t.imports["strconv"] = true
+			return fmt.Sprintf("func() float64 { v, _ := strconv.ParseFloat(%s, 64); return v }()", expr), nil
+		case "decimal.Decimal":
+			t.imports["github.com/shopspring/decimal"] = true
+			return fmt.Sprintf("decimal.RequireFromString(%s)", expr), nil
+		}
+	}
+
+	// Handle decimal-to-numeric conversions
+	if sourceType.isDecimal {
+		switch goType {
+		case "int32":
+			return fmt.Sprintf("int32(%s.IntPart())", expr), nil
+		case "int64":
+			return fmt.Sprintf("%s.IntPart()", expr), nil
+		case "float64":
+			return fmt.Sprintf("%s.InexactFloat64()", expr), nil
+		case "string":
+			return fmt.Sprintf("%s.String()", expr), nil
+		}
+	}
+
+	// Simple type conversion for non-string sources
 	switch goType {
 	case "string":
 		t.imports["fmt"] = true
@@ -717,6 +1005,41 @@ func (t *transpiler) transpileConvertExpression(c *ast.ConvertExpression) (strin
 	goType, err := t.mapDataType(c.TargetType)
 	if err != nil {
 		return "", err
+	}
+
+	// Get source type to handle string-to-numeric conversions
+	sourceType := t.inferType(c.Expression)
+
+	// Handle string-to-numeric conversions (need strconv)
+	if sourceType.isString {
+		switch goType {
+		case "int32":
+			t.imports["strconv"] = true
+			return fmt.Sprintf("func() int32 { v, _ := strconv.ParseInt(%s, 10, 32); return int32(v) }()", expr), nil
+		case "int64":
+			t.imports["strconv"] = true
+			return fmt.Sprintf("func() int64 { v, _ := strconv.ParseInt(%s, 10, 64); return v }()", expr), nil
+		case "float64":
+			t.imports["strconv"] = true
+			return fmt.Sprintf("func() float64 { v, _ := strconv.ParseFloat(%s, 64); return v }()", expr), nil
+		case "decimal.Decimal":
+			t.imports["github.com/shopspring/decimal"] = true
+			return fmt.Sprintf("decimal.RequireFromString(%s)", expr), nil
+		}
+	}
+
+	// Handle decimal-to-numeric conversions
+	if sourceType.isDecimal {
+		switch goType {
+		case "int32":
+			return fmt.Sprintf("int32(%s.IntPart())", expr), nil
+		case "int64":
+			return fmt.Sprintf("%s.IntPart()", expr), nil
+		case "float64":
+			return fmt.Sprintf("%s.InexactFloat64()", expr), nil
+		case "string":
+			return fmt.Sprintf("%s.String()", expr), nil
+		}
 	}
 
 	// Style parameter is ignored for now

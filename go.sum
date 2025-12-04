@@ -1,2 +1,4 @@
 github.com/ha1tch/tsqlparser v0.0.1 h1:bSdp7VnmLoYCUy96GwHS6txZW7RGmJEb8xiZaT3pVZI=
 github.com/ha1tch/tsqlparser v0.0.1/go.mod h1:kPeb5IvtnMF8LVo1ablWbQyLBBwJnGOAhDuZm9ZIPpM=
+github.com/shopspring/decimal v1.3.1 h1:2Usl1nmF/WZucqkFZhnfFYxxxu8LG21F6nPQBE5gKV8=
+github.com/shopspring/decimal v1.3.1/go.mod h1:DKyhrW/HYNuLGql+MJL6WCR6knT2jwCFRcu2hWCYk4o=
