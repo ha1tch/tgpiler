@@ -1,0 +1,220 @@
+syntax = "proto3";
+
+package shopeasy.v1;
+
+option go_package = "github.com/example/shopeasy/v1";
+
+import "google/protobuf/timestamp.proto";
+import "common.proto";
+
+// Category represents a product category
+message Category {
+  int64 id = 1;
+  string name = 2;
+  string slug = 3;
+  string description = 4;
+  optional int64 parent_id = 5;
+  int32 display_order = 6;
+  bool is_active = 7;
+  string image_url = 8;
+  google.protobuf.Timestamp created_at = 9;
+}
+
+// Product represents an item for sale
+message Product {
+  int64 id = 1;
+  string sku = 2;
+  string name = 3;
+  string slug = 4;
+  string description = 5;
+  Money price = 6;
+  optional Money compare_at_price = 7;
+  optional Money cost_price = 8;
+  int64 category_id = 9;
+  string category_name = 10;
+  bool is_active = 11;
+  bool track_inventory = 12;
+  int32 stock_quantity = 13;
+  repeated string image_urls = 14;
+  map<string, string> attributes = 15;
+  double average_rating = 16;
+  int32 review_count = 17;
+  google.protobuf.Timestamp created_at = 18;
+  google.protobuf.Timestamp updated_at = 19;
+}
+
+// Category operations
+
+message GetCategoryRequest {
+  int64 id = 1;
+}
+
+message GetCategoryResponse {
+  Category category = 1;
+}
+
+message GetCategoryBySlugRequest {
+  string slug = 1;
+}
+
+message GetCategoryBySlugResponse {
+  Category category = 1;
+}
+
+message ListCategoriesRequest {
+  optional int64 parent_id = 1;  // Filter by parent, null for root categories
+  bool include_inactive = 2;
+}
+
+message ListCategoriesResponse {
+  repeated Category categories = 1;
+}
+
+message CreateCategoryRequest {
+  string name = 1;
+  string slug = 2;
+  string description = 3;
+  optional int64 parent_id = 4;
+  int32 display_order = 5;
+  string image_url = 6;
+}
+
+message CreateCategoryResponse {
+  Category category = 1;
+}
+
+message UpdateCategoryRequest {
+  int64 id = 1;
+  optional string name = 2;
+  optional string description = 3;
+  optional int32 display_order = 4;
+  optional bool is_active = 5;
+  optional string image_url = 6;
+}
+
+message UpdateCategoryResponse {
+  Category category = 1;
+}
+
+// Product operations
+
+message GetProductRequest {
+  int64 id = 1;
+}
+
+message GetProductResponse {
+  Product product = 1;
+}
+
+message GetProductBySkuRequest {
+  string sku = 1;
+}
+
+message GetProductBySkuResponse {
+  Product product = 1;
+}
+
+message GetProductBySlugRequest {
+  string slug = 1;
+}
+
+message GetProductBySlugResponse {
+  Product product = 1;
+}
+
+message ListProductsRequest {
+  Pagination pagination = 1;
+  optional int64 category_id = 2;
+  optional string search_query = 3;
+  optional Money min_price = 4;
+  optional Money max_price = 5;
+  bool in_stock_only = 6;
+  bool include_inactive = 7;
+  string sort_by = 8;        // "price", "name", "created_at", "rating"
+  bool sort_descending = 9;
+}
+
+message ListProductsResponse {
+  repeated Product products = 1;
+  PaginatedResponse pagination = 2;
+}
+
+message CreateProductRequest {
+  string sku = 1;
+  string name = 2;
+  string slug = 3;
+  string description = 4;
+  Money price = 5;
+  optional Money compare_at_price = 6;
+  optional Money cost_price = 7;
+  int64 category_id = 8;
+  bool track_inventory = 9;
+  int32 initial_stock = 10;
+  repeated string image_urls = 11;
+  map<string, string> attributes = 12;
+}
+
+message CreateProductResponse {
+  Product product = 1;
+}
+
+message UpdateProductRequest {
+  int64 id = 1;
+  optional string name = 2;
+  optional string description = 3;
+  optional Money price = 4;
+  optional Money compare_at_price = 5;
+  optional Money cost_price = 6;
+  optional int64 category_id = 7;
+  optional bool is_active = 8;
+  repeated string image_urls = 9;
+  map<string, string> attributes = 10;
+}
+
+message UpdateProductResponse {
+  Product product = 1;
+}
+
+message DeleteProductRequest {
+  int64 id = 1;
+}
+
+message DeleteProductResponse {
+  bool success = 1;
+}
+
+// Search
+
+message SearchProductsRequest {
+  string query = 1;
+  Pagination pagination = 2;
+  repeated int64 category_ids = 3;
+  optional Money min_price = 4;
+  optional Money max_price = 5;
+}
+
+message SearchProductsResponse {
+  repeated Product products = 1;
+  PaginatedResponse pagination = 2;
+}
+
+service CatalogService {
+  // Categories
+  rpc GetCategory(GetCategoryRequest) returns (GetCategoryResponse);
+  rpc GetCategoryBySlug(GetCategoryBySlugRequest) returns (GetCategoryBySlugResponse);
+  rpc ListCategories(ListCategoriesRequest) returns (ListCategoriesResponse);
+  rpc CreateCategory(CreateCategoryRequest) returns (CreateCategoryResponse);
+  rpc UpdateCategory(UpdateCategoryRequest) returns (UpdateCategoryResponse);
+  
+  // Products
+  rpc GetProduct(GetProductRequest) returns (GetProductResponse);
+  rpc GetProductBySku(GetProductBySkuRequest) returns (GetProductBySkuResponse);
+  rpc GetProductBySlug(GetProductBySlugRequest) returns (GetProductBySlugResponse);
+  rpc ListProducts(ListProductsRequest) returns (ListProductsResponse);
+  rpc CreateProduct(CreateProductRequest) returns (CreateProductResponse);
+  rpc UpdateProduct(UpdateProductRequest) returns (UpdateProductResponse);
+  rpc DeleteProduct(DeleteProductRequest) returns (DeleteProductResponse);
+  
+  // Search
+  rpc SearchProducts(SearchProductsRequest) returns (SearchProductsResponse);
+}

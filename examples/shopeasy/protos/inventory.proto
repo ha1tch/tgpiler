@@ -1,0 +1,159 @@
+syntax = "proto3";
+
+package shopeasy.v1;
+
+option go_package = "github.com/example/shopeasy/v1";
+
+import "google/protobuf/timestamp.proto";
+import "common.proto";
+
+// InventoryTransactionType enum
+enum InventoryTransactionType {
+  INVENTORY_TRANSACTION_TYPE_UNSPECIFIED = 0;
+  INVENTORY_TRANSACTION_TYPE_RECEIVED = 1;     // Stock received from supplier
+  INVENTORY_TRANSACTION_TYPE_SOLD = 2;         // Sold to customer
+  INVENTORY_TRANSACTION_TYPE_RETURNED = 3;     // Customer return
+  INVENTORY_TRANSACTION_TYPE_ADJUSTMENT = 4;   // Manual adjustment
+  INVENTORY_TRANSACTION_TYPE_RESERVED = 5;     // Reserved for order
+  INVENTORY_TRANSACTION_TYPE_RELEASED = 6;     // Released from reservation
+  INVENTORY_TRANSACTION_TYPE_DAMAGED = 7;      // Damaged/lost
+}
+
+// InventoryLevel represents current stock for a product
+message InventoryLevel {
+  int64 product_id = 1;
+  string product_sku = 2;
+  string product_name = 3;
+  int32 quantity_on_hand = 4;
+  int32 quantity_reserved = 5;
+  int32 quantity_available = 6;
+  int32 reorder_point = 7;
+  int32 reorder_quantity = 8;
+  google.protobuf.Timestamp last_updated = 9;
+}
+
+// InventoryTransaction represents a stock movement
+message InventoryTransaction {
+  int64 id = 1;
+  int64 product_id = 2;
+  string product_sku = 3;
+  InventoryTransactionType type = 4;
+  int32 quantity = 5;
+  int32 quantity_before = 6;
+  int32 quantity_after = 7;
+  optional int64 order_id = 8;
+  optional string reference = 9;
+  optional string notes = 10;
+  int64 created_by = 11;
+  google.protobuf.Timestamp created_at = 12;
+}
+
+// Inventory operations
+
+message GetInventoryLevelRequest {
+  int64 product_id = 1;
+}
+
+message GetInventoryLevelResponse {
+  InventoryLevel inventory = 1;
+}
+
+message ListInventoryLevelsRequest {
+  Pagination pagination = 1;
+  bool low_stock_only = 2;      // Below reorder point
+  bool out_of_stock_only = 3;
+  optional int64 category_id = 4;
+}
+
+message ListInventoryLevelsResponse {
+  repeated InventoryLevel inventory = 1;
+  PaginatedResponse pagination = 2;
+}
+
+message AdjustInventoryRequest {
+  int64 product_id = 1;
+  int32 quantity_change = 2;     // Positive to add, negative to subtract
+  InventoryTransactionType reason = 3;
+  optional string reference = 4;
+  optional string notes = 5;
+  int64 adjusted_by = 6;
+}
+
+message AdjustInventoryResponse {
+  InventoryLevel inventory = 1;
+  InventoryTransaction transaction = 2;
+}
+
+message ReserveInventoryRequest {
+  repeated ReservationItem items = 1;
+  int64 order_id = 2;
+}
+
+message ReservationItem {
+  int64 product_id = 1;
+  int32 quantity = 2;
+}
+
+message ReserveInventoryResponse {
+  bool success = 1;
+  repeated ReservationResult results = 2;
+}
+
+message ReservationResult {
+  int64 product_id = 1;
+  bool reserved = 2;
+  int32 quantity_requested = 3;
+  int32 quantity_reserved = 4;
+  optional string error = 5;
+}
+
+message ReleaseInventoryRequest {
+  int64 order_id = 1;
+}
+
+message ReleaseInventoryResponse {
+  bool success = 1;
+  int32 items_released = 2;
+}
+
+message SetReorderPointRequest {
+  int64 product_id = 1;
+  int32 reorder_point = 2;
+  int32 reorder_quantity = 3;
+}
+
+message SetReorderPointResponse {
+  InventoryLevel inventory = 1;
+}
+
+message ListTransactionsRequest {
+  optional int64 product_id = 1;
+  optional int64 order_id = 2;
+  Pagination pagination = 3;
+  optional google.protobuf.Timestamp from_date = 4;
+  optional google.protobuf.Timestamp to_date = 5;
+}
+
+message ListTransactionsResponse {
+  repeated InventoryTransaction transactions = 1;
+  PaginatedResponse pagination = 2;
+}
+
+message GetLowStockProductsRequest {
+  int32 threshold_percentage = 1;  // e.g., 20 means items at 20% of reorder point
+}
+
+message GetLowStockProductsResponse {
+  repeated InventoryLevel products = 1;
+}
+
+service InventoryService {
+  rpc GetInventoryLevel(GetInventoryLevelRequest) returns (GetInventoryLevelResponse);
+  rpc ListInventoryLevels(ListInventoryLevelsRequest) returns (ListInventoryLevelsResponse);
+  rpc AdjustInventory(AdjustInventoryRequest) returns (AdjustInventoryResponse);
+  rpc ReserveInventory(ReserveInventoryRequest) returns (ReserveInventoryResponse);
+  rpc ReleaseInventory(ReleaseInventoryRequest) returns (ReleaseInventoryResponse);
+  rpc SetReorderPoint(SetReorderPointRequest) returns (SetReorderPointResponse);
+  rpc ListTransactions(ListTransactionsRequest) returns (ListTransactionsResponse);
+  rpc GetLowStockProducts(GetLowStockProductsRequest) returns (GetLowStockProductsResponse);
+}

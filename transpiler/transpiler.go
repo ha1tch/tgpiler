@@ -10,6 +10,7 @@ import (
 )
 
 // Transpile converts T-SQL source code to Go source code.
+// This version only handles procedural code (no DML statements).
 func Transpile(source string, packageName string) (string, error) {
 	program, errors := tsqlparser.Parse(source)
 	if len(errors) > 0 {
@@ -19,6 +20,23 @@ func Transpile(source string, packageName string) (string, error) {
 	t := newTranspiler()
 	t.packageName = packageName
 	t.comments = buildCommentIndex(source)
+	return t.transpile(program)
+}
+
+// TranspileWithDML converts T-SQL source code to Go, including DML statements.
+// DML statements (SELECT, INSERT, UPDATE, DELETE, EXEC) are converted to
+// the appropriate backend calls based on the DMLConfig.
+func TranspileWithDML(source string, packageName string, dmlConfig DMLConfig) (string, error) {
+	program, errors := tsqlparser.Parse(source)
+	if len(errors) > 0 {
+		return "", fmt.Errorf("parse errors:\n%s", strings.Join(errors, "\n"))
+	}
+
+	t := newTranspiler()
+	t.packageName = packageName
+	t.comments = buildCommentIndex(source)
+	t.dmlConfig = dmlConfig
+	t.dmlEnabled = true
 	return t.transpile(program)
 }
 
@@ -33,12 +51,33 @@ type transpiler struct {
 	hasReturnCode bool
 	packageName   string
 	comments      *commentIndex
+	
+	// DML handling
+	dmlEnabled      bool
+	dmlConfig       DMLConfig
+	inTransaction   bool // Track if we're inside a transaction block
+	hasDMLStatements bool // Track if procedure has DML requiring error return
+	
+	// Cursor handling
+	cursors       map[string]*cursorInfo // name -> cursor info
+	activeCursor  string                 // currently open cursor (for FETCH detection)
+}
+
+// cursorInfo tracks declared cursors for conversion to rows iteration
+type cursorInfo struct {
+	name       string
+	query      *ast.SelectStatement
+	fetchVars  []*ast.Variable // Variables from FETCH INTO
+	rowsVar    string          // Generated Go variable name for rows
+	isOpen     bool
 }
 
 func newTranspiler() *transpiler {
 	return &transpiler{
-		imports: make(map[string]bool),
-		symbols: newSymbolTable(),
+		imports:   make(map[string]bool),
+		symbols:   newSymbolTable(),
+		dmlConfig: DefaultDMLConfig(),
+		cursors:   make(map[string]*cursorInfo),
 	}
 }
 
@@ -121,6 +160,101 @@ func (t *transpiler) transpileStatement(stmt ast.Statement) (string, error) {
 		return "continue", nil
 	case *ast.PrintStatement:
 		return t.transpilePrint(s)
+	
+	// DML statements - only handled if DML is enabled
+	case *ast.SelectStatement:
+		if t.dmlEnabled {
+			return t.transpileSelect(s)
+		}
+		return "", fmt.Errorf("SELECT statements require DML mode (use TranspileWithDML)")
+	case *ast.InsertStatement:
+		if t.dmlEnabled {
+			return t.transpileInsert(s)
+		}
+		return "", fmt.Errorf("INSERT statements require DML mode (use TranspileWithDML)")
+	case *ast.UpdateStatement:
+		if t.dmlEnabled {
+			return t.transpileUpdate(s)
+		}
+		return "", fmt.Errorf("UPDATE statements require DML mode (use TranspileWithDML)")
+	case *ast.DeleteStatement:
+		if t.dmlEnabled {
+			return t.transpileDelete(s)
+		}
+		return "", fmt.Errorf("DELETE statements require DML mode (use TranspileWithDML)")
+	case *ast.ExecStatement:
+		if t.dmlEnabled {
+			return t.transpileExec(s)
+		}
+		return "", fmt.Errorf("EXEC statements require DML mode (use TranspileWithDML)")
+	
+	// Transaction statements
+	case *ast.BeginTransactionStatement:
+		if t.dmlEnabled {
+			return t.transpileBeginTransaction(s)
+		}
+		return "", fmt.Errorf("BEGIN TRANSACTION requires DML mode (use TranspileWithDML)")
+	case *ast.CommitTransactionStatement:
+		if t.dmlEnabled {
+			return t.transpileCommitTransaction(s)
+		}
+		return "", fmt.Errorf("COMMIT TRANSACTION requires DML mode (use TranspileWithDML)")
+	case *ast.RollbackTransactionStatement:
+		if t.dmlEnabled {
+			return t.transpileRollbackTransaction(s)
+		}
+		return "", fmt.Errorf("ROLLBACK TRANSACTION requires DML mode (use TranspileWithDML)")
+	
+	// DDL statements for temp tables
+	case *ast.CreateTableStatement:
+		if t.dmlEnabled {
+			return t.transpileCreateTable(s)
+		}
+		return "", fmt.Errorf("CREATE TABLE requires DML mode (use TranspileWithDML)")
+	case *ast.DropTableStatement:
+		if t.dmlEnabled {
+			return t.transpileDropTable(s)
+		}
+		return "", fmt.Errorf("DROP TABLE requires DML mode (use TranspileWithDML)")
+	case *ast.TruncateTableStatement:
+		if t.dmlEnabled {
+			return t.transpileTruncateTable(s)
+		}
+		return "", fmt.Errorf("TRUNCATE TABLE requires DML mode (use TranspileWithDML)")
+	
+	// Cursor statements
+	case *ast.DeclareCursorStatement:
+		if t.dmlEnabled {
+			return t.transpileDeclareCursor(s)
+		}
+		return "", fmt.Errorf("DECLARE CURSOR requires DML mode (use TranspileWithDML)")
+	case *ast.OpenCursorStatement:
+		if t.dmlEnabled {
+			return t.transpileOpenCursor(s)
+		}
+		return "", fmt.Errorf("OPEN cursor requires DML mode (use TranspileWithDML)")
+	case *ast.FetchStatement:
+		if t.dmlEnabled {
+			return t.transpileFetch(s)
+		}
+		return "", fmt.Errorf("FETCH requires DML mode (use TranspileWithDML)")
+	case *ast.CloseCursorStatement:
+		if t.dmlEnabled {
+			return t.transpileCloseCursor(s)
+		}
+		return "", fmt.Errorf("CLOSE cursor requires DML mode (use TranspileWithDML)")
+	case *ast.DeallocateCursorStatement:
+		if t.dmlEnabled {
+			return t.transpileDeallocateCursor(s)
+		}
+		return "", fmt.Errorf("DEALLOCATE cursor requires DML mode (use TranspileWithDML)")
+	
+	// Error handling statements
+	case *ast.RaiserrorStatement:
+		return t.transpileRaiserror(s)
+	case *ast.ThrowStatement:
+		return t.transpileThrow(s)
+	
 	default:
 		return "", fmt.Errorf("unsupported statement type: %T", stmt)
 	}
@@ -131,6 +265,14 @@ func (t *transpiler) transpileCreateProcedure(proc *ast.CreateProcedureStatement
 
 	// Reset symbol table for new procedure scope
 	t.symbols = newSymbolTable()
+	
+	// Reset DML tracking
+	t.hasDMLStatements = false
+
+	// Pre-scan for DML statements if DML mode is enabled
+	if t.dmlEnabled && proc.Body != nil {
+		t.hasDMLStatements = t.blockHasDML(proc.Body)
+	}
 
 	// Get procedure name for comment lookup
 	procName := proc.Name.Parts[len(proc.Name.Parts)-1].Value
@@ -172,7 +314,9 @@ func (t *transpiler) transpileCreateProcedure(proc *ast.CreateProcedureStatement
 
 	// Return type(s)
 	hasReturn := t.procedureHasReturn(proc)
-	if len(outputParams) > 0 || hasReturn {
+	needsErrorReturn := t.hasDMLStatements
+	
+	if len(outputParams) > 0 || hasReturn || needsErrorReturn {
 		out.WriteString(" (")
 		var returns []string
 		for _, p := range outputParams {
@@ -182,6 +326,9 @@ func (t *transpiler) transpileCreateProcedure(proc *ast.CreateProcedureStatement
 		}
 		if hasReturn {
 			returns = append(returns, "returnCode int32")
+		}
+		if needsErrorReturn {
+			returns = append(returns, "err error")
 		}
 		out.WriteString(strings.Join(returns, ", "))
 		out.WriteString(")")
@@ -216,7 +363,7 @@ func (t *transpiler) transpileCreateProcedure(proc *ast.CreateProcedureStatement
 
 	// Final return if we have output params or return code, 
 	// but only if the block doesn't already end with a return
-	if (len(outputParams) > 0 || hasReturn) && !t.blockEndsWithReturn(proc.Body) {
+	if (len(outputParams) > 0 || hasReturn || needsErrorReturn) && !t.blockEndsWithReturn(proc.Body) {
 		out.WriteString(t.indentStr())
 		out.WriteString(t.buildReturnStatement(nil))
 		out.WriteString("\n")
@@ -230,6 +377,53 @@ func (t *transpiler) transpileCreateProcedure(proc *ast.CreateProcedureStatement
 	t.hasReturnCode = false
 
 	return out.String(), nil
+}
+
+// blockHasDML checks if a statement block contains DML statements
+func (t *transpiler) blockHasDML(block *ast.BeginEndBlock) bool {
+	if block == nil {
+		return false
+	}
+	for _, stmt := range block.Statements {
+		if t.statementHasDML(stmt) {
+			return true
+		}
+	}
+	return false
+}
+
+// statementHasDML checks if a statement is or contains DML
+func (t *transpiler) statementHasDML(stmt ast.Statement) bool {
+	switch s := stmt.(type) {
+	case *ast.SelectStatement, *ast.InsertStatement, *ast.UpdateStatement, *ast.DeleteStatement:
+		return true
+	case *ast.CreateTableStatement, *ast.DropTableStatement, *ast.TruncateTableStatement:
+		return true
+	case *ast.ExecStatement:
+		return true
+	case *ast.BeginEndBlock:
+		return t.blockHasDML(s)
+	case *ast.IfStatement:
+		if t.statementHasDML(s.Consequence) {
+			return true
+		}
+		if s.Alternative != nil && t.statementHasDML(s.Alternative) {
+			return true
+		}
+		return false
+	case *ast.WhileStatement:
+		return t.statementHasDML(s.Body)
+	case *ast.TryCatchStatement:
+		if s.TryBlock != nil && t.blockHasDML(s.TryBlock) {
+			return true
+		}
+		if s.CatchBlock != nil && t.blockHasDML(s.CatchBlock) {
+			return true
+		}
+		return false
+	default:
+		return false
+	}
 }
 
 // procedureHasReturn checks if a procedure has any RETURN statements with values.
@@ -310,6 +504,11 @@ func (t *transpiler) buildReturnStatement(returnValue ast.Expression) string {
 		} else {
 			parts = append(parts, "0")
 		}
+	}
+	
+	// Add nil error if DML mode with error return
+	if t.hasDMLStatements {
+		parts = append(parts, "nil")
 	}
 	
 	if len(parts) == 0 {
@@ -433,6 +632,11 @@ func (t *transpiler) transpileSet(set *ast.SetStatement) (string, error) {
 	if set.Value == nil {
 		// Method call like @xml.modify(...)
 		return prefix + varExpr, nil
+	}
+
+	// Check if value is a subquery (SET @var = (SELECT ...))
+	if subq, ok := set.Value.(*ast.SubqueryExpression); ok && t.dmlEnabled {
+		return t.transpileSetSubquery(set.Variable, subq, prefix)
 	}
 
 	valExpr, err := t.transpileExpression(set.Value)
@@ -572,6 +776,11 @@ func (t *transpiler) transpileStatementBlock(stmt ast.Statement) (string, error)
 }
 
 func (t *transpiler) transpileWhile(whileStmt *ast.WhileStatement) (string, error) {
+	// Check for WHILE @@FETCH_STATUS = 0 cursor pattern
+	if t.dmlEnabled && t.isFetchStatusCheck(whileStmt.Condition) {
+		return t.transpileCursorWhile(whileStmt)
+	}
+	
 	var out strings.Builder
 
 	cond, err := t.transpileExpression(whileStmt.Condition)
@@ -714,6 +923,227 @@ func (t *transpiler) transpilePrint(print *ast.PrintStatement) (string, error) {
 	return fmt.Sprintf("fmt.Println(%s)", expr), nil
 }
 
+// Transaction support
+
+func (t *transpiler) transpileBeginTransaction(s *ast.BeginTransactionStatement) (string, error) {
+	t.inTransaction = true
+	
+	var out strings.Builder
+	out.WriteString("// BEGIN TRANSACTION\n")
+	out.WriteString(t.indentStr())
+	out.WriteString(fmt.Sprintf("tx, err := %s.BeginTx(ctx, nil)\n", t.dmlConfig.StoreVar))
+	out.WriteString(t.indentStr())
+	out.WriteString("if err != nil {\n")
+	out.WriteString(t.indentStr())
+	out.WriteString("\treturn err\n")
+	out.WriteString(t.indentStr())
+	out.WriteString("}\n")
+	out.WriteString(t.indentStr())
+	out.WriteString("defer func() {\n")
+	out.WriteString(t.indentStr())
+	out.WriteString("\tif p := recover(); p != nil {\n")
+	out.WriteString(t.indentStr())
+	out.WriteString("\t\ttx.Rollback()\n")
+	out.WriteString(t.indentStr())
+	out.WriteString("\t\tpanic(p)\n")
+	out.WriteString(t.indentStr())
+	out.WriteString("\t}\n")
+	out.WriteString(t.indentStr())
+	out.WriteString("}()")
+	
+	return out.String(), nil
+}
+
+func (t *transpiler) transpileCommitTransaction(s *ast.CommitTransactionStatement) (string, error) {
+	t.inTransaction = false
+	
+	var out strings.Builder
+	out.WriteString("// COMMIT TRANSACTION\n")
+	out.WriteString(t.indentStr())
+	out.WriteString("if err := tx.Commit(); err != nil {\n")
+	out.WriteString(t.indentStr())
+	out.WriteString("\treturn err\n")
+	out.WriteString(t.indentStr())
+	out.WriteString("}")
+	
+	return out.String(), nil
+}
+
+func (t *transpiler) transpileRollbackTransaction(s *ast.RollbackTransactionStatement) (string, error) {
+	t.inTransaction = false
+	
+	var out strings.Builder
+	out.WriteString("// ROLLBACK TRANSACTION\n")
+	out.WriteString(t.indentStr())
+	out.WriteString("tx.Rollback()")
+	
+	return out.String(), nil
+}
+
 func (t *transpiler) indentStr() string {
 	return strings.Repeat("\t", t.indent)
+}
+
+// transpileRaiserror converts RAISERROR to Go error handling
+func (t *transpiler) transpileRaiserror(s *ast.RaiserrorStatement) (string, error) {
+	t.imports["fmt"] = true
+	
+	var out strings.Builder
+	
+	// Get the message
+	msg, err := t.transpileExpression(s.Message)
+	if err != nil {
+		return "", err
+	}
+	
+	// Build error expression
+	var errExpr string
+	if len(s.Args) > 0 {
+		var args []string
+		for _, arg := range s.Args {
+			a, err := t.transpileExpression(arg)
+			if err != nil {
+				return "", err
+			}
+			args = append(args, a)
+		}
+		errExpr = "fmt.Errorf(" + msg
+		for _, a := range args {
+			errExpr += ", " + a
+		}
+		errExpr += ")"
+	} else {
+		errExpr = "fmt.Errorf(" + msg + ")"
+	}
+	
+	// Build return statement with all output params
+	var parts []string
+	for _, p := range t.outputParams {
+		paramName := goIdentifier(strings.TrimPrefix(p.Name, "@"))
+		parts = append(parts, paramName)
+	}
+	if t.hasReturnCode {
+		parts = append(parts, "0")
+	}
+	parts = append(parts, errExpr)
+	
+	out.WriteString("return " + strings.Join(parts, ", "))
+	
+	return out.String(), nil
+}
+
+// transpileThrow converts THROW to Go error handling
+func (t *transpiler) transpileThrow(s *ast.ThrowStatement) (string, error) {
+	t.imports["fmt"] = true
+	
+	var out strings.Builder
+	
+	if s.ErrorNum == nil && s.Message == nil {
+		// THROW with no arguments - rethrow current error
+		out.WriteString("return err // THROW (rethrow)")
+	} else {
+		// THROW with arguments
+		msg := "\"unknown error\""
+		if s.Message != nil {
+			var err error
+			msg, err = t.transpileExpression(s.Message)
+			if err != nil {
+				return "", err
+			}
+		}
+		
+		errNum := "50000"
+		if s.ErrorNum != nil {
+			var err error
+			errNum, err = t.transpileExpression(s.ErrorNum)
+			if err != nil {
+				return "", err
+			}
+		}
+		
+		out.WriteString(fmt.Sprintf("return fmt.Errorf(\"error %%d: %%s\", %s, %s)", errNum, msg))
+	}
+	
+	return out.String(), nil
+}
+
+// transpileSetSubquery handles SET @var = (SELECT ...) assignments
+func (t *transpiler) transpileSetSubquery(variable ast.Expression, subq *ast.SubqueryExpression, prefix string) (string, error) {
+	t.imports["database/sql"] = true
+	
+	varExpr, err := t.transpileExpression(variable)
+	if err != nil {
+		return "", err
+	}
+	
+	// Get variable type for proper scanning
+	varType := t.inferType(variable)
+	
+	// Build the SQL query from the subquery
+	// We need to convert the SELECT statement to a SQL string
+	sql := subq.Subquery.String()
+	
+	var out strings.Builder
+	out.WriteString(prefix)
+	out.WriteString("// SET from subquery\n")
+	out.WriteString(t.indentStr())
+	
+	// For scalar subqueries, use QueryRowContext and Scan
+	out.WriteString(fmt.Sprintf("if err := %s.QueryRowContext(ctx, %q).Scan(&%s); err != nil {\n", 
+		t.dmlConfig.StoreVar, sql, varExpr))
+	out.WriteString(t.indentStr())
+	out.WriteString("\tif err != sql.ErrNoRows {\n")
+	out.WriteString(t.indentStr())
+	out.WriteString("\t\t")
+	out.WriteString(t.buildSubqueryErrorReturn())
+	out.WriteString("\n")
+	out.WriteString(t.indentStr())
+	out.WriteString("\t}\n")
+	
+	// Set zero value if no rows
+	out.WriteString(t.indentStr())
+	out.WriteString(fmt.Sprintf("\t%s = %s\n", varExpr, t.zeroValueForType(varType)))
+	out.WriteString(t.indentStr())
+	out.WriteString("}")
+	
+	return out.String(), nil
+}
+
+// buildSubqueryErrorReturn generates an error return appropriate for the current function
+func (t *transpiler) buildSubqueryErrorReturn() string {
+	var parts []string
+	
+	// Add output params
+	for _, p := range t.outputParams {
+		paramName := goIdentifier(strings.TrimPrefix(p.Name, "@"))
+		parts = append(parts, paramName)
+	}
+	
+	// Add return code if present
+	if t.hasReturnCode {
+		parts = append(parts, "0")
+	}
+	
+	// Add error
+	parts = append(parts, "err")
+	
+	if len(parts) == 1 {
+		return "return err"
+	}
+	return "return " + strings.Join(parts, ", ")
+}
+
+// transpileSubqueryExpression handles subqueries used as expressions (not in SET context)
+func (t *transpiler) transpileSubqueryExpression(subq *ast.SubqueryExpression) (string, error) {
+	// For subqueries used as expressions (e.g., in WHERE clauses or comparisons),
+	// we generate an inline function that executes the query
+	
+	sql := subq.Subquery.String()
+	
+	// Generate an anonymous function that executes and returns the result
+	return fmt.Sprintf("func() interface{} {\n"+
+		"\t\tvar result interface{}\n"+
+		"\t\t_ = %s.QueryRowContext(ctx, %q).Scan(&result)\n"+
+		"\t\treturn result\n"+
+		"\t}()", t.dmlConfig.StoreVar, sql), nil
 }

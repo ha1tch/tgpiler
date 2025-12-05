@@ -1,0 +1,41 @@
+syntax = "proto3";
+
+package shopeasy.v1;
+
+option go_package = "github.com/example/shopeasy/v1";
+
+import "google/protobuf/timestamp.proto";
+
+// Common types used across services
+
+message Money {
+  int64 units = 1;           // Whole units (dollars)
+  int32 nanos = 2;           // Nano units (cents as 10^7)
+  string currency_code = 3;  // ISO 4217 currency code
+}
+
+message Pagination {
+  int32 page_size = 1;
+  string page_token = 2;
+}
+
+message PaginatedResponse {
+  string next_page_token = 1;
+  int32 total_count = 2;
+}
+
+message Address {
+  string line1 = 1;
+  string line2 = 2;
+  string city = 3;
+  string state = 4;
+  string postal_code = 5;
+  string country = 6;
+}
+
+// Standard error response
+message ErrorDetail {
+  string code = 1;
+  string message = 2;
+  string field = 3;
+}

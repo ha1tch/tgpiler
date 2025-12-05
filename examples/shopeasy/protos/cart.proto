@@ -1,0 +1,105 @@
+syntax = "proto3";
+
+package shopeasy.v1;
+
+option go_package = "github.com/example/shopeasy/v1";
+
+import "google/protobuf/timestamp.proto";
+import "common.proto";
+
+// CartItem represents an item in a shopping cart
+message CartItem {
+  int64 id = 1;
+  int64 product_id = 2;
+  string product_name = 3;
+  string product_sku = 4;
+  string product_image_url = 5;
+  int32 quantity = 6;
+  Money unit_price = 7;
+  Money subtotal = 8;
+}
+
+// Cart represents a shopping cart
+message Cart {
+  int64 id = 1;
+  int64 user_id = 2;
+  repeated CartItem items = 3;
+  int32 item_count = 4;
+  Money subtotal = 5;
+  google.protobuf.Timestamp created_at = 6;
+  google.protobuf.Timestamp updated_at = 7;
+}
+
+// Cart operations
+
+message GetCartRequest {
+  int64 user_id = 1;
+}
+
+message GetCartResponse {
+  Cart cart = 1;
+}
+
+message AddToCartRequest {
+  int64 user_id = 1;
+  int64 product_id = 2;
+  int32 quantity = 3;
+}
+
+message AddToCartResponse {
+  Cart cart = 1;
+}
+
+message UpdateCartItemRequest {
+  int64 user_id = 1;
+  int64 product_id = 2;
+  int32 quantity = 3;  // Set to 0 to remove
+}
+
+message UpdateCartItemResponse {
+  Cart cart = 1;
+}
+
+message RemoveFromCartRequest {
+  int64 user_id = 1;
+  int64 product_id = 2;
+}
+
+message RemoveFromCartResponse {
+  Cart cart = 1;
+}
+
+message ClearCartRequest {
+  int64 user_id = 1;
+}
+
+message ClearCartResponse {
+  bool success = 1;
+}
+
+message ValidateCartRequest {
+  int64 user_id = 1;
+}
+
+message CartValidationIssue {
+  int64 product_id = 1;
+  string product_name = 2;
+  string issue_type = 3;   // "out_of_stock", "insufficient_stock", "price_changed", "unavailable"
+  string message = 4;
+  optional int32 available_quantity = 5;
+  optional Money current_price = 6;
+}
+
+message ValidateCartResponse {
+  bool is_valid = 1;
+  repeated CartValidationIssue issues = 2;
+}
+
+service CartService {
+  rpc GetCart(GetCartRequest) returns (GetCartResponse);
+  rpc AddToCart(AddToCartRequest) returns (AddToCartResponse);
+  rpc UpdateCartItem(UpdateCartItemRequest) returns (UpdateCartItemResponse);
+  rpc RemoveFromCart(RemoveFromCartRequest) returns (RemoveFromCartResponse);
+  rpc ClearCart(ClearCartRequest) returns (ClearCartResponse);
+  rpc ValidateCart(ValidateCartRequest) returns (ValidateCartResponse);
+}

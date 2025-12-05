@@ -1,0 +1,91 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: tgpiler-postgres
+    environment:
+      POSTGRES_USER: tgpiler
+      POSTGRES_PASSWORD: tgpiler_test
+      POSTGRES_DB: tgpiler_test
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init/postgres:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tgpiler -d tgpiler_test"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - tgpiler-network
+
+  mysql:
+    image: mysql:8.0
+    container_name: tgpiler-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: root_password
+      MYSQL_USER: tgpiler
+      MYSQL_PASSWORD: tgpiler_test
+      MYSQL_DATABASE: tgpiler_test
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./init/mysql:/docker-entrypoint-initdb.d
+    command: 
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --default-authentication-plugin=mysql_native_password
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "tgpiler", "-ptgpiler_test"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - tgpiler-network
+
+  # Optional: pgAdmin for PostgreSQL management
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: tgpiler-pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@tgpiler.local
+      PGADMIN_DEFAULT_PASSWORD: admin
+      PGADMIN_CONFIG_SERVER_MODE: 'False'
+    ports:
+      - "5050:80"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - tgpiler-network
+    profiles:
+      - tools
+
+  # Optional: phpMyAdmin for MySQL management  
+  phpmyadmin:
+    image: phpmyadmin:latest
+    container_name: tgpiler-phpmyadmin
+    environment:
+      PMA_HOST: mysql
+      PMA_USER: tgpiler
+      PMA_PASSWORD: tgpiler_test
+    ports:
+      - "8080:80"
+    depends_on:
+      mysql:
+        condition: service_healthy
+    networks:
+      - tgpiler-network
+    profiles:
+      - tools
+
+volumes:
+  postgres_data:
+  mysql_data:
+
+networks:
+  tgpiler-network:
+    driver: bridge

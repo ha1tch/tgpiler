@@ -89,7 +89,13 @@ func (t *transpiler) transpileExpression(expr ast.Expression) (string, error) {
 		return "(" + strings.Join(parts, ", ") + ")", nil
 
 	case *ast.SubqueryExpression:
+		if t.dmlEnabled {
+			return t.transpileSubqueryExpression(e)
+		}
 		return "", fmt.Errorf("subqueries not supported in procedural transpilation")
+
+	case *ast.MethodCallExpression:
+		return t.transpileMethodCallExpression(e)
 
 	default:
 		return "", fmt.Errorf("unsupported expression type: %T", expr)
@@ -430,6 +436,11 @@ func (t *transpiler) inferType(expr ast.Expression) *typeInfo {
 						return &typeInfo{goType: "decimal.Decimal", isDecimal: true, isNumeric: true}
 					}
 				}
+			case "ISNULL", "COALESCE":
+				// Return type is the type of the first argument
+				if len(e.Arguments) > 0 {
+					return t.inferType(e.Arguments[0])
+				}
 			}
 			return t.inferFunctionReturnType(id.Value)
 		}
@@ -437,6 +448,60 @@ func (t *transpiler) inferType(expr ast.Expression) *typeInfo {
 		return typeInfoFromDataType(e.TargetType)
 	case *ast.ConvertExpression:
 		return typeInfoFromDataType(e.TargetType)
+	case *ast.MethodCallExpression:
+		// XML method return types
+		switch strings.ToLower(e.MethodName) {
+		case "value":
+			// Return type depends on the type argument
+			if len(e.Arguments) >= 2 {
+				// Get the type argument (second argument)
+				if str, ok := e.Arguments[1].(*ast.StringLiteral); ok {
+					typeUpper := strings.ToUpper(str.Value)
+					switch {
+					case strings.HasPrefix(typeUpper, "INT"):
+						return &typeInfo{goType: "int32", isNumeric: true}
+					case strings.HasPrefix(typeUpper, "BIGINT"):
+						return &typeInfo{goType: "int64", isNumeric: true}
+					case strings.HasPrefix(typeUpper, "BIT"):
+						return &typeInfo{goType: "bool", isBool: true}
+					case strings.HasPrefix(typeUpper, "DECIMAL"), strings.HasPrefix(typeUpper, "NUMERIC"), strings.HasPrefix(typeUpper, "MONEY"):
+						return &typeInfo{goType: "decimal.Decimal", isDecimal: true, isNumeric: true}
+					case strings.HasPrefix(typeUpper, "FLOAT"), strings.HasPrefix(typeUpper, "REAL"):
+						return &typeInfo{goType: "float64", isNumeric: true}
+					default:
+						return &typeInfo{goType: "string", isString: true}
+					}
+				}
+			}
+			return &typeInfo{goType: "string", isString: true}
+		case "query":
+			return &typeInfo{goType: "string", isString: true}
+		case "exist":
+			return &typeInfo{goType: "bool", isBool: true}
+		case "nodes":
+			return &typeInfo{goType: "[]map[string]interface{}"}
+		case "modify":
+			return &typeInfo{goType: "string", isString: true}
+		default:
+			return &typeInfo{goType: "interface{}"}
+		}
+	case *ast.CaseExpression:
+		// CASE expression type is determined by the result expressions
+		goType := t.inferCaseResultType(e)
+		switch goType {
+		case "int64", "int32":
+			return &typeInfo{goType: goType, isNumeric: true}
+		case "float64":
+			return &typeInfo{goType: "float64", isNumeric: true}
+		case "decimal.Decimal":
+			return &typeInfo{goType: "decimal.Decimal", isDecimal: true, isNumeric: true}
+		case "string":
+			return &typeInfo{goType: "string", isString: true}
+		case "bool":
+			return &typeInfo{goType: "bool", isBool: true}
+		default:
+			return &typeInfo{goType: goType}
+		}
 	}
 
 	// Default: unknown type
@@ -456,6 +521,18 @@ func (t *transpiler) inferFunctionReturnType(funcName string) *typeInfo {
 		return &typeInfo{goType: "time.Time", isDateTime: true}
 	case "DATEDIFF", "YEAR", "MONTH", "DAY", "DATEPART":
 		return &typeInfo{goType: "int32", isNumeric: true}
+	// JSON functions - all return string (JSON_VALUE returns scalar, JSON_QUERY returns JSON object/array)
+	case "JSON_VALUE", "JSON_QUERY", "JSON_MODIFY":
+		return &typeInfo{goType: "string", isString: true}
+	case "ISJSON":
+		return &typeInfo{goType: "int32", isNumeric: true}
+	// XML functions - vary by function
+	case "XML_VALUE", "XMLVALUE":
+		return &typeInfo{goType: "interface{}"}  // XmlValue returns interface{} for type flexibility
+	case "XML_QUERY", "XMLQUERY":
+		return &typeInfo{goType: "string", isString: true}
+	case "XML_EXIST", "XMLEXIST":
+		return &typeInfo{goType: "int", isNumeric: true}  // Returns 1/0
 	default:
 		return &typeInfo{goType: "interface{}"}
 	}
@@ -651,16 +728,29 @@ func (t *transpiler) transpileFunctionCall(fc *ast.FunctionCall) (string, error)
 		}
 
 	case "ISNULL":
-		// ISNULL(a, b) -> if a != nil { a } else { b }
-		// Simplified: just use b for now since we're not handling nulls properly
+		// ISNULL(a, b) -> returns a if not null, else b
+		// For strings: check if empty
+		// For value types: use the value (Go doesn't have null for value types)
 		if len(args) == 2 {
-			return fmt.Sprintf("func() interface{} { if %s != nil { return %s }; return %s }()", args[0], args[0], args[1]), nil
+			argType := t.inferType(fc.Arguments[0])
+			if argType.isString {
+				return fmt.Sprintf("func() string { if %s != \"\" { return %s }; return %s }()", args[0], args[0], args[1]), nil
+			}
+			// For value types, just return the first value
+			// In a real scenario, you'd use sql.Null* types
+			return args[0], nil
 		}
 
 	case "COALESCE":
-		// Similar to ISNULL but with multiple args
+		// COALESCE returns first non-null value
+		// For strings: return first non-empty, or last value as default
 		if len(args) > 0 {
-			return args[len(args)-1], nil // Simplified: return last non-null candidate
+			argType := t.inferType(fc.Arguments[0])
+			if argType.isString && len(args) == 2 {
+				return fmt.Sprintf("func() string { if %s != \"\" { return %s }; return %s }()", args[0], args[0], args[1]), nil
+			}
+			// For other types or >2 args, return first value (simplified)
+			return args[0], nil
 		}
 
 	case "NULLIF":
@@ -901,7 +991,10 @@ func (t *transpiler) transpileDatePart(interval, date string) (string, error) {
 func (t *transpiler) transpileCaseExpression(c *ast.CaseExpression) (string, error) {
 	var out strings.Builder
 
-	out.WriteString("func() interface{} {\n")
+	// Infer the result type from the first WHEN clause
+	resultType := t.inferCaseResultType(c)
+	
+	out.WriteString(fmt.Sprintf("func() %s {\n", resultType))
 
 	if c.Operand != nil {
 		// Simple CASE: CASE expr WHEN val THEN result
@@ -928,7 +1021,7 @@ func (t *transpiler) transpileCaseExpression(c *ast.CaseExpression) (string, err
 			}
 			out.WriteString(fmt.Sprintf("\tdefault:\n\t\treturn %s\n", elseRes))
 		} else {
-			out.WriteString("\tdefault:\n\t\treturn nil\n")
+			out.WriteString(fmt.Sprintf("\tdefault:\n\t\treturn %s\n", t.zeroValueFor(resultType)))
 		}
 		out.WriteString("\t}")
 	} else {
@@ -955,12 +1048,134 @@ func (t *transpiler) transpileCaseExpression(c *ast.CaseExpression) (string, err
 			}
 			out.WriteString(fmt.Sprintf(" else {\n\t\treturn %s\n\t}", elseRes))
 		} else {
-			out.WriteString(" else {\n\t\treturn nil\n\t}")
+			out.WriteString(fmt.Sprintf(" else {\n\t\treturn %s\n\t}", t.zeroValueFor(resultType)))
 		}
 	}
 
 	out.WriteString("\n}()")
 	return out.String(), nil
+}
+
+// inferCaseResultType looks at CASE WHEN results to determine the return type
+func (t *transpiler) inferCaseResultType(c *ast.CaseExpression) string {
+	// Look at the first WHEN clause result
+	if len(c.WhenClauses) > 0 {
+		firstResult := c.WhenClauses[0].Result
+		return t.inferExpressionType(firstResult)
+	}
+	
+	// Look at ELSE clause
+	if c.ElseClause != nil {
+		return t.inferExpressionType(c.ElseClause)
+	}
+	
+	return "interface{}"
+}
+
+// inferExpressionType returns a Go type string for an expression
+func (t *transpiler) inferExpressionType(expr ast.Expression) string {
+	if expr == nil {
+		return "interface{}"
+	}
+	
+	switch e := expr.(type) {
+	case *ast.IntegerLiteral:
+		return "int64"
+	case *ast.FloatLiteral:
+		return "float64"
+	case *ast.StringLiteral:
+		return "string"
+	case *ast.Variable:
+		// Look up variable type from symbols
+		varName := strings.TrimPrefix(e.Name, "@")
+		if sym := t.symbols.lookup(varName); sym != nil {
+			return sym.goType
+		}
+		// Infer from name patterns
+		upperName := strings.ToUpper(varName)
+		if strings.Contains(upperName, "DECIMAL") || strings.Contains(upperName, "AMOUNT") ||
+			strings.Contains(upperName, "PRICE") || strings.Contains(upperName, "TOTAL") ||
+			strings.Contains(upperName, "COST") {
+			t.imports["github.com/shopspring/decimal"] = true
+			return "decimal.Decimal"
+		}
+		return "interface{}"
+	case *ast.InfixExpression:
+		// For arithmetic, infer from operands
+		leftType := t.inferExpressionType(e.Left)
+		rightType := t.inferExpressionType(e.Right)
+		
+		// If either is decimal, result is decimal
+		if leftType == "decimal.Decimal" || rightType == "decimal.Decimal" {
+			t.imports["github.com/shopspring/decimal"] = true
+			return "decimal.Decimal"
+		}
+		// If either is float, result is float
+		if leftType == "float64" || rightType == "float64" {
+			return "float64"
+		}
+		// If both are int, result is int
+		if leftType == "int64" && rightType == "int64" {
+			return "int64"
+		}
+		return "float64" // Default for arithmetic
+	case *ast.FunctionCall:
+		// Certain functions have known return types
+		funcName := strings.ToUpper(e.Function.String())
+		switch funcName {
+		case "COUNT", "LEN", "DATALENGTH":
+			return "int64"
+		case "SUM", "AVG", "MIN", "MAX":
+			// Aggregate functions return same type as input, default to decimal
+			if len(e.Arguments) > 0 {
+				return t.inferExpressionType(e.Arguments[0])
+			}
+			return "float64"
+		case "ROUND", "FLOOR", "CEILING", "ABS":
+			return "float64"
+		}
+	}
+	
+	// Use existing inferType for declared variables
+	typeInfo := t.inferType(expr)
+	if typeInfo.isDecimal {
+		t.imports["github.com/shopspring/decimal"] = true
+		return "decimal.Decimal"
+	}
+	if typeInfo.isNumeric {
+		// Check if it's a float type by looking at goType
+		if typeInfo.goType == "float32" || typeInfo.goType == "float64" {
+			return "float64"
+		}
+		return "int64"
+	}
+	if typeInfo.isString {
+		return "string"
+	}
+	if typeInfo.isBool {
+		return "bool"
+	}
+	
+	return "interface{}"
+}
+
+// zeroValueFor returns the zero value for a Go type
+func (t *transpiler) zeroValueFor(goType string) string {
+	switch goType {
+	case "int32", "int64", "int":
+		return "0"
+	case "float32", "float64":
+		return "0.0"
+	case "string":
+		return `""`
+	case "bool":
+		return "false"
+	case "decimal.Decimal":
+		t.imports["github.com/shopspring/decimal"] = true
+		return "decimal.Zero"
+	default:
+		return "nil"
+	}
 }
 
 func (t *transpiler) transpileCastExpression(c *ast.CastExpression) (string, error) {
@@ -994,6 +1209,14 @@ func (t *transpiler) transpileCastExpression(c *ast.CastExpression) (string, err
 		case "decimal.Decimal":
 			t.imports["github.com/shopspring/decimal"] = true
 			return fmt.Sprintf("decimal.RequireFromString(%s)", expr), nil
+		case "bool":
+			t.imports["strings"] = true
+			// Handle "true", "false", "1", "0" string values
+			return fmt.Sprintf("(strings.ToLower(%s) == \"true\" || %s == \"1\")", expr, expr), nil
+		case "time.Time":
+			t.imports["time"] = true
+			// Try common date formats
+			return fmt.Sprintf("func() time.Time { t, _ := time.Parse(\"2006-01-02\", %s); return t }()", expr), nil
 		}
 	}
 
@@ -1158,4 +1381,103 @@ func (t *transpiler) transpileInExpression(e *ast.InExpression) (string, error) 
 		result = "!" + result
 	}
 	return result, nil
+}
+
+// transpileMethodCallExpression handles XML method calls like @xml.value('/xpath', 'type')
+func (t *transpiler) transpileMethodCallExpression(e *ast.MethodCallExpression) (string, error) {
+	// Get the object (variable) being called on
+	obj, err := t.transpileExpression(e.Object)
+	if err != nil {
+		return "", err
+	}
+
+	// Handle XML methods
+	switch strings.ToLower(e.MethodName) {
+	case "value":
+		// @xml.value('/xpath', 'type') -> XmlValueType(xml, "/xpath")
+		if len(e.Arguments) < 2 {
+			return "", fmt.Errorf("XML .value() requires 2 arguments (xpath, type)")
+		}
+		xpath, err := t.transpileExpression(e.Arguments[0])
+		if err != nil {
+			return "", err
+		}
+		typeName, err := t.transpileExpression(e.Arguments[1])
+		if err != nil {
+			return "", err
+		}
+		
+		// Generate type-specific wrapper based on target type
+		typeUpper := strings.ToUpper(strings.Trim(typeName, "\"'"))
+		switch {
+		case strings.HasPrefix(typeUpper, "INT"):
+			t.imports["strconv"] = true
+			return fmt.Sprintf("func() int32 { s := XmlValueString(%s, %s); if s == \"\" { return 0 }; v, _ := strconv.ParseInt(s, 10, 32); return int32(v) }()", obj, xpath), nil
+		case strings.HasPrefix(typeUpper, "BIGINT"):
+			t.imports["strconv"] = true
+			return fmt.Sprintf("func() int64 { s := XmlValueString(%s, %s); if s == \"\" { return 0 }; v, _ := strconv.ParseInt(s, 10, 64); return v }()", obj, xpath), nil
+		case strings.HasPrefix(typeUpper, "BIT"):
+			t.imports["strings"] = true
+			return fmt.Sprintf("(XmlValueString(%s, %s) == \"1\" || strings.ToLower(XmlValueString(%s, %s)) == \"true\")", obj, xpath, obj, xpath), nil
+		case strings.HasPrefix(typeUpper, "DECIMAL") || strings.HasPrefix(typeUpper, "NUMERIC") || strings.HasPrefix(typeUpper, "MONEY"):
+			t.imports["github.com/shopspring/decimal"] = true
+			return fmt.Sprintf("func() decimal.Decimal { s := XmlValueString(%s, %s); if s == \"\" { return decimal.Zero }; v, _ := decimal.NewFromString(s); return v }()", obj, xpath), nil
+		case strings.HasPrefix(typeUpper, "FLOAT") || strings.HasPrefix(typeUpper, "REAL"):
+			t.imports["strconv"] = true
+			return fmt.Sprintf("func() float64 { s := XmlValueString(%s, %s); if s == \"\" { return 0 }; v, _ := strconv.ParseFloat(s, 64); return v }()", obj, xpath), nil
+		case strings.HasPrefix(typeUpper, "DATE") || strings.HasPrefix(typeUpper, "DATETIME") || strings.HasPrefix(typeUpper, "DATETIME2"):
+			t.imports["time"] = true
+			return fmt.Sprintf("func() time.Time { s := XmlValueString(%s, %s); if s == \"\" { return time.Time{} }; t, _ := time.Parse(\"2006-01-02\", s); return t }()", obj, xpath), nil
+		default:
+			// String types (NVARCHAR, VARCHAR, CHAR, etc.)
+			return fmt.Sprintf("XmlValueString(%s, %s)", obj, xpath), nil
+		}
+
+	case "query":
+		// @xml.query('/xpath') -> XmlQuery(xml, "/xpath")
+		if len(e.Arguments) < 1 {
+			return "", fmt.Errorf("XML .query() requires 1 argument (xpath)")
+		}
+		xpath, err := t.transpileExpression(e.Arguments[0])
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("XmlQuery(%s, %s)", obj, xpath), nil
+
+	case "exist":
+		// @xml.exist('/xpath') -> XmlExist(xml, "/xpath")
+		if len(e.Arguments) < 1 {
+			return "", fmt.Errorf("XML .exist() requires 1 argument (xpath)")
+		}
+		xpath, err := t.transpileExpression(e.Arguments[0])
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("XmlExist(%s, %s)", obj, xpath), nil
+
+	case "nodes":
+		// @xml.nodes('/xpath') -> XmlNodes(xml, "/xpath")
+		if len(e.Arguments) < 1 {
+			return "", fmt.Errorf("XML .nodes() requires 1 argument (xpath)")
+		}
+		xpath, err := t.transpileExpression(e.Arguments[0])
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("XmlNodes(%s, %s)", obj, xpath), nil
+
+	case "modify":
+		// @xml.modify('...') -> XmlModify(xml, "...")
+		if len(e.Arguments) < 1 {
+			return "", fmt.Errorf("XML .modify() requires 1 argument (dml)")
+		}
+		dml, err := t.transpileExpression(e.Arguments[0])
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("XmlModify(%s, %s)", obj, dml), nil
+
+	default:
+		return "", fmt.Errorf("unsupported method: %s", e.MethodName)
+	}
 }

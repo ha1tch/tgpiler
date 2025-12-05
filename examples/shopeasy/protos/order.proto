@@ -1,0 +1,191 @@
+syntax = "proto3";
+
+package shopeasy.v1;
+
+option go_package = "github.com/example/shopeasy/v1";
+
+import "google/protobuf/timestamp.proto";
+import "common.proto";
+
+// OrderStatus enum
+enum OrderStatus {
+  ORDER_STATUS_UNSPECIFIED = 0;
+  ORDER_STATUS_PENDING = 1;
+  ORDER_STATUS_CONFIRMED = 2;
+  ORDER_STATUS_PROCESSING = 3;
+  ORDER_STATUS_SHIPPED = 4;
+  ORDER_STATUS_DELIVERED = 5;
+  ORDER_STATUS_CANCELLED = 6;
+  ORDER_STATUS_REFUNDED = 7;
+}
+
+// PaymentStatus enum
+enum PaymentStatus {
+  PAYMENT_STATUS_UNSPECIFIED = 0;
+  PAYMENT_STATUS_PENDING = 1;
+  PAYMENT_STATUS_AUTHORIZED = 2;
+  PAYMENT_STATUS_CAPTURED = 3;
+  PAYMENT_STATUS_FAILED = 4;
+  PAYMENT_STATUS_REFUNDED = 5;
+}
+
+// OrderItem represents a line item in an order
+message OrderItem {
+  int64 id = 1;
+  int64 product_id = 2;
+  string product_name = 3;
+  string product_sku = 4;
+  int32 quantity = 5;
+  Money unit_price = 6;
+  Money subtotal = 7;
+  Money tax_amount = 8;
+  Money total = 9;
+}
+
+// Order represents a customer order
+message Order {
+  int64 id = 1;
+  string order_number = 2;
+  int64 user_id = 3;
+  OrderStatus status = 4;
+  PaymentStatus payment_status = 5;
+  Address shipping_address = 6;
+  Address billing_address = 7;
+  repeated OrderItem items = 8;
+  Money subtotal = 9;
+  Money tax_amount = 10;
+  Money shipping_amount = 11;
+  Money discount_amount = 12;
+  Money total = 13;
+  optional string discount_code = 14;
+  optional string notes = 15;
+  optional string tracking_number = 16;
+  optional string carrier = 17;
+  google.protobuf.Timestamp created_at = 18;
+  google.protobuf.Timestamp updated_at = 19;
+  optional google.protobuf.Timestamp shipped_at = 20;
+  optional google.protobuf.Timestamp delivered_at = 21;
+}
+
+// Order operations
+
+message CreateOrderRequest {
+  int64 user_id = 1;
+  Address shipping_address = 2;
+  Address billing_address = 3;
+  optional string discount_code = 4;
+  optional string notes = 5;
+  string payment_method_id = 6;
+}
+
+message CreateOrderResponse {
+  Order order = 1;
+  string payment_intent_id = 2;
+}
+
+message GetOrderRequest {
+  int64 id = 1;
+}
+
+message GetOrderResponse {
+  Order order = 1;
+}
+
+message GetOrderByNumberRequest {
+  string order_number = 1;
+}
+
+message GetOrderByNumberResponse {
+  Order order = 1;
+}
+
+message ListOrdersRequest {
+  int64 user_id = 1;
+  Pagination pagination = 2;
+  optional OrderStatus status = 3;
+  optional google.protobuf.Timestamp from_date = 4;
+  optional google.protobuf.Timestamp to_date = 5;
+}
+
+message ListOrdersResponse {
+  repeated Order orders = 1;
+  PaginatedResponse pagination = 2;
+}
+
+message UpdateOrderStatusRequest {
+  int64 id = 1;
+  OrderStatus status = 2;
+  optional string tracking_number = 3;
+  optional string carrier = 4;
+  optional string notes = 5;
+}
+
+message UpdateOrderStatusResponse {
+  Order order = 1;
+}
+
+message CancelOrderRequest {
+  int64 id = 1;
+  string reason = 2;
+}
+
+message CancelOrderResponse {
+  Order order = 1;
+  bool refund_initiated = 2;
+}
+
+// Payment operations
+
+message ProcessPaymentRequest {
+  int64 order_id = 1;
+  string payment_intent_id = 2;
+}
+
+message ProcessPaymentResponse {
+  bool success = 1;
+  PaymentStatus status = 2;
+  optional string error_message = 3;
+}
+
+message RefundOrderRequest {
+  int64 order_id = 1;
+  Money amount = 2;
+  string reason = 3;
+}
+
+message RefundOrderResponse {
+  bool success = 1;
+  string refund_id = 2;
+}
+
+// Discount validation
+
+message ValidateDiscountCodeRequest {
+  string code = 1;
+  int64 user_id = 2;
+  Money cart_subtotal = 3;
+}
+
+message ValidateDiscountCodeResponse {
+  bool is_valid = 1;
+  optional string error_message = 2;
+  optional Money discount_amount = 3;
+  optional string discount_type = 4;  // "percentage", "fixed"
+}
+
+service OrderService {
+  // Orders
+  rpc CreateOrder(CreateOrderRequest) returns (CreateOrderResponse);
+  rpc GetOrder(GetOrderRequest) returns (GetOrderResponse);
+  rpc GetOrderByNumber(GetOrderByNumberRequest) returns (GetOrderByNumberResponse);
+  rpc ListOrders(ListOrdersRequest) returns (ListOrdersResponse);
+  rpc UpdateOrderStatus(UpdateOrderStatusRequest) returns (UpdateOrderStatusResponse);
+  rpc CancelOrder(CancelOrderRequest) returns (CancelOrderResponse);
+  
+  // Payments
+  rpc ProcessPayment(ProcessPaymentRequest) returns (ProcessPaymentResponse);
+  rpc RefundOrder(RefundOrderRequest) returns (RefundOrderResponse);
+  
+  // Discounts
+  rpc ValidateDiscountCode(ValidateDiscountCodeRequest) returns (ValidateDiscountCodeResponse);
+}

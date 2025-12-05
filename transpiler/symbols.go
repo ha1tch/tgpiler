@@ -16,13 +16,17 @@ type typeInfo struct {
 
 // symbolTable tracks variable declarations and their types.
 type symbolTable struct {
-	variables map[string]*typeInfo
-	parent    *symbolTable // For nested scopes (future use)
+	variables   map[string]*typeInfo
+	parent      *symbolTable // For nested scopes (future use)
+	
+	// Track Go variable declarations (to use = vs :=)
+	declaredVars map[string]bool
 }
 
 func newSymbolTable() *symbolTable {
 	return &symbolTable{
-		variables: make(map[string]*typeInfo),
+		variables:    make(map[string]*typeInfo),
+		declaredVars: make(map[string]bool),
 	}
 }
 
@@ -38,6 +42,22 @@ func (st *symbolTable) lookup(name string) *typeInfo {
 		return st.parent.lookup(name)
 	}
 	return nil
+}
+
+// markDeclared marks a Go variable as having been declared with :=
+func (st *symbolTable) markDeclared(name string) {
+	st.declaredVars[name] = true
+}
+
+// isDeclared checks if a Go variable has been declared
+func (st *symbolTable) isDeclared(name string) bool {
+	if st.declaredVars[name] {
+		return true
+	}
+	if st.parent != nil {
+		return st.parent.isDeclared(name)
+	}
+	return false
 }
 
 // typeInfoFromDataType creates typeInfo from a T-SQL DataType.

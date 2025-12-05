@@ -34,6 +34,9 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		forceL       = fs.Bool("force", false, "Allow overwriting existing files")
 		packageName  = fs.String("p", "main", "Package name for generated code")
 		packageNameL = fs.String("pkg", "main", "Package name for generated code")
+		dmlMode      = fs.Bool("dml", false, "Enable DML mode (SELECT, INSERT, temp tables, etc.)")
+		sqlDialect   = fs.String("dialect", "postgres", "SQL dialect (postgres, mysql, sqlite, sqlserver)")
+		storeVar     = fs.String("store", "r.db", "Store variable name for DML operations")
 		showHelp     = fs.Bool("h", false, "Show help")
 		helpL        = fs.Bool("help", false, "Show help")
 		showVer      = fs.Bool("v", false, "Show version")
@@ -116,6 +119,9 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		outDir:      *outDir,
 		force:       *force,
 		packageName: *packageName,
+		dmlMode:     *dmlMode,
+		sqlDialect:  *sqlDialect,
+		storeVar:    *storeVar,
 		stdin:       stdin,
 		stdout:      stdout,
 		stderr:      stderr,
@@ -137,6 +143,9 @@ type config struct {
 	outDir      string
 	force       bool
 	packageName string
+	dmlMode     bool
+	sqlDialect  string
+	storeVar    string
 	stdin       io.Reader
 	stdout      io.Writer
 	stderr      io.Writer
@@ -190,7 +199,7 @@ func executeStdin(cfg *config) error {
 		return fmt.Errorf("reading stdin: %w", err)
 	}
 
-	result, err := transpiler.Transpile(string(source), cfg.packageName)
+	result, err := doTranspile(cfg, string(source))
 	if err != nil {
 		return err
 	}
@@ -204,12 +213,25 @@ func executeSingleFile(cfg *config) error {
 		return fmt.Errorf("reading %s: %w", cfg.inputFile, err)
 	}
 
-	result, err := transpiler.Transpile(string(source), cfg.packageName)
+	result, err := doTranspile(cfg, string(source))
 	if err != nil {
 		return fmt.Errorf("%s: %w", cfg.inputFile, err)
 	}
 
 	return writeOutput(cfg, cfg.inputFile, result)
+}
+
+// doTranspile calls the appropriate transpiler based on config
+func doTranspile(cfg *config, source string) (string, error) {
+	if cfg.dmlMode {
+		dmlConfig := transpiler.DMLConfig{
+			Backend:    transpiler.BackendSQL,
+			SQLDialect: cfg.sqlDialect,
+			StoreVar:   cfg.storeVar,
+		}
+		return transpiler.TranspileWithDML(source, cfg.packageName, dmlConfig)
+	}
+	return transpiler.Transpile(source, cfg.packageName)
 }
 
 func executeDirectory(cfg *config) error {
@@ -239,7 +261,7 @@ func executeDirectory(cfg *config) error {
 			return fmt.Errorf("reading %s: %w", inputPath, err)
 		}
 
-		result, err := transpiler.Transpile(string(source), cfg.packageName)
+		result, err := doTranspile(cfg, string(source))
 		if err != nil {
 			return fmt.Errorf("%s: %w", inputPath, err)
 		}
@@ -304,6 +326,7 @@ Output (mutually exclusive):
 
 Options:
   -p, --pkg <name>      Package name for generated code (default: main)
+  --dml                 Enable DML mode (SELECT, INSERT, temp tables, JSON/XML)
   -f, --force           Allow overwriting existing files
   -h, --help            Show help
   -v, --version         Show version
@@ -311,6 +334,7 @@ Options:
 Examples:
   tgpiler input.sql                       # file to stdout
   tgpiler input.sql -o output.go          # file to file
+  tgpiler --dml input.sql                 # with DML support (JSON/XML)
   tgpiler -s < input.sql                  # stdin to stdout
   cat input.sql | tgpiler -s              # pipe to stdout
   tgpiler -s -o output.go < input.sql     # stdin to file

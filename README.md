@@ -1,12 +1,16 @@
 # tgpiler
 
-A proof-of-concept T-SQL to Go transpiler. Converts procedural T-SQL stored procedures to Go functions.
+A T-SQL to Go transpiler. Converts procedural T-SQL stored procedures to Go functions, with support for DML operations (SELECT, INSERT, UPDATE, DELETE), JSON/XML processing, and temp tables.
 
 ## Purpose
 
-This tool is designed to help developers migrate business logic trapped in Microsoft SQL Server stored procedures to Go. It handles procedural constructs (variables, control flow, expressions) and generates idiomatic Go code.
+This tool helps developers migrate business logic from Microsoft SQL Server stored procedures to Go. It handles:
 
-**Note:** This is a proof-of-concept. It does not handle database operations (SELECT, INSERT, UPDATE, DELETE) or advanced T-SQL features like cursors, dynamic SQL, or transactions.
+- **Procedural constructs**: Variables, control flow, expressions
+- **DML operations**: SELECT, INSERT, UPDATE, DELETE with database connectivity
+- **JSON functions**: JSON_VALUE, JSON_QUERY, JSON_MODIFY, OPENJSON, FOR JSON
+- **XML functions**: .value(), .query(), .exist(), .nodes(), .modify(), OPENXML, FOR XML
+- **Temp tables**: CREATE TABLE #temp, DROP TABLE #temp
 
 ## Installation
 
@@ -25,8 +29,7 @@ make build
 ## Dependencies
 
 - [ha1tch/tsqlparser](https://github.com/ha1tch/tsqlparser) - T-SQL parser
-- [shopspring/decimal](https://github.com/shopspring/decimal) - Arbitrary-precision decimals (for generated code using DECIMAL/MONEY types)
-
+- [shopspring/decimal](https://github.com/shopspring/decimal) - Arbitrary-precision decimals
 
 ## Usage
 
@@ -47,7 +50,8 @@ Output (mutually exclusive):
   -O, --outdir <path>   Write to directory (creates if needed)
 
 Options:
-  -p, --pkg <n>      Package name for generated code (default: main)
+  -p, --pkg <name>      Package name for generated code (default: main)
+  --dml                 Enable DML mode (SELECT, INSERT, temp tables, JSON/XML)
   -f, --force           Allow overwriting existing files
   -h, --help            Show help
   -v, --version         Show version
@@ -56,23 +60,26 @@ Options:
 ### Examples
 
 ```bash
-# Transpile single file to stdout
+# Transpile procedural logic (default mode)
 tgpiler input.sql
+
+# Transpile with DML support (database operations, JSON/XML)
+tgpiler --dml input.sql
 
 # Transpile with custom package name
 tgpiler -p mypackage input.sql -o output.go
 
-# Read from stdin (explicit flag required)
+# Read from stdin
 tgpiler -s < input.sql
 cat input.sql | tgpiler -s
 
-# Transpile directory of SQL files
-tgpiler -d ./sql -O ./go -p procedures
+# Transpile directory of SQL files with DML mode
+tgpiler --dml -d ./sql -O ./go -p procedures
 ```
 
 ## Testing
 
-The project includes a comprehensive test suite with multiple levels of verification.
+The project includes a comprehensive test suite with 80 T-SQL sample files.
 
 ### Quick Start
 
@@ -80,7 +87,7 @@ The project includes a comprehensive test suite with multiple levels of verifica
 # Run all tests
 make test
 
-# Quick smoke test (~5 key tests)
+# Quick smoke test
 make test-quick
 
 # End-to-end tests (transpile → compile → execute)
@@ -89,76 +96,34 @@ make test-e2e
 
 ### Test Categories
 
-| Command | Description | Tests |
-|---------|-------------|-------|
-| `make test` | Run all unit tests | ~285 |
-| `make test-e2e` | Full end-to-end tests | 68 |
-| `make test-e2e-compile` | Verify all 55 files compile | 56 |
-| `make test-e2e-execute` | Execute 12 transpiled functions | 12 |
-| `make test-compilation` | Syntax verification (gofmt) | 55 |
-| `make test-basic` | Basic algorithm unit tests | ~89 |
-| `make test-nontrivial` | Complex algorithm unit tests | ~85 |
-| `make test-financial` | Financial calculation unit tests | ~44 |
+| Command | Description |
+|---------|-------------|
+| `make test` | Run all unit tests |
+| `make test-e2e` | Full end-to-end tests |
+| `make test-e2e-compile` | Verify all files compile |
+| `make test-e2e-execute` | Execute transpiled functions |
+| `make test-compilation` | Syntax verification (gofmt) |
+| `make test-structured` | JSON/XML DML mode tests |
 
-### End-to-End Testing
-
-The e2e test suite provides full verification that generated code actually works:
-
-1. **Compile All** (`TestE2ECompileAll`): Transpiles all 55 SQL files, writes them to a temp workspace with `go.mod`, and runs `go build` to verify they compile as a package.
-
-2. **Execute Tests** (`TestE2EExecuteBasic`, `TestE2EExecuteFinancial`, `TestE2EExecuteNontrivial`): Transpiles SQL files, wraps functions in a test harness, compiles to a binary, executes, and verifies output matches expected values.
-
-Functions verified by execution:
-
-| Category | Function | Test Input | Expected |
-|----------|----------|------------|----------|
-| Basic | `AddNumbers` | 10, 20 | 30 |
-| Basic | `Factorial` | 5 | 120 |
-| Basic | `Gcd` | 48, 18 | 6 |
-| Basic | `IsPrime` | 17, 18 | true, false |
-| Basic | `Fibonacci` | 10 | 55 |
-| Financial | `FutureValue` | $10k, 5%, 10yr | $16,470.09 |
-| Financial | `LoanPayment` | $250k, 6.5%, 30yr | $1,580.17/mo |
-| Financial | `StraightLineDepreciation` | $10k, $2k salvage, 5yr | $1,600/yr |
-| Nontrivial | `LevenshteinDistance` | "kitten", "sitting" | 3 |
-| Nontrivial | `ExtendedEuclidean` | 35, 15 | gcd=5, x=1, y=-2 |
-| Nontrivial | `CalculateEasterDate` | 2024 | March 31 |
-| Nontrivial | `ModularExponentiation` | 2^10 mod 1000 | 24 |
-
-### Scripts
-
-Convenience scripts are available in `scripts/`:
+### Structured Data Tests (JSON/XML)
 
 ```bash
-./scripts/test-all.sh         # Run all tests with summary
-./scripts/test-e2e.sh         # End-to-end tests (compile + execute)
-./scripts/test-quick.sh       # Quick smoke test
-./scripts/test-compilation.sh # Compilation verification only
-./scripts/test-financial.sh   # Financial tests only
-./scripts/transpile.sh FILE   # Transpile and display output
-./scripts/build.sh            # Build the binary
-```
+# Run all structured data tests
+go test -v ./tests/... -run "TestCompilationStructured|TestStructuredFullBuild|TestE2EExecute"
 
-### Makefile Targets
+# Compilation only (fast)
+go test -v ./tests/... -run TestCompilationStructuredDML
 
-```bash
-make help              # Show all available targets
-make build             # Build the transpiler
-make test              # Run all unit tests
-make test-e2e          # Full end-to-end tests
-make test-e2e-compile  # Verify all files compile
-make test-e2e-execute  # Execute selected functions
-make test-quick        # Quick smoke test
-make test-compilation  # Verify transpilation syntax
-make transpile-all     # Transpile all samples to /tmp
-make fmt               # Format code
-make lint              # Run go vet
-make clean             # Remove build artifacts
+# Full build test (all 25 files as a package)
+go test -v ./tests/... -run TestStructuredFullBuild
+
+# E2E execution tests
+go test -v ./tests/... -run "TestE2EExecuteJSON|TestE2EExecuteXML"
 ```
 
 ## Sample Files
 
-The project includes 55 T-SQL sample files demonstrating supported features:
+The project includes 80 T-SQL sample files across 4 categories:
 
 ### Basic Algorithms (`tsql_basic/`) — 20 files
 
@@ -183,7 +148,7 @@ The project includes 55 T-SQL sample files demonstrating supported features:
 | 17_roman_numerals.sql | ToRomanNumeral | Number conversion |
 | 18_luhn_validation.sql | ValidateCreditCard | Luhn algorithm |
 | 19_math_utils.sql | MathUtils | Multiple functions |
-| 20_order_processing.sql | ProcessOrder | Business logic with validation |
+| 20_order_processing.sql | ProcessOrder | Business logic |
 
 ### Non-Trivial Algorithms (`tsql_nontrivial/`) — 15 files
 
@@ -218,7 +183,7 @@ The project includes 55 T-SQL sample files demonstrating supported features:
 | 07_straight_line_depreciation.sql | StraightLineDepreciation | Asset depreciation |
 | 08_declining_balance_depreciation.sql | DecliningBalanceDepreciation | Accelerated depreciation |
 | 09_markup_margin.sql | MarkupMargin | Markup ↔ margin conversion |
-| 10_break_even.sql | BreakEvenAnalysis | Break-even point analysis |
+| 10_break_even.sql | BreakEvenAnalysis | Break-even point |
 | 11_amortization_period.sql | AmortizationPeriod | Per-period loan breakdown |
 | 12_irr.sql | InternalRateOfReturn | Newton-Raphson IRR |
 | 13_npv.sql | NetPresentValue | NPV with profitability index |
@@ -228,7 +193,37 @@ The project includes 55 T-SQL sample files demonstrating supported features:
 | 17_loan_comparison.sql | LoanComparison | Compare loans with fees |
 | 18_sinking_fund.sql | SinkingFund | Required periodic deposits |
 | 19_effective_rate_with_fees.sql | EffectiveRateWithFees | True APR with all fees |
-| 20_portfolio_return.sql | PortfolioWeightedReturn | Weighted return & Sharpe ratio |
+| 20_portfolio_return.sql | PortfolioWeightedReturn | Weighted return & Sharpe |
+
+### Structured Data — JSON/XML (`tsql_structured/`) — 25 files
+
+| File | Function | Description |
+|------|----------|-------------|
+| 01_json_value_extract.sql | ParseCustomerJson | JSON_VALUE scalar extraction |
+| 02_json_nested_extract.sql | ParseOrderJson | Nested JSON with ISJSON |
+| 03_openjson_basic.sql | ParseJsonArray | OPENJSON without schema |
+| 04_openjson_schema.sql | ParseProductsJson | OPENJSON WITH schema |
+| 05_json_modify.sql | UpdateCustomerJson | JSON_MODIFY updates |
+| 06_for_json_path.sql | BuildOrdersJson | FOR JSON PATH output |
+| 07_for_json_root.sql | BuildCustomerJson | FOR JSON with ROOT |
+| 08_json_validate_process.sql | ValidateAndProcessJson | JSON validation workflow |
+| 09_json_aggregate.sql | CalculateOrderTotals | JSON array aggregation |
+| 10_json_merge.sql | MergeJsonDocuments | JSON document merging |
+| 11_xml_value_extract.sql | ParseCustomerXml | XML .value() extraction |
+| 12_xml_attributes.sql | ParseProductXmlAttributes | XML attribute extraction |
+| 13_xml_exist.sql | ValidateOrderXml | XML .exist() validation |
+| 14_xml_nodes.sql | ParseInvoiceItems | XML .nodes() shredding |
+| 15_openxml.sql | ImportEmployeesXml | OPENXML legacy pattern |
+| 16_for_xml_raw.sql | BuildEmployeesXml | FOR XML RAW output |
+| 17_for_xml_path_elements.sql | BuildOrderXml | FOR XML PATH ELEMENTS |
+| 18_xml_query.sql | ExtractXmlFragment | XML .query() fragments |
+| 19_xml_aggregate.sql | SummarizeXmlData | XML data aggregation |
+| 20_xml_modify.sql | UpdateConfigXml | XML .modify() DML |
+| 21_xml_to_json.sql | ConvertXmlToJson | XML to JSON conversion |
+| 22_json_to_xml.sql | ConvertJsonToXml | JSON to XML conversion |
+| 23_json_config.sql | ParseAppConfig | JSON config parsing |
+| 24_xml_invoice.sql | ProcessInvoiceXml | Complex XML invoice |
+| 25_json_api_response.sql | BuildApiResponse | JSON API response builder |
 
 ## Supported Features
 
@@ -247,6 +242,46 @@ The project includes 55 T-SQL sample files demonstrating supported features:
 | `BREAK / CONTINUE` | `break / continue` |
 | `PRINT` | `fmt.Println` |
 | `OUTPUT` parameters | Named return values |
+| `RAISERROR` | `fmt.Errorf` / `return err` |
+
+### DML Operations (--dml mode)
+
+| T-SQL | Go |
+|-------|-----|
+| `SELECT ... INTO @var` | `db.QueryRowContext().Scan()` |
+| `SELECT ... FROM` | `db.QueryContext()` with row iteration |
+| `INSERT INTO` | `db.ExecContext()` |
+| `UPDATE` | `db.ExecContext()` |
+| `DELETE` | `db.ExecContext()` |
+| `CREATE TABLE #temp` | `tsqlruntime.TempTableManager` |
+| `DROP TABLE #temp` | `tempTables.DropTempTable()` |
+
+### JSON Functions (--dml mode)
+
+| T-SQL | Go |
+|-------|-----|
+| `JSON_VALUE(json, path)` | `JsonValue(json, path)` |
+| `JSON_QUERY(json, path)` | `JsonQuery(json, path)` |
+| `JSON_MODIFY(json, path, val)` | `JsonModify(json, path, val)` |
+| `ISJSON(string)` | `Isjson(string)` |
+| `OPENJSON(json)` | Table-valued function |
+| `OPENJSON(json) WITH (...)` | Typed table-valued function |
+| `FOR JSON PATH` | JSON array output |
+| `FOR JSON AUTO` | Automatic JSON structure |
+
+### XML Functions (--dml mode)
+
+| T-SQL | Go |
+|-------|-----|
+| `@xml.value(xpath, type)` | `XmlValueString()` with type conversion |
+| `@xml.query(xpath)` | `XmlQuery()` |
+| `@xml.exist(xpath)` | `XmlExist()` returns `bool` |
+| `@xml.nodes(xpath)` | `XmlNodes()` |
+| `@xml.modify(dml)` | `XmlModify()` |
+| `OPENXML(@hdoc, path) WITH` | Legacy XML shredding |
+| `FOR XML RAW` | XML element output |
+| `FOR XML PATH` | Customised XML structure |
+| `FOR XML PATH, ELEMENTS` | Element-centric XML |
 
 ### Type Mapping
 
@@ -263,55 +298,29 @@ The project includes 55 T-SQL sample files demonstrating supported features:
 | `BIT` | `bool` |
 | `BINARY`, `VARBINARY` | `[]byte` |
 | `UNIQUEIDENTIFIER` | `string` |
-
-### Decimal Handling
-
-The transpiler includes comprehensive support for `decimal.Decimal` operations:
-
-- Arithmetic: `Add`, `Sub`, `Mul`, `Div`, `Mod`
-- Comparisons: `LessThan`, `GreaterThan`, `Equal`, `LessThanOrEqual`, `GreaterThanOrEqual`
-- Unary minus: `.Neg()` method
-- Power: `.Pow()` for decimal exponents
-- Math functions: `Abs`, `Ceil`, `Floor`, `Round`
-- Type conversions: `IntPart()`, `InexactFloat64()`, `String()`
-- Null handling: `decimal.Zero` for NULL assignments
+| `XML` | `string` |
 
 ### Expressions & Functions
 
-- Arithmetic operators with proper decimal handling
-- Comparison operators (including datetime comparisons via `.Before()`, `.After()`, `.Equal()`)
-- Logical operators (`AND` → `&&`, `OR` → `||`, `NOT` → `!`)
-- `CAST` / `CONVERT` with proper type coercion
-- `CASE` expressions (simple and searched)
-- `IIF`
-- String functions: `LEN`, `UPPER`, `LOWER`, `TRIM`, `LTRIM`, `RTRIM`, `SUBSTRING`, `LEFT`, `RIGHT`, `CHARINDEX`, `REPLACE`, `REPLICATE`, `CONCAT`, `CONCAT_WS`
-- Math functions: `ABS`, `CEILING`, `FLOOR`, `ROUND`, `POWER`, `SQRT`, `SIGN`
-- Date functions: `GETDATE`, `DATEADD`, `DATEDIFF`, `YEAR`, `MONTH`, `DAY`, `DATEPART`
-- NULL functions: `ISNULL`, `COALESCE`, `NULLIF`
-- Error functions: `ERROR_MESSAGE` (in CATCH blocks)
+**String functions:** `LEN`, `UPPER`, `LOWER`, `TRIM`, `LTRIM`, `RTRIM`, `SUBSTRING`, `LEFT`, `RIGHT`, `CHARINDEX`, `REPLACE`, `REPLICATE`, `CONCAT`, `CONCAT_WS`, `STRING_AGG`
 
-### Comments
+**Math functions:** `ABS`, `CEILING`, `FLOOR`, `ROUND`, `POWER`, `SQRT`, `SIGN`, `LOG`, `LOG10`, `EXP`
 
-Comments are preserved and associated with nearby code:
+**Date functions:** `GETDATE`, `SYSDATETIME`, `DATEADD`, `DATEDIFF`, `YEAR`, `MONTH`, `DAY`, `DATEPART`, `DATENAME`, `EOMONTH`
 
-```sql
--- Calculate the total
-SET @Total = @Price * @Quantity
-```
+**NULL functions:** `ISNULL`, `COALESCE`, `NULLIF`
 
-Becomes:
+**Conversion:** `CAST`, `CONVERT`, `TRY_CAST`, `TRY_CONVERT`
 
-```go
-// Calculate the total
-Total = Price.Mul(decimal.NewFromInt(int64(Quantity)))
-```
+**Other:** `CASE` expressions, `IIF`, `CHOOSE`, `ERROR_MESSAGE`
 
-## Example
+## Examples
+
+### Basic Procedural Logic
 
 Input (`discount.sql`):
 
 ```sql
--- Calculate discount for a purchase
 CREATE PROCEDURE dbo.CalculateDiscount
     @Price DECIMAL(10,2),
     @Quantity INT,
@@ -319,10 +328,8 @@ CREATE PROCEDURE dbo.CalculateDiscount
 AS
 BEGIN
     DECLARE @Discount DECIMAL(10,2) = 0
-    
     SET @Total = @Price * @Quantity
     
-    -- Apply volume discount
     IF @Quantity >= 100
         SET @Discount = @Total * 0.15
     ELSE IF @Quantity >= 50
@@ -337,18 +344,14 @@ Output:
 ```go
 package main
 
-import (
-    "github.com/shopspring/decimal"
-)
+import "github.com/shopspring/decimal"
 
-// Calculate discount for a purchase
 func CalculateDiscount(Price decimal.Decimal, Quantity int32) (Total decimal.Decimal) {
     var Discount decimal.Decimal = decimal.NewFromInt(0)
     Total = Price.Mul(decimal.NewFromInt(int64(Quantity)))
-    // Apply volume discount
-    if (Quantity >= 100) {
+    if Quantity >= 100 {
         Discount = Total.Mul(decimal.NewFromFloat(0.15))
-    } else if (Quantity >= 50) {
+    } else if Quantity >= 50 {
         Discount = Total.Mul(decimal.NewFromFloat(0.10))
     }
     Total = Total.Sub(Discount)
@@ -356,75 +359,176 @@ func CalculateDiscount(Price decimal.Decimal, Quantity int32) (Total decimal.Dec
 }
 ```
 
+### JSON Processing (--dml mode)
+
+Input:
+
+```sql
+CREATE PROCEDURE dbo.ParseCustomerJson
+    @JsonData NVARCHAR(MAX),
+    @CustomerName NVARCHAR(100) OUTPUT,
+    @CustomerId INT OUTPUT,
+    @Email NVARCHAR(200) OUTPUT
+AS
+BEGIN
+    SET @CustomerName = JSON_VALUE(@JsonData, '$.customer.name')
+    SET @CustomerId = CAST(JSON_VALUE(@JsonData, '$.customer.id') AS INT)
+    SET @Email = JSON_VALUE(@JsonData, '$.customer.email')
+END
+```
+
+Output (`tgpiler --dml`):
+
+```go
+package main
+
+import "strconv"
+
+func ParseCustomerJson(jsonData string) (customerName string, customerId int32, email string) {
+    customerName = JsonValue(jsonData, "$.customer.name")
+    customerId = func() int32 { 
+        v, _ := strconv.ParseInt(JsonValue(jsonData, "$.customer.id"), 10, 32)
+        return int32(v) 
+    }()
+    email = JsonValue(jsonData, "$.customer.email")
+    return customerName, customerId, email
+}
+```
+
+### XML Validation (--dml mode)
+
+Input:
+
+```sql
+CREATE PROCEDURE dbo.ValidateOrderXml
+    @XmlData XML,
+    @IsValid BIT OUTPUT,
+    @HasCustomer BIT OUTPUT
+AS
+BEGIN
+    SET @HasCustomer = @XmlData.exist('/order/customer')
+    IF @HasCustomer = 0
+        SET @IsValid = 0
+    ELSE
+        SET @IsValid = 1
+END
+```
+
+Output (`tgpiler --dml`):
+
+```go
+package main
+
+func ValidateOrderXml(xmlData string) (isValid bool, hasCustomer bool) {
+    hasCustomer = XmlExist(xmlData, "/order/customer")
+    if !hasCustomer {
+        isValid = false
+    } else {
+        isValid = true
+    }
+    return isValid, hasCustomer
+}
+```
+
 ## Project Structure
 
 ```
 tgpiler/
-├── cmd/tgpiler/        # CLI entry point
-├── transpiler/         # Core transpilation logic
-│   ├── transpiler.go   # Main transpiler, control flow
-│   ├── expressions.go  # Expression handling, operators
-│   ├── types.go        # Type mapping
-│   ├── symbols.go      # Symbol table
-│   └── comments.go     # Comment preservation
-├── tests/              # Test suite
-│   ├── e2e_test.go           # End-to-end tests
-│   ├── compilation_test.go   # Transpilation verification
-│   ├── basic_test.go         # Basic algorithm tests
-│   ├── nontrivial_test.go    # Complex algorithm tests
-│   └── financial_test.go     # Financial calculation tests
-├── tsql_basic/         # 20 basic T-SQL samples
-├── tsql_nontrivial/    # 15 non-trivial T-SQL samples
-├── tsql_financial/     # 20 financial T-SQL samples
-├── scripts/            # Convenience scripts
-├── Makefile            # Build and test automation
+├── cmd/tgpiler/           # CLI entry point
+├── transpiler/            # Core transpilation logic
+│   ├── transpiler.go      # Main transpiler, control flow
+│   ├── expressions.go     # Expression handling
+│   ├── dml.go             # DML statement transpilation
+│   ├── types.go           # Type mapping
+│   ├── symbols.go         # Symbol table
+│   └── comments.go        # Comment preservation
+├── tsqlruntime/           # Runtime library
+│   ├── json.go            # JSON function implementations
+│   ├── xml.go             # XML function implementations
+│   ├── ddl.go             # Temp table support
+│   └── functions.go       # Built-in function implementations
+├── adapter/               # Database adapter patterns
+├── storage/               # DML analysis utilities
+├── protogen/              # Protocol buffer generation
+├── mock/                  # Mock implementations for testing
+├── tests/                 # Test suite
+│   ├── e2e_test.go        # End-to-end tests
+│   ├── structured_test.go # JSON/XML DML tests
+│   ├── compilation_test.go
+│   ├── basic_test.go
+│   ├── nontrivial_test.go
+│   └── financial_test.go
+├── tsql_basic/            # 20 basic T-SQL samples
+├── tsql_nontrivial/       # 15 non-trivial T-SQL samples
+├── tsql_financial/        # 20 financial T-SQL samples
+├── tsql_structured/       # 25 JSON/XML T-SQL samples
+├── scripts/               # Convenience scripts
+├── Makefile               # Build and test automation
 └── README.md
 ```
 
-## Recent Changes
+## Runtime Library
 
-### Bug Fixes (Latest)
+The `tsqlruntime` package provides Go implementations of T-SQL functions:
 
-- **POWER/SQRT return type**: Functions now correctly return `decimal.Decimal` when argument is decimal
-- **TRY/CATCH RETURN**: RETURN statements inside TRY blocks now generate correct code for anonymous functions
-- **Integer literal recognition**: Negative literals like `-1` are now properly recognised, avoiding unnecessary type promotions
-- **String NULL comparisons**: Comparisons between strings and NULL now use `""` instead of `nil`
-- **Decimal NULL assignment**: `SET @DecimalVar = NULL` now generates `decimal.Zero` without double-wrapping
+```go
+import "github.com/ha1tch/tgpiler/tsqlruntime"
 
-### CLI Improvements
+// JSON functions
+value, err := tsqlruntime.JSONValue(jsonStr, "$.customer.name")
+query, err := tsqlruntime.JSONQuery(jsonStr, "$.items")
+modified, err := tsqlruntime.JSONModify(jsonStr, "$.status", "active")
+isValid, err := tsqlruntime.IsJSON(jsonStr)
 
-- Running `tgpiler` with no arguments now shows help (previously read from stdin)
-- Explicit `-s`/`--stdin` flag required for stdin input
-- Mutually exclusive input modes are validated
+// XML functions  
+value, err := tsqlruntime.XMLValue(xmlStr, "/order/id", tsqlruntime.TypeInt)
+exists, err := tsqlruntime.XMLExist(xmlStr, "/order/customer")
+fragment, err := tsqlruntime.XMLQuery(xmlStr, "/order/items")
 
-## Not Supported (Yet)
+// Temp tables
+tempTables := tsqlruntime.NewTempTableManager()
+tempTables.CreateTempTable("#Orders", columns)
+tempTables.DropTempTable("#Orders")
+```
 
-- `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `MERGE`
+## Makefile Targets
+
+```bash
+make help              # Show all available targets
+make build             # Build the transpiler
+make test              # Run all unit tests
+make test-e2e          # Full end-to-end tests
+make test-structured   # JSON/XML DML tests
+make test-quick        # Quick smoke test
+make transpile-all     # Transpile all samples to /tmp
+make fmt               # Format code
+make lint              # Run go vet
+make clean             # Remove build artifacts
+```
+
+## Limitations
+
+The following T-SQL features are not yet supported:
+
 - Cursors
-- Table variables and temp tables
 - `EXEC` / `EXECUTE` (calling other procedures)
 - Dynamic SQL (`EXEC(@sql)`)
 - Transactions (`BEGIN TRAN`, `COMMIT`, `ROLLBACK`)
-- `RAISERROR` / `THROW`
-- User-defined functions
+- User-defined functions (UDFs)
 - Common Table Expressions (CTEs)
-- Window functions
+- Window functions (`ROW_NUMBER`, `RANK`, etc.)
+- `MERGE` statements
+- Linked servers / distributed queries
 
 ## Author
 
-Copyright (C) 2025 haitch
+Copyright (C) 2025 haitch — h@ual.fi
 
-h@ual.fi
+## Licence
 
-## License
-
-GNU GENERAL PUBLIC LICENSE VERSION 3.0
+GNU General Public License v3.0
 
 https://github.com/ha1tch/tgpiler?tab=GPL-3.0-1-ov-file#readme
-
-## Disclaimer
-
-This is a proof-of-concept. It is released for educational purposes only, don't use in production.
 
 ## Related Projects
 
