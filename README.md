@@ -8,6 +8,7 @@ This tool helps developers migrate business logic from Microsoft SQL Server stor
 
 - **Procedural constructs**: Variables, control flow, expressions
 - **DML operations**: SELECT, INSERT, UPDATE, DELETE with database connectivity
+- **Cursors**: DECLARE CURSOR, OPEN, FETCH, CLOSE, DEALLOCATE → idiomatic Go iteration
 - **JSON functions**: JSON_VALUE, JSON_QUERY, JSON_MODIFY, OPENJSON, FOR JSON
 - **XML functions**: .value(), .query(), .exist(), .nodes(), .modify(), OPENXML, FOR XML
 - **Temp tables**: CREATE TABLE #temp, DROP TABLE #temp
@@ -243,6 +244,7 @@ The project includes 80 T-SQL sample files across 4 categories:
 | `PRINT` | `fmt.Println` |
 | `OUTPUT` parameters | Named return values |
 | `RAISERROR` | `fmt.Errorf` / `return err` |
+| `@@FETCH_STATUS` | `rows.Next()` loop condition |
 
 ### DML Operations (--dml mode)
 
@@ -255,6 +257,7 @@ The project includes 80 T-SQL sample files across 4 categories:
 | `DELETE` | `db.ExecContext()` |
 | `CREATE TABLE #temp` | `tsqlruntime.TempTableManager` |
 | `DROP TABLE #temp` | `tempTables.DropTempTable()` |
+| `DECLARE CURSOR ... OPEN ... FETCH ... CLOSE` | `db.QueryContext()` with `rows.Next()` loop |
 
 ### JSON Functions (--dml mode)
 
@@ -430,6 +433,61 @@ func ValidateOrderXml(xmlData string) (isValid bool, hasCustomer bool) {
 }
 ```
 
+### Cursor Processing (--dml mode)
+
+Input:
+
+```sql
+CREATE PROCEDURE dbo.ProcessUsers
+AS
+BEGIN
+    DECLARE @UserID INT, @Email NVARCHAR(100)
+    
+    DECLARE user_cursor CURSOR FOR
+        SELECT ID, Email FROM Users WHERE IsActive = 1
+    
+    OPEN user_cursor
+    FETCH NEXT FROM user_cursor INTO @UserID, @Email
+    
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        PRINT @Email
+        FETCH NEXT FROM user_cursor INTO @UserID, @Email
+    END
+    
+    CLOSE user_cursor
+    DEALLOCATE user_cursor
+END
+```
+
+Output (`tgpiler --dml`):
+
+```go
+package main
+
+import "fmt"
+
+func ProcessUsers() {
+    var userId int32
+    var email string
+    
+    // Cursor becomes idiomatic Go row iteration
+    userCursorRows, err := r.db.QueryContext(ctx, 
+        "SELECT ID, Email FROM Users WHERE IsActive = 1")
+    if err != nil {
+        return err
+    }
+    defer userCursorRows.Close()
+    
+    for userCursorRows.Next() {
+        if err := userCursorRows.Scan(&userId, &email); err != nil {
+            return err
+        }
+        fmt.Println(email)
+    }
+}
+```
+
 ## Project Structure
 
 ```
@@ -489,6 +547,14 @@ fragment, err := tsqlruntime.XMLQuery(xmlStr, "/order/items")
 tempTables := tsqlruntime.NewTempTableManager()
 tempTables.CreateTempTable("#Orders", columns)
 tempTables.DropTempTable("#Orders")
+
+// Cursors (for interpreter mode)
+cursorMgr := tsqlruntime.NewCursorManager()
+cursor, _ := cursorMgr.DeclareCursor("myCursor", query, false, 
+    tsqlruntime.CursorForwardOnly, tsqlruntime.CursorScrollNone, tsqlruntime.CursorReadOnly)
+cursor.Open(columns, rows)
+row, status := cursor.FetchNext()  // Also: FetchPrior, FetchFirst, FetchLast, FetchAbsolute
+cursor.Close()
 ```
 
 ## Makefile Targets
@@ -510,7 +576,6 @@ make clean             # Remove build artifacts
 
 The following T-SQL features are not yet supported:
 
-- Cursors
 - `EXEC` / `EXECUTE` (calling other procedures)
 - Dynamic SQL (`EXEC(@sql)`)
 - Transactions (`BEGIN TRAN`, `COMMIT`, `ROLLBACK`)
