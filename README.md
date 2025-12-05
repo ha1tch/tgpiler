@@ -132,7 +132,7 @@ go test -v ./tests/... -run "TestE2EExecuteJSON|TestE2EExecuteXML"
 
 ## Sample Files
 
-The project includes 80 T-SQL sample files across 4 categories:
+The project includes 90 T-SQL sample files across 5 categories:
 
 ### Basic Algorithms (`tsql_basic/`) — 20 files
 
@@ -234,6 +234,21 @@ The project includes 80 T-SQL sample files across 4 categories:
 | 24_xml_invoice.sql | ProcessInvoiceXml | Complex XML invoice |
 | 25_json_api_response.sql | BuildApiResponse | JSON API response builder |
 
+### CTEs and Window Functions (`tsql_cte/`) — 10 files
+
+| File | Function | Description |
+|------|----------|-------------|
+| 01_simple_cte.sql | GetCustomerSummary | Basic CTE usage |
+| 02_multiple_cte.sql | GetCustomerMetrics | Multiple CTEs in one query |
+| 03_recursive_cte.sql | GetEmployeeHierarchy | Recursive CTE (org chart) |
+| 04_cte_insert.sql | ArchiveOldOrders | CTE with INSERT |
+| 05_cte_update.sql | UpdateCustomerTiers | CTE with UPDATE |
+| 06_cte_delete.sql | RemoveDuplicateOrders | CTE with DELETE |
+| 07_window_ranking.sql | GetProductRankings | ROW_NUMBER, RANK, DENSE_RANK, NTILE |
+| 08_window_navigation.sql | GetOrderHistory | LEAD, LAG, FIRST_VALUE, LAST_VALUE |
+| 09_window_aggregates.sql | GetSalesAnalysis | Running totals, moving averages |
+| 10_pagination.sql | GetOrdersPage | ROW_NUMBER for pagination |
+
 ## Supported Features
 
 ### Procedural Constructs
@@ -293,6 +308,41 @@ The project includes 80 T-SQL sample files across 4 categories:
 | `FOR XML RAW` | XML element output |
 | `FOR XML PATH` | Customised XML structure |
 | `FOR XML PATH, ELEMENTS` | Element-centric XML |
+
+### Window Functions (--dml mode)
+
+Window functions are fully supported with automatic type inference. The transpiler analyses each window function and assigns the correct Go type:
+
+| Window Function | Go Type | Notes |
+|-----------------|---------|-------|
+| `ROW_NUMBER()` | `int64` | Always returns row position |
+| `RANK()` | `int64` | Rank with gaps |
+| `DENSE_RANK()` | `int64` | Rank without gaps |
+| `NTILE(n)` | `int64` | Bucket number |
+| `PERCENT_RANK()` | `float64` | Relative rank (0.0 to 1.0) |
+| `CUME_DIST()` | `float64` | Cumulative distribution |
+| `LEAD(expr)` | *Same as expr* | Next row value |
+| `LAG(expr)` | *Same as expr* | Previous row value |
+| `FIRST_VALUE(expr)` | *Same as expr* | First value in window |
+| `LAST_VALUE(expr)` | *Same as expr* | Last value in window |
+| `COUNT(*) OVER` | `int64` | Running/windowed count |
+| `SUM(expr) OVER` | `decimal.Decimal` | Running/windowed sum |
+| `AVG(expr) OVER` | `decimal.Decimal` | Running/windowed average |
+| `MIN(expr) OVER` | *Same as expr* | Running/windowed minimum |
+| `MAX(expr) OVER` | *Same as expr* | Running/windowed maximum |
+
+### CTEs (Common Table Expressions)
+
+CTEs are fully supported in both transpiler and interpreter modes:
+
+| CTE Pattern | Support |
+|-------------|---------|
+| Simple CTE | `WITH Sales AS (...) SELECT ...` |
+| Multiple CTEs | `WITH A AS (...), B AS (...) SELECT ...` |
+| Recursive CTE | `WITH Hierarchy AS (... UNION ALL ...) SELECT ...` |
+| CTE + INSERT | `WITH Source AS (...) INSERT INTO ... SELECT ...` |
+| CTE + UPDATE | `WITH Calc AS (...) UPDATE ... FROM ... JOIN Calc` |
+| CTE + DELETE | `WITH Dups AS (...) DELETE FROM Dups WHERE ...` |
 
 ### Type Mapping
 
@@ -496,6 +546,128 @@ func ProcessUsers() {
 }
 ```
 
+### Window Functions with Type Inference (--dml mode)
+
+Input:
+
+```sql
+CREATE PROCEDURE dbo.GetSalesRankings
+    @CategoryID INT
+AS
+BEGIN
+    SELECT 
+        ProductID,
+        ProductName,
+        Price,
+        ROW_NUMBER() OVER (ORDER BY Price DESC) AS PriceRank,
+        PERCENT_RANK() OVER (ORDER BY Price) AS PercentileRank,
+        SUM(Price) OVER (ORDER BY Price ROWS UNBOUNDED PRECEDING) AS RunningTotal,
+        LAG(Price, 1, 0) OVER (ORDER BY Price) AS PreviousPrice
+    FROM Products
+    WHERE CategoryID = @CategoryID
+END
+```
+
+Output (`tgpiler --dml`):
+
+```go
+package main
+
+import "github.com/shopspring/decimal"
+
+func GetSalesRankings(categoryId int32) error {
+    var productId int64
+    var productName string
+    var price decimal.Decimal
+    var priceRank int64           // ROW_NUMBER → int64
+    var percentileRank float64    // PERCENT_RANK → float64
+    var runningTotal decimal.Decimal  // SUM(Price) → decimal.Decimal
+    var previousPrice decimal.Decimal // LAG(Price) → same as Price
+    
+    rows, err := r.db.QueryContext(ctx, 
+        `SELECT ProductID, ProductName, Price,
+         ROW_NUMBER() OVER (ORDER BY Price DESC) AS PriceRank,
+         PERCENT_RANK() OVER (ORDER BY Price ASC) AS PercentileRank,
+         SUM(Price) OVER (ORDER BY Price ASC ROWS UNBOUNDED PRECEDING) AS RunningTotal,
+         LAG(Price, 1, 0) OVER (ORDER BY Price ASC) AS PreviousPrice
+         FROM Products WHERE CategoryID = $1`, categoryId)
+    if err != nil {
+        return err
+    }
+    defer rows.Close()
+    
+    for rows.Next() {
+        if err := rows.Scan(&productId, &productName, &price, 
+            &priceRank, &percentileRank, &runningTotal, &previousPrice); err != nil {
+            return err
+        }
+    }
+    return nil
+}
+```
+
+### CTE with Recursive Query (--dml mode)
+
+Input:
+
+```sql
+CREATE PROCEDURE dbo.GetEmployeeHierarchy
+    @RootEmployeeID INT
+AS
+BEGIN
+    WITH EmployeeCTE AS (
+        -- Anchor: root employee
+        SELECT EmployeeID, Name, ManagerID, 0 AS Level
+        FROM Employees
+        WHERE EmployeeID = @RootEmployeeID
+        
+        UNION ALL
+        
+        -- Recursive: subordinates
+        SELECT e.EmployeeID, e.Name, e.ManagerID, cte.Level + 1
+        FROM Employees e
+        INNER JOIN EmployeeCTE cte ON e.ManagerID = cte.EmployeeID
+    )
+    SELECT EmployeeID, Name, Level
+    FROM EmployeeCTE
+    ORDER BY Level, Name
+END
+```
+
+Output (`tgpiler --dml`):
+
+```go
+package main
+
+func GetEmployeeHierarchy(rootEmployeeId int32) error {
+    var employeeId int64
+    var name string
+    var level int64
+    
+    rows, err := r.db.QueryContext(ctx, 
+        `WITH EmployeeCTE AS (
+            SELECT EmployeeID, Name, ManagerID, 0 AS Level
+            FROM Employees WHERE EmployeeID = $1
+            UNION ALL
+            SELECT e.EmployeeID, e.Name, e.ManagerID, (cte.Level + 1)
+            FROM Employees AS e
+            INNER JOIN EmployeeCTE AS cte ON (e.ManagerID = cte.EmployeeID))
+         SELECT EmployeeID, Name, Level FROM EmployeeCTE
+         ORDER BY Level ASC, Name ASC`, rootEmployeeId)
+    if err != nil {
+        return err
+    }
+    defer rows.Close()
+    
+    for rows.Next() {
+        if err := rows.Scan(&employeeId, &name, &level); err != nil {
+            return err
+        }
+    }
+    return nil
+}
+```
+
 ## Project Structure
 
 ```
@@ -528,6 +700,7 @@ tgpiler/
 ├── tsql_nontrivial/       # 15 non-trivial T-SQL samples
 ├── tsql_financial/        # 20 financial T-SQL samples
 ├── tsql_structured/       # 25 JSON/XML T-SQL samples
+├── tsql_cte/              # 10 CTE and window function samples
 ├── scripts/               # Convenience scripts
 ├── Makefile               # Build and test automation
 └── README.md
@@ -638,9 +811,11 @@ Converts T-SQL to standalone Go code. Use `tgpiler` or `tgpiler --dml`:
 |-----------|---------------|
 | Procedural logic (IF, WHILE, CASE) | Dynamic SQL (`EXEC(@sql)`) |
 | DML (SELECT, INSERT, UPDATE, DELETE) | Transactions (in generated code) |
-| Cursors → `rows.Next()` loops | CTEs, Window functions |
-| JSON/XML functions | `MERGE` statements |
-| Temp tables (#temp) | Linked servers |
+| Cursors → `rows.Next()` loops | `MERGE` statements |
+| CTEs (WITH ... AS) | Linked servers |
+| JSON/XML functions | |
+| Temp tables (#temp) | |
+| Window functions (with type inference) | |
 | `EXEC ProcName` (static calls) | |
 | `RAISERROR` / `THROW` → errors | |
 
@@ -671,15 +846,15 @@ result, err := interp.Execute(ctx, `
 
 ## Limitations
 
-The following T-SQL features are not supported in either mode:
+The following T-SQL features are not yet supported:
 
 - User-defined functions (UDFs)
-- Common Table Expressions (CTEs)
-- Window functions (`ROW_NUMBER`, `RANK`, `DENSE_RANK`, etc.)
 - `MERGE` statements
 - Linked servers / distributed queries
 - `WAITFOR` / Service Broker
 - Full-text search
+
+**Note:** CTEs (Common Table Expressions) and window functions (`ROW_NUMBER`, `RANK`, `DENSE_RANK`, `LEAD`, `LAG`, etc.) are fully supported in DML mode — queries are passed through to the database which handles them natively. Window functions have proper type inference: ranking functions return `int64`, percentage functions return `float64`, and navigation functions inherit their argument types.
 
 ## Author
 
