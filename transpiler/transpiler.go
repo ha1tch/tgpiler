@@ -255,6 +255,13 @@ func (t *transpiler) transpileStatement(stmt ast.Statement) (string, error) {
 	case *ast.ThrowStatement:
 		return t.transpileThrow(s)
 	
+	// CTE (Common Table Expression) statements
+	case *ast.WithStatement:
+		if t.dmlEnabled {
+			return t.transpileWithStatement(s)
+		}
+		return "", fmt.Errorf("WITH/CTE statements require DML mode (use TranspileWithDML)")
+	
 	default:
 		return "", fmt.Errorf("unsupported statement type: %T", stmt)
 	}

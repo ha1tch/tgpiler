@@ -272,6 +272,9 @@ func (i *Interpreter) executeStatement(ctx context.Context, stmt ast.Statement, 
 	case *ast.DeallocateCursorStatement:
 		return i.executeDeallocateCursor(s)
 
+	case *ast.WithStatement:
+		return i.executeWithStatement(ctx, s, result)
+
 	default:
 		return fmt.Errorf("unsupported statement type: %T", stmt)
 	}
@@ -342,6 +345,174 @@ func (i *Interpreter) executeSelect(ctx context.Context, s *ast.SelectStatement,
 	i.ctx.AddResultSet(rs)
 
 	return rows.Err()
+}
+
+// executeWithStatement executes a WITH (CTE) statement
+func (i *Interpreter) executeWithStatement(ctx context.Context, ws *ast.WithStatement, result *ExecutionResult) error {
+	// Determine the type of inner query and execute accordingly
+	switch inner := ws.Query.(type) {
+	case *ast.SelectStatement:
+		return i.executeWithSelect(ctx, ws, inner, result)
+	case *ast.InsertStatement:
+		return i.executeWithInsert(ctx, ws, inner)
+	case *ast.UpdateStatement:
+		return i.executeWithUpdate(ctx, ws, inner)
+	case *ast.DeleteStatement:
+		return i.executeWithDelete(ctx, ws, inner)
+	default:
+		return fmt.Errorf("unsupported query type in WITH statement: %T", ws.Query)
+	}
+}
+
+// executeWithSelect executes a WITH ... SELECT statement
+func (i *Interpreter) executeWithSelect(ctx context.Context, ws *ast.WithStatement, sel *ast.SelectStatement, result *ExecutionResult) error {
+	// Build the full CTE query
+	query, args, err := i.buildWithQuery(ws)
+	if err != nil {
+		return err
+	}
+
+	if i.Debug {
+		fmt.Printf("CTE Query: %s\nArgs: %v\n", query, args)
+	}
+
+	// Execute query
+	var rows *sql.Rows
+	if i.ctx.Tx != nil {
+		rows, err = i.ctx.Tx.QueryContext(ctx, query, args...)
+	} else {
+		rows, err = i.ctx.DB.QueryContext(ctx, query, args...)
+	}
+	if err != nil {
+		return fmt.Errorf("CTE query error: %w", err)
+	}
+	defer rows.Close()
+
+	// Get column info
+	columns, err := rows.Columns()
+	if err != nil {
+		return err
+	}
+
+	rs := ResultSet{Columns: columns}
+
+	// Scan rows
+	for rows.Next() {
+		values := make([]interface{}, len(columns))
+		valuePtrs := make([]interface{}, len(columns))
+		for j := range values {
+			valuePtrs[j] = &values[j]
+		}
+
+		if err := rows.Scan(valuePtrs...); err != nil {
+			return err
+		}
+
+		row := make([]Value, len(columns))
+		for j, v := range values {
+			row[j] = ToValue(v)
+		}
+		rs.Rows = append(rs.Rows, row)
+	}
+
+	result.ResultSets = append(result.ResultSets, rs)
+	i.ctx.UpdateRowCount(int64(len(rs.Rows)))
+	i.ctx.AddResultSet(rs)
+
+	return rows.Err()
+}
+
+// executeWithInsert executes a WITH ... INSERT statement
+func (i *Interpreter) executeWithInsert(ctx context.Context, ws *ast.WithStatement, ins *ast.InsertStatement) error {
+	query, args, err := i.buildWithQuery(ws)
+	if err != nil {
+		return err
+	}
+
+	if i.Debug {
+		fmt.Printf("CTE Insert: %s\nArgs: %v\n", query, args)
+	}
+
+	var res sql.Result
+	if i.ctx.Tx != nil {
+		res, err = i.ctx.Tx.ExecContext(ctx, query, args...)
+	} else {
+		res, err = i.ctx.DB.ExecContext(ctx, query, args...)
+	}
+	if err != nil {
+		return fmt.Errorf("CTE insert error: %w", err)
+	}
+
+	rowsAffected, _ := res.RowsAffected()
+	i.ctx.UpdateRowCount(rowsAffected)
+
+	return nil
+}
+
+// executeWithUpdate executes a WITH ... UPDATE statement
+func (i *Interpreter) executeWithUpdate(ctx context.Context, ws *ast.WithStatement, upd *ast.UpdateStatement) error {
+	query, args, err := i.buildWithQuery(ws)
+	if err != nil {
+		return err
+	}
+
+	if i.Debug {
+		fmt.Printf("CTE Update: %s\nArgs: %v\n", query, args)
+	}
+
+	var res sql.Result
+	if i.ctx.Tx != nil {
+		res, err = i.ctx.Tx.ExecContext(ctx, query, args...)
+	} else {
+		res, err = i.ctx.DB.ExecContext(ctx, query, args...)
+	}
+	if err != nil {
+		return fmt.Errorf("CTE update error: %w", err)
+	}
+
+	rowsAffected, _ := res.RowsAffected()
+	i.ctx.UpdateRowCount(rowsAffected)
+
+	return nil
+}
+
+// executeWithDelete executes a WITH ... DELETE statement
+func (i *Interpreter) executeWithDelete(ctx context.Context, ws *ast.WithStatement, del *ast.DeleteStatement) error {
+	query, args, err := i.buildWithQuery(ws)
+	if err != nil {
+		return err
+	}
+
+	if i.Debug {
+		fmt.Printf("CTE Delete: %s\nArgs: %v\n", query, args)
+	}
+
+	var res sql.Result
+	if i.ctx.Tx != nil {
+		res, err = i.ctx.Tx.ExecContext(ctx, query, args...)
+	} else {
+		res, err = i.ctx.DB.ExecContext(ctx, query, args...)
+	}
+	if err != nil {
+		return fmt.Errorf("CTE delete error: %w", err)
+	}
+
+	rowsAffected, _ := res.RowsAffected()
+	i.ctx.UpdateRowCount(rowsAffected)
+
+	return nil
+}
+
+// buildWithQuery builds the full CTE query with variable substitution
+func (i *Interpreter) buildWithQuery(ws *ast.WithStatement) (string, []interface{}, error) {
+	var args []interface{}
+	paramIndex := 0
+
+	// Use the AST's String() method and substitute variables
+	query := ws.String()
+	query, args, paramIndex = i.substituteVariables(query, args, paramIndex)
+
+	return query, args, nil
 }
 
 func (i *Interpreter) executeInsert(ctx context.Context, s *ast.InsertStatement) error {

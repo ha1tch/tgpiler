@@ -670,6 +670,390 @@ func (dt *dmlTranspiler) transpileDeleteMock(s *ast.DeleteStatement) (string, er
 	return out.String(), nil
 }
 
+// transpileWithStatement converts a WITH (CTE) statement to Go code.
+// CTEs are passed through to the database which handles them natively.
+func (t *transpiler) transpileWithStatement(s *ast.WithStatement) (string, error) {
+	dt := &dmlTranspiler{transpiler: t, config: t.dmlConfig}
+	return dt.transpileWithStatement(s)
+}
+
+func (dt *dmlTranspiler) transpileWithStatement(s *ast.WithStatement) (string, error) {
+	// The inner query determines how we handle this
+	switch inner := s.Query.(type) {
+	case *ast.SelectStatement:
+		return dt.transpileWithSelect(s, inner)
+	case *ast.InsertStatement:
+		return dt.transpileWithInsert(s, inner)
+	case *ast.UpdateStatement:
+		return dt.transpileWithUpdate(s, inner)
+	case *ast.DeleteStatement:
+		return dt.transpileWithDelete(s, inner)
+	default:
+		return "", fmt.Errorf("unsupported query type in WITH statement: %T", s.Query)
+	}
+}
+
+// transpileWithSelect handles WITH ... SELECT
+func (dt *dmlTranspiler) transpileWithSelect(ws *ast.WithStatement, sel *ast.SelectStatement) (string, error) {
+	var out strings.Builder
+
+	// Build the full CTE query
+	query := ws.String()
+	
+	// Convert @variable references to parameter placeholders
+	query, args := dt.substituteVariablesInQuery(query)
+	
+	// Get the database variable
+	dbVar := dt.getDBVar()
+	
+	// Check if this is a SELECT INTO variable assignment
+	assignments := dt.extractSelectAssignments(sel)
+	if len(assignments) > 0 {
+		return dt.transpileWithSelectIntoVars(ws, sel, assignments, query, args)
+	}
+	
+	// Extract column names from the main SELECT for scan targets
+	columns := dt.extractSelectColumns(sel)
+	scanDecl, scanTargets := dt.generateScanTargets(columns)
+
+	// Generate CTE names for comment
+	cteNames := make([]string, len(ws.CTEs))
+	for i, cte := range ws.CTEs {
+		if cte.Name != nil {
+			cteNames[i] = cte.Name.Value
+		}
+	}
+
+	// Generate the Go code
+	out.WriteString(fmt.Sprintf("// WITH %s - CTE query\n", strings.Join(cteNames, ", ")))
+	out.WriteString(dt.indentStr())
+	
+	// Generate variable declarations for scan targets
+	if scanDecl != "" {
+		out.WriteString(scanDecl)
+		out.WriteString("\n")
+		out.WriteString(dt.indentStr())
+	}
+
+	if dt.isSingleRowSelect(sel) {
+		// Use QueryRow for single-row SELECT
+		out.WriteString(fmt.Sprintf("row := %s.QueryRowContext(ctx, %q", dbVar, query))
+		for _, arg := range args {
+			out.WriteString(", " + arg)
+		}
+		out.WriteString(")\n")
+		out.WriteString(dt.indentStr())
+		out.WriteString(fmt.Sprintf("if err := row.Scan(%s); err != nil {\n", scanTargets))
+		out.WriteString(dt.indentStr())
+		out.WriteString("\t")
+		out.WriteString(dt.buildErrorReturn())
+		out.WriteString("\n")
+		out.WriteString(dt.indentStr())
+		out.WriteString("}")
+	} else {
+		// Use Query for multi-row SELECT
+		rowsDeclared := dt.symbols.isDeclared("rows")
+		errDeclared := dt.symbols.isDeclared("err")
+		
+		assignOp := ":="
+		if rowsDeclared && errDeclared {
+			assignOp = "="
+		}
+		dt.symbols.markDeclared("rows")
+		dt.symbols.markDeclared("err")
+		
+		out.WriteString(fmt.Sprintf("rows, err %s %s.QueryContext(ctx, %q", assignOp, dbVar, query))
+		for _, arg := range args {
+			out.WriteString(", " + arg)
+		}
+		out.WriteString(")\n")
+		out.WriteString(dt.indentStr())
+		out.WriteString("if err != nil {\n")
+		out.WriteString(dt.indentStr())
+		out.WriteString("\t")
+		out.WriteString(dt.buildErrorReturn())
+		out.WriteString("\n")
+		out.WriteString(dt.indentStr())
+		out.WriteString("}\n")
+		out.WriteString(dt.indentStr())
+		out.WriteString("defer rows.Close()\n")
+		out.WriteString(dt.indentStr())
+		out.WriteString("for rows.Next() {\n")
+		out.WriteString(dt.indentStr())
+		out.WriteString(fmt.Sprintf("\tif err := rows.Scan(%s); err != nil {\n", scanTargets))
+		out.WriteString(dt.indentStr())
+		out.WriteString("\t\t")
+		out.WriteString(dt.buildErrorReturn())
+		out.WriteString("\n")
+		out.WriteString(dt.indentStr())
+		out.WriteString("\t}\n")
+		out.WriteString(dt.indentStr())
+		out.WriteString("}")
+	}
+
+	return out.String(), nil
+}
+
+// transpileWithSelectIntoVars handles WITH ... SELECT @var = col pattern
+func (dt *dmlTranspiler) transpileWithSelectIntoVars(ws *ast.WithStatement, sel *ast.SelectStatement, assignments []varAssignment, query string, args []string) (string, error) {
+	var out strings.Builder
+	
+	// This function uses sql.ErrNoRows
+	dt.imports["database/sql"] = true
+	
+	// Get the database variable
+	dbVar := dt.getDBVar()
+	
+	// Build scan targets from assignments
+	var scanTargets []string
+	for _, a := range assignments {
+		scanTargets = append(scanTargets, "&"+a.varName)
+	}
+
+	// Generate CTE names for comment
+	cteNames := make([]string, len(ws.CTEs))
+	for i, cte := range ws.CTEs {
+		if cte.Name != nil {
+			cteNames[i] = cte.Name.Value
+		}
+	}
+
+	out.WriteString(fmt.Sprintf("// WITH %s - CTE SELECT INTO variables\n", strings.Join(cteNames, ", ")))
+	out.WriteString(dt.indentStr())
+	out.WriteString(fmt.Sprintf("row := %s.QueryRowContext(ctx, %q", dbVar, query))
+	for _, arg := range args {
+		out.WriteString(", " + arg)
+	}
+	out.WriteString(")\n")
+	out.WriteString(dt.indentStr())
+	out.WriteString(fmt.Sprintf("if err := row.Scan(%s); err != nil {\n", strings.Join(scanTargets, ", ")))
+	out.WriteString(dt.indentStr())
+	out.WriteString("\tif err != sql.ErrNoRows {\n")
+	out.WriteString(dt.indentStr())
+	out.WriteString("\t\t")
+	out.WriteString(dt.buildErrorReturn())
+	out.WriteString("\n")
+	out.WriteString(dt.indentStr())
+	out.WriteString("\t}\n")
+	out.WriteString(dt.indentStr())
+	out.WriteString("}")
+
+	return out.String(), nil
+}
+
+// transpileWithInsert handles WITH ... INSERT
+func (dt *dmlTranspiler) transpileWithInsert(ws *ast.WithStatement, ins *ast.InsertStatement) (string, error) {
+	var out strings.Builder
+
+	// Build the full CTE query
+	query := ws.String()
+	
+	// Convert @variable references to parameter placeholders
+	query, args := dt.substituteVariablesInQuery(query)
+	
+	// Get the database variable
+	dbVar := dt.getDBVar()
+
+	// Generate CTE names for comment
+	cteNames := make([]string, len(ws.CTEs))
+	for i, cte := range ws.CTEs {
+		if cte.Name != nil {
+			cteNames[i] = cte.Name.Value
+		}
+	}
+
+	// Check if result/err already declared
+	resultDeclared := dt.symbols.isDeclared("result")
+	errDeclared := dt.symbols.isDeclared("err")
+	
+	assignOp := ":="
+	if resultDeclared && errDeclared {
+		assignOp = "="
+	}
+	dt.symbols.markDeclared("result")
+	dt.symbols.markDeclared("err")
+
+	out.WriteString(fmt.Sprintf("// WITH %s - CTE INSERT\n", strings.Join(cteNames, ", ")))
+	out.WriteString(dt.indentStr())
+	out.WriteString(fmt.Sprintf("result, err %s %s.ExecContext(ctx, %q", assignOp, dbVar, query))
+	for _, arg := range args {
+		out.WriteString(", " + arg)
+	}
+	out.WriteString(")\n")
+	out.WriteString(dt.indentStr())
+	out.WriteString("if err != nil {\n")
+	out.WriteString(dt.indentStr())
+	out.WriteString("\t")
+	out.WriteString(dt.buildErrorReturn())
+	out.WriteString("\n")
+	out.WriteString(dt.indentStr())
+	out.WriteString("}\n")
+	out.WriteString(dt.indentStr())
+	out.WriteString("_ = result")
+
+	return out.String(), nil
+}
+
+// transpileWithUpdate handles WITH ... UPDATE
+func (dt *dmlTranspiler) transpileWithUpdate(ws *ast.WithStatement, upd *ast.UpdateStatement) (string, error) {
+	var out strings.Builder
+
+	// Build the full CTE query
+	query := ws.String()
+	
+	// Convert @variable references to parameter placeholders
+	query, args := dt.substituteVariablesInQuery(query)
+	
+	// Get the database variable
+	dbVar := dt.getDBVar()
+
+	// Generate CTE names for comment
+	cteNames := make([]string, len(ws.CTEs))
+	for i, cte := range ws.CTEs {
+		if cte.Name != nil {
+			cteNames[i] = cte.Name.Value
+		}
+	}
+
+	// Check if result/err already declared
+	resultDeclared := dt.symbols.isDeclared("result")
+	errDeclared := dt.symbols.isDeclared("err")
+	
+	assignOp := ":="
+	if resultDeclared && errDeclared {
+		assignOp = "="
+	}
+	dt.symbols.markDeclared("result")
+	dt.symbols.markDeclared("err")
+
+	out.WriteString(fmt.Sprintf("// WITH %s - CTE UPDATE\n", strings.Join(cteNames, ", ")))
+	out.WriteString(dt.indentStr())
+	out.WriteString(fmt.Sprintf("result, err %s %s.ExecContext(ctx, %q", assignOp, dbVar, query))
+	for _, arg := range args {
+		out.WriteString(", " + arg)
+	}
+	out.WriteString(")\n")
+	out.WriteString(dt.indentStr())
+	out.WriteString("if err != nil {\n")
+	out.WriteString(dt.indentStr())
+	out.WriteString("\t")
+	out.WriteString(dt.buildErrorReturn())
+	out.WriteString("\n")
+	out.WriteString(dt.indentStr())
+	out.WriteString("}\n")
+	out.WriteString(dt.indentStr())
+	out.WriteString("_ = result")
+
+	return out.String(), nil
+}
+
+// transpileWithDelete handles WITH ... DELETE
+func (dt *dmlTranspiler) transpileWithDelete(ws *ast.WithStatement, del *ast.DeleteStatement) (string, error) {
+	var out strings.Builder
+
+	// Build the full CTE query
+	query := ws.String()
+	
+	// Convert @variable references to parameter placeholders
+	query, args := dt.substituteVariablesInQuery(query)
+	
+	// Get the database variable
+	dbVar := dt.getDBVar()
+
+	// Generate CTE names for comment
+	cteNames := make([]string, len(ws.CTEs))
+	for i, cte := range ws.CTEs {
+		if cte.Name != nil {
+			cteNames[i] = cte.Name.Value
+		}
+	}
+
+	// Check if result/err already declared
+	resultDeclared := dt.symbols.isDeclared("result")
+	errDeclared := dt.symbols.isDeclared("err")
+	
+	assignOp := ":="
+	if resultDeclared && errDeclared {
+		assignOp = "="
+	}
+	dt.symbols.markDeclared("result")
+	dt.symbols.markDeclared("err")
+
+	out.WriteString(fmt.Sprintf("// WITH %s - CTE DELETE\n", strings.Join(cteNames, ", ")))
+	out.WriteString(dt.indentStr())
+	out.WriteString(fmt.Sprintf("result, err %s %s.ExecContext(ctx, %q", assignOp, dbVar, query))
+	for _, arg := range args {
+		out.WriteString(", " + arg)
+	}
+	out.WriteString(")\n")
+	out.WriteString(dt.indentStr())
+	out.WriteString("if err != nil {\n")
+	out.WriteString(dt.indentStr())
+	out.WriteString("\t")
+	out.WriteString(dt.buildErrorReturn())
+	out.WriteString("\n")
+	out.WriteString(dt.indentStr())
+	out.WriteString("}\n")
+	out.WriteString(dt.indentStr())
+	out.WriteString("_ = result")
+
+	return out.String(), nil
+}
+
+// substituteVariablesInQuery replaces @variable references with parameter placeholders
+func (dt *dmlTranspiler) substituteVariablesInQuery(query string) (string, []string) {
+	var args []string
+	var result strings.Builder
+	paramIndex := 1 // Start at 1 for the existing getPlaceholder
+	
+	pos := 0
+	for pos < len(query) {
+		if query[pos] == '@' && pos+1 < len(query) {
+			// Skip @@global variables
+			if query[pos+1] == '@' {
+				result.WriteByte(query[pos])
+				pos++
+				continue
+			}
+			
+			// Check if this is a valid variable start
+			if isAlphaForCTE(query[pos+1]) || query[pos+1] == '_' {
+				// Find variable name
+				end := pos + 1
+				for end < len(query) && (isAlphaNumForCTE(query[end]) || query[end] == '_') {
+					end++
+				}
+				
+				varName := query[pos+1 : end]
+				goVar := goIdentifier(varName)
+				
+				// Generate placeholder based on dialect
+				placeholder := dt.getPlaceholder(paramIndex)
+				result.WriteString(placeholder)
+				args = append(args, goVar)
+				paramIndex++
+				
+				pos = end
+				continue
+			}
+		}
+		result.WriteByte(query[pos])
+		pos++
+	}
+	
+	return result.String(), args
+}
+
+// isAlphaForCTE checks if a character is alphabetic
+func isAlphaForCTE(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+// isAlphaNumForCTE checks if a character is alphanumeric
+func isAlphaNumForCTE(c byte) bool {
+	return isAlphaForCTE(c) || (c >= '0' && c <= '9')
+}
+
 // transpileExec converts an EXEC/EXECUTE statement to a Go function call.
 func (t *transpiler) transpileExec(s *ast.ExecStatement) (string, error) {
 	dt := &dmlTranspiler{transpiler: t, config: t.dmlConfig}
@@ -1785,9 +2169,10 @@ func (t *transpiler) transpileCursorLoopBody(stmt ast.Statement) (string, error)
 
 // selectColumn represents a column from a SELECT clause
 type selectColumn struct {
-	name  string // column name or alias
-	expr  string // original expression
-	alias string // AS alias if present
+	name       string         // column name or alias
+	expr       string         // original expression as string
+	alias      string         // AS alias if present
+	expression ast.Expression // the actual AST expression for type inference
 }
 
 // extractSelectColumns extracts column names from SELECT clause
@@ -1800,6 +2185,9 @@ func (dt *dmlTranspiler) extractSelectColumns(s *ast.SelectStatement) []selectCo
 	
 	for _, item := range s.Columns {
 		col := selectColumn{}
+		
+		// Store the actual expression for type inference
+		col.expression = item.Expression
 		
 		// Get the expression string
 		if item.Expression != nil {
@@ -1878,27 +2266,40 @@ func (dt *dmlTranspiler) generateScanTargets(columns []selectColumn) (string, st
 			usedNames[name] = 1
 		}
 		
-		// Infer type (default to interface{} since we don't have schema)
+		// First, try to infer type from the actual expression
 		goType := "interface{}"
+		if col.expression != nil {
+			if ti := dt.transpiler.inferType(col.expression); ti != nil && ti.goType != "" && ti.goType != "interface{}" {
+				goType = ti.goType
+				// Add imports if needed
+				if ti.goType == "decimal.Decimal" {
+					dt.imports["github.com/shopspring/decimal"] = true
+				} else if ti.goType == "time.Time" {
+					dt.imports["time"] = true
+				}
+			}
+		}
 		
-		// Try to infer type from name patterns
-		lowerName := strings.ToLower(col.name)
-		switch {
-		case strings.HasSuffix(lowerName, "id"):
-			goType = "int64"
-		case strings.HasSuffix(lowerName, "at") || strings.HasSuffix(lowerName, "date") || strings.HasSuffix(lowerName, "time"):
-			goType = "time.Time"
-			dt.imports["time"] = true
-		case lowerName == "count" || lowerName == "sum" || lowerName == "total":
-			goType = "int64"
-		case strings.HasPrefix(lowerName, "is") || strings.HasPrefix(lowerName, "has") || strings.HasSuffix(lowerName, "active"):
-			goType = "bool"
-		case strings.Contains(lowerName, "price") || strings.Contains(lowerName, "amount") || strings.Contains(lowerName, "total"):
-			goType = "decimal.Decimal"
-			dt.imports["github.com/shopspring/decimal"] = true
-		case strings.Contains(lowerName, "name") || strings.Contains(lowerName, "email") || 
-			strings.Contains(lowerName, "title") || strings.Contains(lowerName, "description"):
-			goType = "string"
+		// If expression-based inference didn't work, fall back to name heuristics
+		if goType == "interface{}" {
+			lowerName := strings.ToLower(col.name)
+			switch {
+			case strings.HasSuffix(lowerName, "id"):
+				goType = "int64"
+			case strings.HasSuffix(lowerName, "at") || strings.HasSuffix(lowerName, "date") || strings.HasSuffix(lowerName, "time"):
+				goType = "time.Time"
+				dt.imports["time"] = true
+			case lowerName == "count" || lowerName == "sum" || lowerName == "total":
+				goType = "int64"
+			case strings.HasPrefix(lowerName, "is") || strings.HasPrefix(lowerName, "has") || strings.HasSuffix(lowerName, "active"):
+				goType = "bool"
+			case strings.Contains(lowerName, "price") || strings.Contains(lowerName, "amount") || strings.Contains(lowerName, "total"):
+				goType = "decimal.Decimal"
+				dt.imports["github.com/shopspring/decimal"] = true
+			case strings.Contains(lowerName, "name") || strings.Contains(lowerName, "email") || 
+				strings.Contains(lowerName, "title") || strings.Contains(lowerName, "description"):
+				goType = "string"
+			}
 		}
 		
 		decls = append(decls, fmt.Sprintf("var %s %s", name, goType))

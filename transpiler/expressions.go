@@ -427,6 +427,12 @@ func (t *transpiler) inferType(expr ast.Expression) *typeInfo {
 		// Some functions have known return types
 		if id, ok := e.Function.(*ast.Identifier); ok {
 			funcName := normaliseTypeName(id.Value)
+			
+			// Check if this is a window function (has OVER clause)
+			if e.Over != nil {
+				return t.inferWindowFunctionType(funcName, e)
+			}
+			
 			// For math functions, return type matches argument type
 			switch funcName {
 			case "ABS", "CEILING", "CEIL", "FLOOR", "ROUND", "POWER", "SQRT":
@@ -511,30 +517,102 @@ func (t *transpiler) inferType(expr ast.Expression) *typeInfo {
 // inferFunctionReturnType returns type info for known T-SQL functions.
 func (t *transpiler) inferFunctionReturnType(funcName string) *typeInfo {
 	switch normaliseTypeName(funcName) {
+	// String length/position functions
 	case "LEN", "DATALENGTH", "CHARINDEX", "PATINDEX", "ASCII", "UNICODE":
 		return &typeInfo{goType: "int32", isNumeric: true}
+	// String manipulation functions
 	case "UPPER", "LOWER", "LTRIM", "RTRIM", "TRIM", "SUBSTRING", "LEFT", "RIGHT", "REPLACE", "REPLICATE", "REVERSE", "CONCAT", "CONCAT_WS", "NCHAR", "CHAR":
 		return &typeInfo{goType: "string", isString: true}
+	// Math functions
 	case "ABS", "CEILING", "CEIL", "FLOOR", "ROUND", "POWER", "SQRT", "SIGN":
 		return &typeInfo{goType: "float64", isNumeric: true}
+	// Date/time functions
 	case "GETDATE", "SYSDATETIME", "GETUTCDATE", "SYSUTCDATETIME", "DATEADD":
 		return &typeInfo{goType: "time.Time", isDateTime: true}
 	case "DATEDIFF", "YEAR", "MONTH", "DAY", "DATEPART":
 		return &typeInfo{goType: "int32", isNumeric: true}
-	// JSON functions - all return string (JSON_VALUE returns scalar, JSON_QUERY returns JSON object/array)
+	// JSON functions
 	case "JSON_VALUE", "JSON_QUERY", "JSON_MODIFY":
 		return &typeInfo{goType: "string", isString: true}
 	case "ISJSON":
 		return &typeInfo{goType: "int32", isNumeric: true}
-	// XML functions - vary by function
+	// XML functions
 	case "XML_VALUE", "XMLVALUE":
-		return &typeInfo{goType: "interface{}"}  // XmlValue returns interface{} for type flexibility
+		return &typeInfo{goType: "interface{}"}
 	case "XML_QUERY", "XMLQUERY":
 		return &typeInfo{goType: "string", isString: true}
 	case "XML_EXIST", "XMLEXIST":
-		return &typeInfo{goType: "int", isNumeric: true}  // Returns 1/0
+		return &typeInfo{goType: "int", isNumeric: true}
+	// Ranking window functions - always return int64
+	case "ROW_NUMBER", "RANK", "DENSE_RANK", "NTILE":
+		return &typeInfo{goType: "int64", isNumeric: true}
+	// Percentage window functions - return float64
+	case "PERCENT_RANK", "CUME_DIST":
+		return &typeInfo{goType: "float64", isNumeric: true}
+	// Aggregate functions (when used as window functions, type depends on argument)
+	case "COUNT":
+		return &typeInfo{goType: "int64", isNumeric: true}
+	case "SUM", "AVG", "MIN", "MAX":
+		// These need argument type - handled specially in inferType
+		return &typeInfo{goType: "decimal.Decimal", isDecimal: true, isNumeric: true}
 	default:
 		return &typeInfo{goType: "interface{}"}
+	}
+}
+
+// inferWindowFunctionType returns type info for window functions (functions with OVER clause).
+func (t *transpiler) inferWindowFunctionType(funcName string, fc *ast.FunctionCall) *typeInfo {
+	switch funcName {
+	// Ranking functions - always return int64
+	case "ROW_NUMBER", "RANK", "DENSE_RANK", "NTILE":
+		return &typeInfo{goType: "int64", isNumeric: true}
+	
+	// Percentage functions - return float64
+	case "PERCENT_RANK", "CUME_DIST":
+		return &typeInfo{goType: "float64", isNumeric: true}
+	
+	// Navigation functions - return type matches first argument
+	case "LEAD", "LAG", "FIRST_VALUE", "LAST_VALUE", "NTH_VALUE":
+		if len(fc.Arguments) > 0 {
+			argType := t.inferType(fc.Arguments[0])
+			if argType != nil && argType.goType != "" {
+				return argType
+			}
+		}
+		return &typeInfo{goType: "interface{}"}
+	
+	// Aggregate functions with OVER - COUNT always returns int64
+	case "COUNT":
+		return &typeInfo{goType: "int64", isNumeric: true}
+	
+	// SUM, AVG, MIN, MAX - return type matches argument
+	case "SUM", "AVG":
+		if len(fc.Arguments) > 0 {
+			argType := t.inferType(fc.Arguments[0])
+			if argType != nil {
+				// SUM/AVG of integers typically returns the same or larger type
+				if argType.isDecimal {
+					return &typeInfo{goType: "decimal.Decimal", isDecimal: true, isNumeric: true}
+				}
+				if argType.isNumeric {
+					return &typeInfo{goType: "decimal.Decimal", isDecimal: true, isNumeric: true}
+				}
+			}
+		}
+		return &typeInfo{goType: "decimal.Decimal", isDecimal: true, isNumeric: true}
+	
+	case "MIN", "MAX":
+		if len(fc.Arguments) > 0 {
+			argType := t.inferType(fc.Arguments[0])
+			if argType != nil && argType.goType != "" {
+				return argType
+			}
+		}
+		return &typeInfo{goType: "interface{}"}
+	
+	default:
+		// Fall back to regular function type inference
+		return t.inferFunctionReturnType(funcName)
 	}
 }
 
