@@ -1,17 +1,25 @@
 # tgpiler
 
-A T-SQL to Go transpiler. Converts procedural T-SQL stored procedures to Go functions, with support for DML operations (SELECT, INSERT, UPDATE, DELETE), JSON/XML processing, and temp tables.
+A T-SQL to Go transpiler and runtime interpreter. Converts T-SQL stored procedures to Go functions, and provides a runtime interpreter for dynamic SQL execution including transactions.
 
 ## Purpose
 
-This tool helps developers migrate business logic from Microsoft SQL Server stored procedures to Go. It handles:
+This tool helps developers migrate business logic from Microsoft SQL Server stored procedures to Go. It provides two execution modes:
 
-- **Procedural constructs**: Variables, control flow, expressions
-- **DML operations**: SELECT, INSERT, UPDATE, DELETE with database connectivity
-- **Cursors**: DECLARE CURSOR, OPEN, FETCH, CLOSE, DEALLOCATE → idiomatic Go iteration
-- **JSON functions**: JSON_VALUE, JSON_QUERY, JSON_MODIFY, OPENJSON, FOR JSON
-- **XML functions**: .value(), .query(), .exist(), .nodes(), .modify(), OPENXML, FOR XML
-- **Temp tables**: CREATE TABLE #temp, DROP TABLE #temp
+**Transpiler Mode** — Static code generation:
+- Procedural constructs (variables, control flow, expressions)
+- DML operations (SELECT, INSERT, UPDATE, DELETE)
+- Cursors → idiomatic Go `rows.Next()` iteration
+- JSON functions (JSON_VALUE, JSON_QUERY, JSON_MODIFY, OPENJSON, FOR JSON)
+- XML functions (.value(), .query(), .exist(), .nodes(), .modify(), OPENXML, FOR XML)
+- Temp tables (#temp), RAISERROR/THROW
+
+**Interpreter Mode** — Dynamic SQL execution at runtime:
+- Everything above, plus:
+- **Transactions** (BEGIN TRAN, COMMIT, ROLLBACK, nested transactions)
+- **Dynamic SQL** (EXEC(@sql), sp_executesql with parameters)
+- **Scrollable cursors** (FETCH ABSOLUTE, FETCH RELATIVE, FETCH FIRST/LAST)
+- **Full error handling** (TRY/CATCH, ERROR_NUMBER(), ERROR_MESSAGE(), XACT_STATE())
 
 ## Installation
 
@@ -527,34 +535,80 @@ tgpiler/
 
 ## Runtime Library
 
-The `tsqlruntime` package provides Go implementations of T-SQL functions:
+The `tsqlruntime` package provides both function implementations and a full T-SQL interpreter.
+
+### Functions
 
 ```go
 import "github.com/ha1tch/tgpiler/tsqlruntime"
 
 // JSON functions
-value, err := tsqlruntime.JSONValue(jsonStr, "$.customer.name")
-query, err := tsqlruntime.JSONQuery(jsonStr, "$.items")
-modified, err := tsqlruntime.JSONModify(jsonStr, "$.status", "active")
-isValid, err := tsqlruntime.IsJSON(jsonStr)
+value := tsqlruntime.JSONValue(jsonStr, "$.customer.name")
+modified := tsqlruntime.JSONModify(jsonStr, "$.status", "active")
 
 // XML functions  
-value, err := tsqlruntime.XMLValue(xmlStr, "/order/id", tsqlruntime.TypeInt)
-exists, err := tsqlruntime.XMLExist(xmlStr, "/order/customer")
-fragment, err := tsqlruntime.XMLQuery(xmlStr, "/order/items")
+value := tsqlruntime.XMLValue(xmlStr, "/order/id", tsqlruntime.TypeInt)
+exists := tsqlruntime.XMLExist(xmlStr, "/order/customer")
 
 // Temp tables
 tempTables := tsqlruntime.NewTempTableManager()
 tempTables.CreateTempTable("#Orders", columns)
-tempTables.DropTempTable("#Orders")
+```
 
-// Cursors (for interpreter mode)
-cursorMgr := tsqlruntime.NewCursorManager()
-cursor, _ := cursorMgr.DeclareCursor("myCursor", query, false, 
-    tsqlruntime.CursorForwardOnly, tsqlruntime.CursorScrollNone, tsqlruntime.CursorReadOnly)
+### Interpreter (Dynamic SQL Execution)
+
+The interpreter executes T-SQL at runtime, supporting dynamic SQL and transactions:
+
+```go
+import "github.com/ha1tch/tgpiler/tsqlruntime"
+
+// Create interpreter
+interp := tsqlruntime.NewInterpreter(db, tsqlruntime.DialectPostgres)
+
+// Set parameters
+interp.SetVariable("@userID", 42)
+interp.SetVariable("@amount", decimal.NewFromFloat(100.00))
+
+// Execute dynamic SQL with transactions
+result, err := interp.Execute(ctx, `
+    BEGIN TRANSACTION
+    
+    DECLARE @balance DECIMAL(18,2)
+    SELECT @balance = Balance FROM Accounts WHERE ID = @userID
+    
+    IF @balance >= @amount
+    BEGIN
+        UPDATE Accounts SET Balance = Balance - @amount WHERE ID = @userID
+        INSERT INTO Transactions (AccountID, Amount, Type) VALUES (@userID, @amount, 'DEBIT')
+        COMMIT
+    END
+    ELSE
+    BEGIN
+        ROLLBACK
+        RAISERROR('Insufficient funds', 16, 1)
+    END
+`, nil)
+
+// Access results
+for _, rs := range result.ResultSets {
+    for _, row := range rs.Rows {
+        // Process rows
+    }
+}
+```
+
+### Cursors
+
+```go
+// Scrollable cursor support
+cursor, _ := cursorMgr.DeclareCursor("myCursor", query, false,
+    tsqlruntime.CursorStatic, tsqlruntime.CursorScrollForward, tsqlruntime.CursorReadOnly)
 cursor.Open(columns, rows)
-row, status := cursor.FetchNext()  // Also: FetchPrior, FetchFirst, FetchLast, FetchAbsolute
-cursor.Close()
+
+row, status := cursor.FetchNext()
+row, status = cursor.FetchAbsolute(5)   // Jump to row 5
+row, status = cursor.FetchRelative(-2)  // Go back 2 rows
+row, status = cursor.FetchLast()        // Jump to last row
 ```
 
 ## Makefile Targets
@@ -572,18 +626,60 @@ make lint              # Run go vet
 make clean             # Remove build artifacts
 ```
 
+## Execution Modes
+
+tgpiler supports two execution modes with different capabilities:
+
+### Transpiler Mode (Static Code Generation)
+
+Converts T-SQL to standalone Go code. Use `tgpiler` or `tgpiler --dml`:
+
+| Supported | Not Supported |
+|-----------|---------------|
+| Procedural logic (IF, WHILE, CASE) | Dynamic SQL (`EXEC(@sql)`) |
+| DML (SELECT, INSERT, UPDATE, DELETE) | Transactions (in generated code) |
+| Cursors → `rows.Next()` loops | CTEs, Window functions |
+| JSON/XML functions | `MERGE` statements |
+| Temp tables (#temp) | Linked servers |
+| `EXEC ProcName` (static calls) | |
+| `RAISERROR` / `THROW` → errors | |
+
+### Interpreter Mode (Dynamic Execution)
+
+Executes T-SQL at runtime via `tsqlruntime.Interpreter`. Supports everything above plus:
+
+| Feature | Example |
+|---------|---------|
+| **Dynamic SQL** | `EXEC(@sql)`, `sp_executesql` |
+| **Transactions** | `BEGIN TRAN`, `COMMIT`, `ROLLBACK` |
+| **Nested transactions** | `@@TRANCOUNT`, `XACT_STATE()` |
+| **Full cursor support** | `FETCH ABSOLUTE`, `FETCH RELATIVE`, scrollable cursors |
+| **Error handling** | `TRY/CATCH`, `ERROR_NUMBER()`, `ERROR_MESSAGE()` |
+
+```go
+// Interpreter example
+interp := tsqlruntime.NewInterpreter(db, tsqlruntime.DialectPostgres)
+interp.SetVariable("@amount", 100.00)
+
+result, err := interp.Execute(ctx, `
+    BEGIN TRAN
+    UPDATE Accounts SET Balance = Balance - @amount WHERE ID = 1
+    UPDATE Accounts SET Balance = Balance + @amount WHERE ID = 2
+    COMMIT
+`, nil)
+```
+
 ## Limitations
 
-The following T-SQL features are not yet supported:
+The following T-SQL features are not supported in either mode:
 
-- `EXEC` / `EXECUTE` (calling other procedures)
-- Dynamic SQL (`EXEC(@sql)`)
-- Transactions (`BEGIN TRAN`, `COMMIT`, `ROLLBACK`)
 - User-defined functions (UDFs)
 - Common Table Expressions (CTEs)
-- Window functions (`ROW_NUMBER`, `RANK`, etc.)
+- Window functions (`ROW_NUMBER`, `RANK`, `DENSE_RANK`, etc.)
 - `MERGE` statements
 - Linked servers / distributed queries
+- `WAITFOR` / Service Broker
+- Full-text search
 
 ## Author
 
