@@ -45,7 +45,9 @@ type transpiler struct {
 	output        strings.Builder
 	indent        int
 	inProcBody    bool
-	inTryBlock    bool // Track if we're inside a TRY block (anonymous function)
+	inTryBlock    bool   // Track if we're inside a TRY block (anonymous function)
+	inCatchBlock  bool   // Track if we're inside a CATCH block
+	currentProcName string // Current procedure name for ERROR_PROCEDURE()
 	symbols       *symbolTable
 	outputParams  []*ast.ParameterDef
 	hasReturnCode bool
@@ -130,10 +132,73 @@ func (t *transpiler) transpile(program *ast.Program) (string, error) {
 		out.WriteString(")\n\n")
 	}
 
+	// Generate SPLogger initialization if requested
+	if t.dmlEnabled && t.dmlConfig.UseSPLogger && t.dmlConfig.GenLoggerInit {
+		initCode := t.generateSPLoggerInit()
+		if initCode != "" {
+			out.WriteString(initCode)
+			out.WriteString("\n\n")
+		}
+	}
+
 	out.WriteString(strings.Join(bodies, "\n\n"))
 	out.WriteString("\n")
 
 	return out.String(), nil
+}
+
+// generateSPLoggerInit generates initialization code for SPLogger based on config
+func (t *transpiler) generateSPLoggerInit() string {
+	var out strings.Builder
+
+	out.WriteString("// SPLogger initialization - configure based on your environment\n")
+	out.WriteString("var " + t.dmlConfig.SPLoggerVar + " tsqlruntime.SPLogger\n\n")
+	out.WriteString("func init() {\n")
+
+	switch t.dmlConfig.SPLoggerType {
+	case "db":
+		out.WriteString("\t// Database logger - logs to a table like the original T-SQL pattern\n")
+		out.WriteString("\t// Requires: db *sql.DB to be initialised\n")
+		out.WriteString(fmt.Sprintf("\t// %s = tsqlruntime.NewDatabaseSPLogger(db, %q, %q)\n",
+			t.dmlConfig.SPLoggerVar, t.dmlConfig.SPLoggerTable, t.dmlConfig.SQLDialect))
+		out.WriteString("\t\n")
+		out.WriteString("\t// For now, use slog as fallback\n")
+		out.WriteString(fmt.Sprintf("\t%s = tsqlruntime.NewSlogSPLogger(nil)\n", t.dmlConfig.SPLoggerVar))
+
+	case "file":
+		if t.dmlConfig.SPLoggerFile != "" {
+			out.WriteString(fmt.Sprintf("\t// File logger - logs to %s\n", t.dmlConfig.SPLoggerFile))
+			out.WriteString(fmt.Sprintf("\tvar err error\n"))
+			out.WriteString(fmt.Sprintf("\t%s, err = tsqlruntime.NewFileSPLogger(%q, %q)\n",
+				t.dmlConfig.SPLoggerVar, t.dmlConfig.SPLoggerFile, t.dmlConfig.SPLoggerFormat))
+			out.WriteString("\tif err != nil {\n")
+			out.WriteString(fmt.Sprintf("\t\t%s = tsqlruntime.NewSlogSPLogger(nil) // Fallback to slog\n", t.dmlConfig.SPLoggerVar))
+			out.WriteString("\t}\n")
+		} else {
+			out.WriteString("\t// File logger - specify path with --logger-file\n")
+			out.WriteString(fmt.Sprintf("\t%s = tsqlruntime.NewSlogSPLogger(nil)\n", t.dmlConfig.SPLoggerVar))
+		}
+
+	case "multi":
+		out.WriteString("\t// Multi logger - logs to multiple destinations\n")
+		out.WriteString("\t// Customise the loggers as needed:\n")
+		out.WriteString("\tslogLogger := tsqlruntime.NewSlogSPLogger(nil)\n")
+		out.WriteString("\t// dbLogger := tsqlruntime.NewDatabaseSPLogger(db, \"Error.Log\", \"postgres\")\n")
+		out.WriteString("\t// fileLogger, _ := tsqlruntime.NewFileSPLogger(\"/var/log/sp.json\", \"json\")\n")
+		out.WriteString(fmt.Sprintf("\t%s = tsqlruntime.NewMultiSPLogger(slogLogger)\n", t.dmlConfig.SPLoggerVar))
+
+	case "nop":
+		out.WriteString("\t// No-op logger - discards all logs (for testing)\n")
+		out.WriteString(fmt.Sprintf("\t%s = tsqlruntime.NewNopSPLogger()\n", t.dmlConfig.SPLoggerVar))
+
+	default: // "slog" or anything else
+		out.WriteString("\t// Slog logger - uses Go's structured logging\n")
+		out.WriteString(fmt.Sprintf("\t%s = tsqlruntime.NewSlogSPLogger(nil) // Uses slog.Default()\n", t.dmlConfig.SPLoggerVar))
+	}
+
+	out.WriteString("}\n")
+
+	return out.String()
 }
 
 func (t *transpiler) transpileStatement(stmt ast.Statement) (string, error) {
@@ -281,8 +346,9 @@ func (t *transpiler) transpileCreateProcedure(proc *ast.CreateProcedureStatement
 		t.hasDMLStatements = t.blockHasDML(proc.Body)
 	}
 
-	// Get procedure name for comment lookup
+	// Get procedure name for comment lookup and ERROR_PROCEDURE()
 	procName := proc.Name.Parts[len(proc.Name.Parts)-1].Value
+	t.currentProcName = procName // Store for ERROR_PROCEDURE() in CATCH blocks
 	sig := "PROC:" + strings.ToLower(procName)
 
 	// Emit leading comments for the procedure
@@ -850,8 +916,35 @@ func (t *transpiler) transpileTryCatch(tc *ast.TryCatchStatement) (string, error
 	t.indent++
 
 	// CATCH block - _recovered contains the panic value if needed
+	// Set inCatchBlock so we can handle ERROR_* functions and XML building specially
+	wasInCatchBlock := t.inCatchBlock
+	t.inCatchBlock = true
+
+	// If SPLogger is enabled, generate a CaptureError call at the start
+	if t.dmlEnabled && t.dmlConfig.UseSPLogger {
+		t.imports["github.com/ha1tch/tgpiler/tsqlruntime"] = true
+		out.WriteString(t.indentStr())
+		out.WriteString(fmt.Sprintf("_spErr := tsqlruntime.CaptureError(%q, _recovered, %s)\n",
+			t.currentProcName, t.buildParamsMap()))
+	}
+
 	if tc.CatchBlock != nil {
 		for _, stmt := range tc.CatchBlock.Statements {
+			// Check if SPLogger is enabled and we should skip/replace certain statements
+			if t.dmlEnabled && t.dmlConfig.UseSPLogger {
+				// Skip DECLARE statements that build XML parameters
+				if decl, ok := stmt.(*ast.DeclareStatement); ok && t.isXMLParameterDeclare(decl) {
+					continue
+				}
+				
+				// Replace error logging INSERT with SPLogger call
+				if insert, ok := stmt.(*ast.InsertStatement); ok && t.isErrorLoggingInsert(insert) {
+					out.WriteString(t.indentStr())
+					out.WriteString(fmt.Sprintf("_ = %s.LogError(ctx, _spErr)\n", t.dmlConfig.SPLoggerVar))
+					continue
+				}
+			}
+
 			s, err := t.transpileStatement(stmt)
 			if err != nil {
 				return "", err
@@ -863,6 +956,7 @@ func (t *transpiler) transpileTryCatch(tc *ast.TryCatchStatement) (string, error
 			}
 		}
 	}
+	t.inCatchBlock = wasInCatchBlock
 
 	t.indent--
 	out.WriteString(t.indentStr())
@@ -894,6 +988,83 @@ func (t *transpiler) transpileTryCatch(tc *ast.TryCatchStatement) (string, error
 	out.WriteString("}()")
 
 	return out.String(), nil
+}
+
+// buildParamsMap builds a Go map literal of procedure parameters for SPLogger
+func (t *transpiler) buildParamsMap() string {
+	if len(t.outputParams) == 0 && len(t.symbols.variables) == 0 {
+		return "nil"
+	}
+
+	var parts []string
+
+	// Add input parameters from symbol table (excluding output params)
+	for name := range t.symbols.variables {
+		// Skip internal variables
+		if strings.HasPrefix(name, "_") {
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%q: %s", name, name))
+	}
+
+	if len(parts) == 0 {
+		return "nil"
+	}
+
+	return "map[string]interface{}{" + strings.Join(parts, ", ") + "}"
+}
+
+// isErrorLoggingInsert checks if an INSERT is an error logging pattern
+func (t *transpiler) isErrorLoggingInsert(ins *ast.InsertStatement) bool {
+	if ins.Table == nil {
+		return false
+	}
+
+	tableName := strings.ToLower(ins.Table.String())
+
+	// Common error log table patterns
+	errorTablePatterns := []string{
+		"error",
+		"errorlog",
+		"error_log",
+		"logerror",
+		"log_error",
+		"logforstorep",
+	}
+
+	for _, pattern := range errorTablePatterns {
+		if strings.Contains(tableName, pattern) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// isXMLParameterDeclare checks if a DECLARE is for XML parameter building in CATCH
+func (t *transpiler) isXMLParameterDeclare(decl *ast.DeclareStatement) bool {
+	if decl == nil || len(decl.Variables) == 0 {
+		return false
+	}
+
+	for _, v := range decl.Variables {
+		// Check if variable name suggests parameters
+		varName := strings.ToLower(v.Name)
+		if strings.Contains(varName, "param") || strings.Contains(varName, "xml") {
+			return true
+		}
+
+		// Check if it has a subquery with FOR XML
+		if subq, ok := v.Value.(*ast.SubqueryExpression); ok {
+			if subq.Subquery != nil && subq.Subquery.ForClause != nil {
+				if strings.ToUpper(subq.Subquery.ForClause.ForType) == "XML" {
+					return true
+				}
+			}
+		}
+	}
+
+	return false
 }
 
 func (t *transpiler) transpileReturn(ret *ast.ReturnStatement) (string, error) {
@@ -1142,15 +1313,248 @@ func (t *transpiler) buildSubqueryErrorReturn() string {
 
 // transpileSubqueryExpression handles subqueries used as expressions (not in SET context)
 func (t *transpiler) transpileSubqueryExpression(subq *ast.SubqueryExpression) (string, error) {
-	// For subqueries used as expressions (e.g., in WHERE clauses or comparisons),
-	// we generate an inline function that executes the query
-	
 	sql := subq.Subquery.String()
+	
+	// Check if this is a FOR XML query in a CATCH block (error logging pattern)
+	isForXML := strings.Contains(strings.ToUpper(sql), "FOR XML")
+	
+	if t.inCatchBlock && isForXML {
+		// In CATCH context with FOR XML, build XML in Go instead of querying DB
+		// This is safer because the DB might be the source of the error
+		return t.transpileErrorLoggingXML(subq.Subquery)
+	}
+	
+	// Standard subquery handling - substitute variables
+	sql = stripTableHints(sql)
+	substitutedSQL, args := t.substituteVariablesForExists(sql)
+	
+	var argsStr string
+	if len(args) > 0 {
+		argsStr = ", " + strings.Join(args, ", ")
+	}
 	
 	// Generate an anonymous function that executes and returns the result
 	return fmt.Sprintf("func() interface{} {\n"+
 		"\t\tvar result interface{}\n"+
-		"\t\t_ = %s.QueryRowContext(ctx, %q).Scan(&result)\n"+
+		"\t\t_ = %s.QueryRowContext(ctx, %q%s).Scan(&result)\n"+
 		"\t\treturn result\n"+
-		"\t}()", t.dmlConfig.StoreVar, sql), nil
+		"\t}()", t.dmlConfig.StoreVar, substitutedSQL, argsStr), nil
+}
+
+// transpileErrorLoggingXML handles SELECT ... FOR XML in CATCH blocks
+// Instead of querying the database, we build XML in Go
+func (t *transpiler) transpileErrorLoggingXML(sel *ast.SelectStatement) (string, error) {
+	t.imports["fmt"] = true
+	
+	// Extract column aliases and their source expressions
+	var xmlParts []string
+	var args []string
+	
+	if sel.Columns != nil {
+		for _, col := range sel.Columns {
+			alias := ""
+			if col.Alias != nil {
+				alias = col.Alias.Value
+			} else if id, ok := col.Expression.(*ast.Identifier); ok {
+				alias = id.Value
+			} else {
+				alias = "value"
+			}
+			
+			// Extract the variable from the expression
+			// Pattern: ISNULL(CONVERT(VARCHAR(MAX), @VarName), '--NULL--')
+			varName := t.extractVariableFromExpression(col.Expression)
+			if varName != "" {
+				xmlParts = append(xmlParts, fmt.Sprintf("<%s>%%v</%s>", alias, alias))
+				args = append(args, goIdentifier(varName))
+			} else {
+				// Can't extract variable, use placeholder
+				xmlParts = append(xmlParts, fmt.Sprintf("<%s>%%v</%s>", alias, alias))
+				// Try to transpile the expression
+				exprStr, err := t.transpileExpression(col.Expression)
+				if err != nil {
+					args = append(args, "\"\"")
+				} else {
+					args = append(args, exprStr)
+				}
+			}
+		}
+	}
+	
+	// Get the root element name from FOR XML PATH
+	rootElement := "RootXml"
+	if sel.ForClause != nil && sel.ForClause.ElementName != "" {
+		rootElement = strings.Trim(sel.ForClause.ElementName, "'\"")
+	} else if sel.ForClause != nil && sel.ForClause.Root != "" {
+		rootElement = strings.Trim(sel.ForClause.Root, "'\"")
+	}
+	
+	// Build the format string
+	xmlFormat := fmt.Sprintf("<%s>%s</%s>", rootElement, strings.Join(xmlParts, ""), rootElement)
+	
+	if len(args) > 0 {
+		return fmt.Sprintf("fmt.Sprintf(`%s`, %s)", xmlFormat, strings.Join(args, ", ")), nil
+	}
+	return fmt.Sprintf("`%s`", xmlFormat), nil
+}
+
+// extractVariableFromExpression tries to find a @variable in an expression
+// Handles patterns like ISNULL(CONVERT(type, @Var), default)
+func (t *transpiler) extractVariableFromExpression(expr ast.Expression) string {
+	if expr == nil {
+		return ""
+	}
+	
+	switch e := expr.(type) {
+	case *ast.Variable:
+		return strings.TrimPrefix(e.Name, "@")
+	case *ast.FunctionCall:
+		// Check arguments recursively (for ISNULL, CONVERT, etc.)
+		for _, arg := range e.Arguments {
+			if v := t.extractVariableFromExpression(arg); v != "" {
+				return v
+			}
+		}
+	case *ast.CastExpression:
+		return t.extractVariableFromExpression(e.Expression)
+	case *ast.ConvertExpression:
+		return t.extractVariableFromExpression(e.Expression)
+	}
+	return ""
+}
+
+// transpileExistsExpression handles EXISTS(SELECT ...) expressions
+func (t *transpiler) transpileExistsExpression(exists *ast.ExistsExpression) (string, error) {
+	if exists.Subquery == nil {
+		return "", fmt.Errorf("EXISTS expression has no subquery")
+	}
+	
+	// Get the subquery SQL and substitute variables
+	sql := exists.Subquery.String()
+	
+	// Strip table hints like (NOLOCK) that aren't supported by all databases
+	sql = stripTableHints(sql)
+	
+	// Substitute variables in the query
+	substitutedSQL, args := t.substituteVariablesForExists(sql)
+	
+	// Generate an inline function that checks if any rows exist
+	// Uses COUNT with LIMIT 1 for portability across databases
+	var argsStr string
+	if len(args) > 0 {
+		argsStr = ", " + strings.Join(args, ", ")
+	}
+	
+	return fmt.Sprintf("func() bool {\n"+
+		"\t\tvar exists int\n"+
+		"\t\terr := %s.QueryRowContext(ctx, \"SELECT 1 WHERE EXISTS(%s)\"%s).Scan(&exists)\n"+
+		"\t\treturn err == nil && exists == 1\n"+
+		"\t}()", t.dmlConfig.StoreVar, substitutedSQL, argsStr), nil
+}
+
+// substituteVariablesForExists replaces @variables with placeholders and returns args
+func (t *transpiler) substituteVariablesForExists(sql string) (string, []string) {
+	var args []string
+	paramIndex := 0
+	
+	result := make([]byte, 0, len(sql))
+	i := 0
+	for i < len(sql) {
+		if sql[i] == '@' && i+1 < len(sql) && (isAlphaForCTE(sql[i+1]) || sql[i+1] == '@') {
+			// Skip @@ system variables - leave them as-is for now
+			if i+1 < len(sql) && sql[i+1] == '@' {
+				result = append(result, sql[i], sql[i+1])
+				i += 2
+				for i < len(sql) && isAlphaNumForCTE(sql[i]) {
+					result = append(result, sql[i])
+					i++
+				}
+				continue
+			}
+			
+			// Extract variable name
+			start := i + 1
+			j := start
+			for j < len(sql) && isAlphaNumForCTE(sql[j]) {
+				j++
+			}
+			varName := sql[start:j]
+			
+			// Add placeholder
+			paramIndex++
+			placeholder := getPlaceholderForDialect(t.dmlConfig.SQLDialect, paramIndex)
+			result = append(result, placeholder...)
+			
+			// Add to args
+			args = append(args, goIdentifier(varName))
+			i = j
+		} else {
+			result = append(result, sql[i])
+			i++
+		}
+	}
+	
+	return string(result), args
+}
+
+// getPlaceholderForDialect returns the appropriate placeholder for a given SQL dialect
+func getPlaceholderForDialect(dialect string, n int) string {
+	switch dialect {
+	case "postgres":
+		return fmt.Sprintf("$%d", n)
+	case "sqlserver":
+		return fmt.Sprintf("@p%d", n)
+	case "oracle":
+		return fmt.Sprintf(":p%d", n)
+	default: // mysql, sqlite
+		return "?"
+	}
+}
+
+// stripTableHints removes SQL Server table hints like (NOLOCK), WITH (NOLOCK), etc.
+func stripTableHints(sql string) string {
+	// Patterns to remove: WITH (hint), WITH (hint1, hint2), or just (hint)
+	// Common table hints
+	hints := []string{
+		"NOLOCK", "READUNCOMMITTED", "READCOMMITTED", "REPEATABLEREAD",
+		"SERIALIZABLE", "ROWLOCK", "PAGLOCK", "TABLOCK", "TABLOCKX",
+		"UPDLOCK", "XLOCK", "HOLDLOCK", "NOWAIT", "READPAST",
+	}
+	
+	result := sql
+	
+	// First, remove "WITH (hint)" patterns
+	for _, hint := range hints {
+		// WITH (HINT)
+		result = replaceIgnoreCase(result, "WITH ("+hint+")", "")
+		// Just (HINT)
+		result = replaceIgnoreCase(result, "("+hint+")", "")
+	}
+	
+	// Clean up any double spaces left behind
+	for strings.Contains(result, "  ") {
+		result = strings.ReplaceAll(result, "  ", " ")
+	}
+	
+	return result
+}
+
+// replaceIgnoreCase performs case-insensitive string replacement
+func replaceIgnoreCase(s, old, new string) string {
+	lower := strings.ToLower(s)
+	oldLower := strings.ToLower(old)
+	
+	var result strings.Builder
+	i := 0
+	for i < len(s) {
+		idx := strings.Index(lower[i:], oldLower)
+		if idx == -1 {
+			result.WriteString(s[i:])
+			break
+		}
+		result.WriteString(s[i : i+idx])
+		result.WriteString(new)
+		i = i + idx + len(old)
+	}
+	return result.String()
 }

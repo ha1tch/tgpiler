@@ -22,25 +22,32 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 
 	var (
-		inputDir     = fs.String("d", "", "Read all .sql files from directory")
-		inputDirL    = fs.String("dir", "", "Read all .sql files from directory")
-		readStdin    = fs.Bool("s", false, "Read from stdin")
-		readStdinL   = fs.Bool("stdin", false, "Read from stdin")
-		output       = fs.String("o", "", "Write to single output file")
-		outputL      = fs.String("output", "", "Write to single output file")
-		outDir       = fs.String("O", "", "Write to output directory (creates if needed)")
-		outDirL      = fs.String("outdir", "", "Write to output directory (creates if needed)")
-		force        = fs.Bool("f", false, "Allow overwriting existing files")
-		forceL       = fs.Bool("force", false, "Allow overwriting existing files")
-		packageName  = fs.String("p", "main", "Package name for generated code")
-		packageNameL = fs.String("pkg", "main", "Package name for generated code")
-		dmlMode      = fs.Bool("dml", false, "Enable DML mode (SELECT, INSERT, temp tables, etc.)")
-		sqlDialect   = fs.String("dialect", "postgres", "SQL dialect (postgres, mysql, sqlite, sqlserver)")
-		storeVar     = fs.String("store", "r.db", "Store variable name for DML operations")
-		showHelp     = fs.Bool("h", false, "Show help")
-		helpL        = fs.Bool("help", false, "Show help")
-		showVer      = fs.Bool("v", false, "Show version")
-		versionL     = fs.Bool("version", false, "Show version")
+		inputDir       = fs.String("d", "", "Read all .sql files from directory")
+		inputDirL      = fs.String("dir", "", "Read all .sql files from directory")
+		readStdin      = fs.Bool("s", false, "Read from stdin")
+		readStdinL     = fs.Bool("stdin", false, "Read from stdin")
+		output         = fs.String("o", "", "Write to single output file")
+		outputL        = fs.String("output", "", "Write to single output file")
+		outDir         = fs.String("O", "", "Write to output directory (creates if needed)")
+		outDirL        = fs.String("outdir", "", "Write to output directory (creates if needed)")
+		force          = fs.Bool("f", false, "Allow overwriting existing files")
+		forceL         = fs.Bool("force", false, "Allow overwriting existing files")
+		packageName    = fs.String("p", "main", "Package name for generated code")
+		packageNameL   = fs.String("pkg", "main", "Package name for generated code")
+		dmlMode        = fs.Bool("dml", false, "Enable DML mode (SELECT, INSERT, temp tables, etc.)")
+		sqlDialect     = fs.String("dialect", "postgres", "SQL dialect (postgres, mysql, sqlite, sqlserver)")
+		storeVar       = fs.String("store", "r.db", "Store variable name for DML operations")
+		useSPLogger    = fs.Bool("splogger", false, "Use SPLogger for CATCH block error logging")
+		spLoggerVar    = fs.String("logger", "spLogger", "SPLogger variable name")
+		spLoggerType   = fs.String("logger-type", "slog", "SPLogger type: slog, db, file, multi, nop")
+		spLoggerTable  = fs.String("logger-table", "Error.LogForStoreProcedure", "Table name for db logger")
+		spLoggerFile   = fs.String("logger-file", "", "File path for file logger")
+		spLoggerFormat = fs.String("logger-format", "json", "Format for file logger: json, text")
+		genLoggerInit  = fs.Bool("logger-init", false, "Generate SPLogger initialization code")
+		showHelp       = fs.Bool("h", false, "Show help")
+		helpL          = fs.Bool("help", false, "Show help")
+		showVer        = fs.Bool("v", false, "Show version")
+		versionL       = fs.Bool("version", false, "Show version")
 	)
 
 	fs.Usage = func() {
@@ -112,19 +119,26 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 
 	// Execute based on mode
 	cfg := &config{
-		inputFile:   inputFile,
-		inputDir:    *inputDir,
-		readStdin:   *readStdin,
-		output:      *output,
-		outDir:      *outDir,
-		force:       *force,
-		packageName: *packageName,
-		dmlMode:     *dmlMode,
-		sqlDialect:  *sqlDialect,
-		storeVar:    *storeVar,
-		stdin:       stdin,
-		stdout:      stdout,
-		stderr:      stderr,
+		inputFile:      inputFile,
+		inputDir:       *inputDir,
+		readStdin:      *readStdin,
+		output:         *output,
+		outDir:         *outDir,
+		force:          *force,
+		packageName:    *packageName,
+		dmlMode:        *dmlMode,
+		sqlDialect:     *sqlDialect,
+		storeVar:       *storeVar,
+		useSPLogger:    *useSPLogger,
+		spLoggerVar:    *spLoggerVar,
+		spLoggerType:   *spLoggerType,
+		spLoggerTable:  *spLoggerTable,
+		spLoggerFile:   *spLoggerFile,
+		spLoggerFormat: *spLoggerFormat,
+		genLoggerInit:  *genLoggerInit,
+		stdin:          stdin,
+		stdout:         stdout,
+		stderr:         stderr,
 	}
 
 	if err := execute(cfg); err != nil {
@@ -136,19 +150,26 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 }
 
 type config struct {
-	inputFile   string
-	inputDir    string
-	readStdin   bool
-	output      string
-	outDir      string
-	force       bool
-	packageName string
-	dmlMode     bool
-	sqlDialect  string
-	storeVar    string
-	stdin       io.Reader
-	stdout      io.Writer
-	stderr      io.Writer
+	inputFile      string
+	inputDir       string
+	readStdin      bool
+	output         string
+	outDir         string
+	force          bool
+	packageName    string
+	dmlMode        bool
+	sqlDialect     string
+	storeVar       string
+	useSPLogger    bool
+	spLoggerVar    string
+	spLoggerType   string
+	spLoggerTable  string
+	spLoggerFile   string
+	spLoggerFormat string
+	genLoggerInit  bool
+	stdin          io.Reader
+	stdout         io.Writer
+	stderr         io.Writer
 }
 
 func validateFlags(inputFile, inputDir string, readStdin bool, output, outDir string) error {
@@ -225,9 +246,16 @@ func executeSingleFile(cfg *config) error {
 func doTranspile(cfg *config, source string) (string, error) {
 	if cfg.dmlMode {
 		dmlConfig := transpiler.DMLConfig{
-			Backend:    transpiler.BackendSQL,
-			SQLDialect: cfg.sqlDialect,
-			StoreVar:   cfg.storeVar,
+			Backend:        transpiler.BackendSQL,
+			SQLDialect:     cfg.sqlDialect,
+			StoreVar:       cfg.storeVar,
+			UseSPLogger:    cfg.useSPLogger,
+			SPLoggerVar:    cfg.spLoggerVar,
+			SPLoggerType:   cfg.spLoggerType,
+			SPLoggerTable:  cfg.spLoggerTable,
+			SPLoggerFile:   cfg.spLoggerFile,
+			SPLoggerFormat: cfg.spLoggerFormat,
+			GenLoggerInit:  cfg.genLoggerInit,
 		}
 		return transpiler.TranspileWithDML(source, cfg.packageName, dmlConfig)
 	}
@@ -306,6 +334,7 @@ func writeOutput(cfg *config, inputPath, content string) error {
 }
 
 
+
 func printUsage(w io.Writer) {
 	fmt.Fprint(w, `tgpiler - T-SQL to Go transpiler
 
@@ -324,23 +353,44 @@ Output (mutually exclusive):
   -o, --output <file>   Write to single file
   -O, --outdir <path>   Write to directory (creates if needed)
 
-Options:
-  -p, --pkg <name>      Package name for generated code (default: main)
+General Options:
+  -p, --pkg <n>         Package name for generated code (default: main)
   --dml                 Enable DML mode (SELECT, INSERT, temp tables, JSON/XML)
+  --dialect <n>         SQL dialect: postgres, mysql, sqlite, sqlserver (default: postgres)
+  --store <var>         Store variable name (default: r.db)
   -f, --force           Allow overwriting existing files
   -h, --help            Show help
   -v, --version         Show version
 
+SPLogger Options (requires --dml):
+  --splogger            Enable SPLogger for CATCH block error logging
+  --logger <var>        SPLogger variable name (default: spLogger)
+  --logger-type <type>  Logger type: slog, db, file, multi, nop (default: slog)
+  --logger-table <n>    Table name for db logger (default: Error.LogForStoreProcedure)
+  --logger-file <path>  File path for file logger
+  --logger-format <f>   Format for file logger: json, text (default: json)
+  --logger-init         Generate SPLogger initialization code
+
 Examples:
+  # Basic transpilation
   tgpiler input.sql                       # file to stdout
-  tgpiler input.sql -o output.go          # file to file
-  tgpiler --dml input.sql                 # with DML support (JSON/XML)
-  tgpiler -s < input.sql                  # stdin to stdout
-  cat input.sql | tgpiler -s              # pipe to stdout
-  tgpiler -s -o output.go < input.sql     # stdin to file
+  tgpiler --dml input.sql                 # with DML support
+
+  # SPLogger with slog (default)
+  tgpiler --dml --splogger input.sql
+
+  # SPLogger with database logging
+  tgpiler --dml --splogger --logger-type=db --logger-table=ErrorLog input.sql
+
+  # SPLogger with file logging
+  tgpiler --dml --splogger --logger-type=file --logger-file=/var/log/sp.json input.sql
+
+  # Generate init() code for SPLogger setup
+  tgpiler --dml --splogger --logger-init input.sql
+
+  # Directory processing
   tgpiler -d ./sql -O ./go                # directory to directory
   tgpiler -d ./sql -O ./go -f             # with overwrite
-  tgpiler -p mypackage input.sql          # custom package name
 
 Exit codes:
   0  Success

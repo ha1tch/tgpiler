@@ -41,16 +41,30 @@ type DMLConfig struct {
 
 	// Proto package for gRPC
 	ProtoPackage string
+
+	// SPLogger configuration
+	UseSPLogger    bool   // Use SPLogger for CATCH blocks
+	SPLoggerVar    string // Variable name for logger (e.g., "spLogger", "r.logger")
+	SPLoggerType   string // Logger type: slog, db, file, multi, nop
+	SPLoggerTable  string // Table name for db logger
+	SPLoggerFile   string // File path for file logger
+	SPLoggerFormat string // Format for file logger: json, text
+	GenLoggerInit  bool   // Generate logger initialization code
 }
 
 // DefaultDMLConfig returns sensible defaults.
 func DefaultDMLConfig() DMLConfig {
 	return DMLConfig{
-		Backend:         BackendSQL,
-		SQLDialect:      "postgres",
-		StoreVar:        "r.db",
+		Backend:        BackendSQL,
+		SQLDialect:     "postgres",
+		StoreVar:       "r.db",
 		UseTransactions: false,
-		GRPCMappings:    make(map[string]string),
+		GRPCMappings:   make(map[string]string),
+		UseSPLogger:    false,
+		SPLoggerVar:    "spLogger",
+		SPLoggerType:   "slog",
+		SPLoggerTable:  "Error.LogForStoreProcedure",
+		SPLoggerFormat: "json",
 	}
 }
 
@@ -361,7 +375,12 @@ func (dt *dmlTranspiler) transpileInsertSQL(s *ast.InsertStatement) (string, err
 		out.WriteString(dt.indentStr())
 		out.WriteString("if err := row.Scan(/* TODO: RETURNING columns */); err != nil {\n")
 		out.WriteString(dt.indentStr())
-		out.WriteString("\treturn err\n")
+		if dt.transpiler.inCatchBlock {
+			// In CATCH block, just log and continue - don't return
+			out.WriteString("\t_ = err // Error logging failed, but we're already in error handling\n")
+		} else {
+			out.WriteString("\treturn err\n")
+		}
 		out.WriteString(dt.indentStr())
 		out.WriteString("}")
 	} else {
@@ -385,9 +404,15 @@ func (dt *dmlTranspiler) transpileInsertSQL(s *ast.InsertStatement) (string, err
 		out.WriteString(dt.indentStr())
 		out.WriteString("if err != nil {\n")
 		out.WriteString(dt.indentStr())
-		out.WriteString("\t")
-		out.WriteString(dt.buildErrorReturn())
-		out.WriteString("\n")
+		if dt.transpiler.inCatchBlock {
+			// In CATCH block, just log and continue - don't return
+			// We're already in error handling, so failing to log is not critical
+			out.WriteString("\t_ = err // Error logging failed, but we're already in error handling\n")
+		} else {
+			out.WriteString("\t")
+			out.WriteString(dt.buildErrorReturn())
+			out.WriteString("\n")
+		}
 		out.WriteString(dt.indentStr())
 		out.WriteString("}\n")
 		out.WriteString(dt.indentStr())

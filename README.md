@@ -869,3 +869,103 @@ https://github.com/ha1tch/tgpiler?tab=GPL-3.0-1-ov-file#readme
 ## Related Projects
 
 - [tsqlparser](https://github.com/ha1tch/tsqlparser) - The T-SQL parser used by this project
+
+## SPLogger - Structured Error Logging
+
+The transpiler supports a professional logging system for stored procedure errors. Instead of generating inline error handling code with XML parameter building, you can use SPLogger for clean, structured logging.
+
+### Enabling SPLogger
+
+```bash
+tgpiler --dml --splogger input.sql
+```
+
+### Before (without SPLogger)
+
+```go
+defer func() {
+    if _recovered := recover(); _recovered != nil {
+        hasError = true
+        var parameters string = fmt.Sprintf(`<RootXml>...`, ...)
+        result, err := r.db.ExecContext(ctx, "INSERT INTO Error.Log...", ...)
+        // ...
+    }
+}()
+```
+
+### After (with SPLogger)
+
+```go
+defer func() {
+    if _recovered := recover(); _recovered != nil {
+        _spErr := tsqlruntime.CaptureError("ProcName", _recovered, params)
+        hasError = true
+        _ = spLogger.LogError(ctx, _spErr)
+    }
+}()
+```
+
+### SPLogger Implementations
+
+The `tsqlruntime` package provides several logger implementations:
+
+| Logger | Description |
+|--------|-------------|
+| `DatabaseSPLogger` | Logs to a database table (like original T-SQL pattern) |
+| `SlogSPLogger` | Uses Go's `log/slog` structured logging |
+| `FileSPLogger` | Logs to a file in JSON or text format |
+| `MultiSPLogger` | Logs to multiple destinations |
+| `BufferedSPLogger` | Buffers errors for batch insert |
+| `NopSPLogger` | No-op logger for testing |
+
+### Example Setup
+
+```go
+package main
+
+import (
+    "context"
+    "database/sql"
+    "log/slog"
+    "os"
+    
+    "github.com/ha1tch/tgpiler/tsqlruntime"
+)
+
+func main() {
+    // Option 1: Log to database (like original T-SQL)
+    db, _ := sql.Open("postgres", "...")
+    dbLogger := tsqlruntime.NewDatabaseSPLogger(db, "Error.LogForStoreProcedure", "postgres")
+    
+    // Option 2: Use Go's structured logging
+    slogLogger := tsqlruntime.NewSlogSPLogger(slog.Default())
+    
+    // Option 3: Log to file
+    fileLogger, _ := tsqlruntime.NewFileSPLogger("/var/log/sp_errors.json", "json")
+    defer fileLogger.Close()
+    
+    // Option 4: Multiple destinations
+    multiLogger := tsqlruntime.NewMultiSPLogger(dbLogger, slogLogger)
+    
+    // Set as default (used by generated code)
+    tsqlruntime.SetDefaultSPLogger(multiLogger)
+}
+```
+
+### SPError Structure
+
+```go
+type SPError struct {
+    ProcedureName  string                 // Name of the stored procedure
+    Parameters     map[string]interface{} // Input parameters at time of error
+    ErrorMessage   string                 // Error message (ERROR_MESSAGE())
+    ErrorNumber    int                    // Error number (ERROR_NUMBER())
+    Severity       int                    // Error severity (ERROR_SEVERITY())
+    State          int                    // Error state (ERROR_STATE())
+    Line           int                    // Line number (runtime.Caller)
+    Timestamp      time.Time              // When error occurred
+    StackTrace     string                 // Go stack trace
+}
+```
+
+The `SPError` type provides `ToXML()` and `ToJSON()` methods for serialisation.

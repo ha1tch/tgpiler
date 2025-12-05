@@ -94,6 +94,12 @@ func (t *transpiler) transpileExpression(expr ast.Expression) (string, error) {
 		}
 		return "", fmt.Errorf("subqueries not supported in procedural transpilation")
 
+	case *ast.ExistsExpression:
+		if t.dmlEnabled {
+			return t.transpileExistsExpression(e)
+		}
+		return "", fmt.Errorf("EXISTS not supported in procedural transpilation")
+
 	case *ast.MethodCallExpression:
 		return t.transpileMethodCallExpression(e)
 
@@ -980,6 +986,7 @@ func (t *transpiler) transpileFunctionCall(fc *ast.FunctionCall) (string, error)
 
 	case "ERROR_NUMBER":
 		// No direct equivalent in Go - return 0
+		// Could potentially parse error codes from specific error types
 		return "0", nil
 
 	case "ERROR_SEVERITY", "ERROR_STATE":
@@ -987,12 +994,16 @@ func (t *transpiler) transpileFunctionCall(fc *ast.FunctionCall) (string, error)
 		return "0", nil
 
 	case "ERROR_PROCEDURE":
-		// No direct equivalent - return empty string
+		// Return the current procedure name
+		if t.currentProcName != "" {
+			return fmt.Sprintf("%q", t.currentProcName), nil
+		}
 		return "\"\"", nil
 
 	case "ERROR_LINE":
-		// No direct equivalent - return 0
-		return "0", nil
+		// Use runtime.Caller to get approximate line info
+		t.imports["runtime"] = true
+		return "func() int { _, _, line, _ := runtime.Caller(0); return line }()", nil
 	}
 
 	// Default: output as-is (unknown function) - use exported name as it's likely a procedure
