@@ -36,11 +36,13 @@ type DMLConfig struct {
 	// Whether to use transactions
 	UseTransactions bool
 
-	// gRPC service mappings (procedure -> service.method)
-	GRPCMappings map[string]string
+	// gRPC backend options
+	GRPCClientVar string            // gRPC client variable name (e.g., "client", "svc")
+	GRPCMappings  map[string]string // procedure -> service.method
+	ProtoPackage  string            // Proto package for gRPC
 
-	// Proto package for gRPC
-	ProtoPackage string
+	// Mock backend options
+	MockStoreVar string // Mock store variable name (e.g., "store", "mockDB")
 
 	// SPLogger configuration
 	UseSPLogger    bool   // Use SPLogger for CATCH blocks
@@ -55,16 +57,18 @@ type DMLConfig struct {
 // DefaultDMLConfig returns sensible defaults.
 func DefaultDMLConfig() DMLConfig {
 	return DMLConfig{
-		Backend:        BackendSQL,
-		SQLDialect:     "postgres",
-		StoreVar:       "r.db",
+		Backend:         BackendSQL,
+		SQLDialect:      "postgres",
+		StoreVar:        "r.db",
 		UseTransactions: false,
-		GRPCMappings:   make(map[string]string),
-		UseSPLogger:    false,
-		SPLoggerVar:    "spLogger",
-		SPLoggerType:   "slog",
-		SPLoggerTable:  "Error.LogForStoreProcedure",
-		SPLoggerFormat: "json",
+		GRPCClientVar:   "client",
+		GRPCMappings:    make(map[string]string),
+		MockStoreVar:    "store",
+		UseSPLogger:     false,
+		SPLoggerVar:     "spLogger",
+		SPLoggerType:    "slog",
+		SPLoggerTable:   "Error.LogForStoreProcedure",
+		SPLoggerFormat:  "json",
 	}
 }
 
