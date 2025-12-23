@@ -3,6 +3,7 @@ package transpiler
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/ha1tch/tsqlparser"
@@ -1511,25 +1512,21 @@ func getPlaceholderForDialect(dialect string, n int) string {
 	}
 }
 
-// stripTableHints removes SQL Server table hints like (NOLOCK), WITH (NOLOCK), etc.
+// stripTableHints removes SQL Server table hints like (NOLOCK), WITH (NOLOCK), WITH (NOLOCK, ROWLOCK), etc.
 func stripTableHints(sql string) string {
-	// Patterns to remove: WITH (hint), WITH (hint1, hint2), or just (hint)
-	// Common table hints
-	hints := []string{
-		"NOLOCK", "READUNCOMMITTED", "READCOMMITTED", "REPEATABLEREAD",
-		"SERIALIZABLE", "ROWLOCK", "PAGLOCK", "TABLOCK", "TABLOCKX",
-		"UPDLOCK", "XLOCK", "HOLDLOCK", "NOWAIT", "READPAST",
-	}
+	// Common table hints - these will be matched case-insensitively
+	hintPattern := `(?i)\b(NOLOCK|READUNCOMMITTED|READCOMMITTED|REPEATABLEREAD|SERIALIZABLE|ROWLOCK|PAGLOCK|TABLOCK|TABLOCKX|UPDLOCK|XLOCK|HOLDLOCK|NOWAIT|READPAST)\b`
 	
-	result := sql
+	// Pattern 1: WITH (hint) or WITH (hint1, hint2, ...)
+	// Matches: WITH (NOLOCK), WITH (NOLOCK, ROWLOCK), WITH ( NOLOCK , ROWLOCK )
+	withPattern := regexp.MustCompile(`(?i)\s*WITH\s*\(\s*` + hintPattern + `(\s*,\s*` + hintPattern + `)*\s*\)`)
+	result := withPattern.ReplaceAllString(sql, "")
 	
-	// First, remove "WITH (hint)" patterns
-	for _, hint := range hints {
-		// WITH (HINT)
-		result = replaceIgnoreCase(result, "WITH ("+hint+")", "")
-		// Just (HINT)
-		result = replaceIgnoreCase(result, "("+hint+")", "")
-	}
+	// Pattern 2: Just (hint) or (hint1, hint2, ...) - legacy syntax without WITH
+	// Need to be careful not to remove function calls or subqueries
+	// We match (HINT) only when preceded by whitespace or identifier char (table name/alias)
+	legacyPattern := regexp.MustCompile(`(?i)(\s)\(\s*` + hintPattern + `(\s*,\s*` + hintPattern + `)*\s*\)`)
+	result = legacyPattern.ReplaceAllString(result, "$1")
 	
 	// Clean up any double spaces left behind
 	for strings.Contains(result, "  ") {

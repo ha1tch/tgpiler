@@ -722,8 +722,8 @@ func (dt *dmlTranspiler) transpileWithStatement(s *ast.WithStatement) (string, e
 func (dt *dmlTranspiler) transpileWithSelect(ws *ast.WithStatement, sel *ast.SelectStatement) (string, error) {
 	var out strings.Builder
 
-	// Build the full CTE query
-	query := ws.String()
+	// Build the full CTE query and strip table hints
+	query := stripTableHints(ws.String())
 	
 	// Convert @variable references to parameter placeholders
 	query, args := dt.substituteVariablesInQuery(query)
@@ -870,8 +870,8 @@ func (dt *dmlTranspiler) transpileWithSelectIntoVars(ws *ast.WithStatement, sel 
 func (dt *dmlTranspiler) transpileWithInsert(ws *ast.WithStatement, ins *ast.InsertStatement) (string, error) {
 	var out strings.Builder
 
-	// Build the full CTE query
-	query := ws.String()
+	// Build the full CTE query and strip table hints
+	query := stripTableHints(ws.String())
 	
 	// Convert @variable references to parameter placeholders
 	query, args := dt.substituteVariablesInQuery(query)
@@ -923,8 +923,8 @@ func (dt *dmlTranspiler) transpileWithInsert(ws *ast.WithStatement, ins *ast.Ins
 func (dt *dmlTranspiler) transpileWithUpdate(ws *ast.WithStatement, upd *ast.UpdateStatement) (string, error) {
 	var out strings.Builder
 
-	// Build the full CTE query
-	query := ws.String()
+	// Build the full CTE query and strip table hints
+	query := stripTableHints(ws.String())
 	
 	// Convert @variable references to parameter placeholders
 	query, args := dt.substituteVariablesInQuery(query)
@@ -976,8 +976,8 @@ func (dt *dmlTranspiler) transpileWithUpdate(ws *ast.WithStatement, upd *ast.Upd
 func (dt *dmlTranspiler) transpileWithDelete(ws *ast.WithStatement, del *ast.DeleteStatement) (string, error) {
 	var out strings.Builder
 
-	// Build the full CTE query
-	query := ws.String()
+	// Build the full CTE query and strip table hints
+	query := stripTableHints(ws.String())
 	
 	// Convert @variable references to parameter placeholders
 	query, args := dt.substituteVariablesInQuery(query)
@@ -1397,7 +1397,7 @@ func (dt *dmlTranspiler) buildSelectQuery(s *ast.SelectStatement) (string, []str
 		args = append(args, whereArgs...)
 	}
 
-	return query.String(), args
+	return stripTableHints(query.String()), args
 }
 
 func (dt *dmlTranspiler) buildInsertQuery(s *ast.InsertStatement) (string, []string) {
@@ -1435,7 +1435,7 @@ func (dt *dmlTranspiler) buildInsertQuery(s *ast.InsertStatement) (string, []str
 		query.WriteString(")")
 	}
 
-	return query.String(), args
+	return stripTableHints(query.String()), args
 }
 
 func (dt *dmlTranspiler) buildUpdateQuery(s *ast.UpdateStatement) (string, []string) {
@@ -1493,7 +1493,7 @@ func (dt *dmlTranspiler) buildUpdateQuery(s *ast.UpdateStatement) (string, []str
 		args = append(args, whereArgs...)
 	}
 
-	return query.String(), args
+	return stripTableHints(query.String()), args
 }
 
 // buildFromClause builds the FROM clause for UPDATE/DELETE with JOINs
@@ -1685,7 +1685,7 @@ func (dt *dmlTranspiler) buildDeleteQuery(s *ast.DeleteStatement) (string, []str
 		args = append(args, whereArgs...)
 	}
 
-	return query.String(), args
+	return stripTableHints(query.String()), args
 }
 
 func (dt *dmlTranspiler) buildWhereClause(expr ast.Expression, argNum *int) (string, []string) {
