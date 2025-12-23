@@ -639,7 +639,8 @@ Usage:
   tgpiler [options] -s < input.sql
   tgpiler [options] -d <path>
   tgpiler --gen-server --proto <file> [options]
-  tgpiler --gen-impl --proto <file> --sql-dir <path> [options]
+  tgpiler --gen-server --proto-dir <path> [options]
+  tgpiler --gen-impl --proto-dir <path> --sql-dir <path> [options]
 
 Input (mutually exclusive):
   <file.sql>            Read single file
@@ -696,14 +697,15 @@ Examples:
   # Using mock backend
   tgpiler --dml --backend=mock --mock-store=mockDB input.sql
 
-  # Generate server stubs from proto
+  # Generate server stubs from proto (single file or directory)
   tgpiler --gen-server --proto api.proto -o server.go
+  tgpiler --gen-server --proto-dir ./protos -o all_servers.go
 
   # Generate repository implementations with procedure mappings
-  tgpiler --gen-impl --proto api.proto --sql-dir ./procedures -o repo.go
+  tgpiler --gen-impl --proto-dir ./protos --sql-dir ./procedures -o repo.go
 
   # Show procedure-to-method mappings
-  tgpiler --show-mappings --proto api.proto --sql-dir ./procedures
+  tgpiler --show-mappings --proto-dir ./protos --sql-dir ./procedures
 
   # SPLogger with slog (default)
   tgpiler --dml --splogger input.sql
