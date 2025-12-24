@@ -147,11 +147,18 @@ func (dt *dmlTranspiler) emitResultHandling(out *strings.Builder, comment string
 			out.WriteString(" // " + comment)
 		}
 	}
+	out.WriteString("\n")
 }
 
 // buildErrorReturn generates a return statement with error for DML operations
 // In CATCH blocks (defer func), cannot return values - operations fail silently
 func (dt *dmlTranspiler) buildErrorReturn() string {
+	// In TRY block, we're inside an anonymous func() - cannot return values
+	// Panic with error to let defer/recover catch it
+	if dt.transpiler.inTryBlock {
+		return "panic(err)"
+	}
+	
 	// In CATCH block, we're inside a defer func - cannot return values
 	// Use _ = err to acknowledge error but continue
 	if dt.transpiler.inCatchBlock {
@@ -448,7 +455,18 @@ func (dt *dmlTranspiler) transpileSelectMock(s *ast.SelectStatement) (string, er
 	methodName := dt.inferMockMethod(s, tableName)
 
 	var out strings.Builder
-	out.WriteString(fmt.Sprintf("result, err := %s.%s(", dt.config.StoreVar, methodName))
+	
+	// Check if result and err are already declared
+	resultDeclared := dt.symbols.isDeclared("result")
+	errDeclared := dt.symbols.isDeclared("err")
+	assignOp := ":="
+	if resultDeclared && errDeclared {
+		assignOp = "="
+	}
+	dt.symbols.markDeclared("result")
+	dt.symbols.markDeclared("err")
+	
+	out.WriteString(fmt.Sprintf("result, err %s %s.%s(", assignOp, dt.config.StoreVar, methodName))
 
 	// Add arguments from WHERE clause
 	whereFields := dt.extractWhereFields(s)
@@ -461,10 +479,23 @@ func (dt *dmlTranspiler) transpileSelectMock(s *ast.SelectStatement) (string, er
 	out.WriteString(dt.indentStr())
 	out.WriteString("if err != nil {\n")
 	out.WriteString(dt.indentStr())
-	out.WriteString("\treturn err\n")
+	out.WriteString("\t" + dt.buildErrorReturn() + "\n")
 	out.WriteString(dt.indentStr())
 	out.WriteString("}\n")
-	dt.emitResultHandling(&out, "TODO: use result")
+	dt.emitResultHandling(&out, "")
+	
+	// Check if this is a SELECT INTO variable assignment
+	assignments := dt.extractSelectAssignments(s)
+	if len(assignments) > 0 {
+		// Generate assignments from result
+		// For mock backend, we assume result has fields matching the column names
+		for _, a := range assignments {
+			out.WriteString(dt.indentStr())
+			// Use the column name as the field accessor on result
+			fieldName := goExportedIdentifier(a.column)
+			out.WriteString(fmt.Sprintf("%s = result.%s\n", a.varName, fieldName))
+		}
+	}
 
 	return out.String(), nil
 }
@@ -554,7 +585,7 @@ func (dt *dmlTranspiler) transpileInsertSQL(s *ast.InsertStatement) (string, err
 			// In CATCH block, just log and continue - don't return
 			out.WriteString("\t_ = err // Error logging failed, but we're already in error handling\n")
 		} else {
-			out.WriteString("\treturn err\n")
+			out.WriteString("\t" + dt.buildErrorReturn() + "\n")
 		}
 		out.WriteString(dt.indentStr())
 		out.WriteString("}")
@@ -722,7 +753,18 @@ func (dt *dmlTranspiler) transpileInsertMock(s *ast.InsertStatement) (string, er
 	methodName := "Create" + toPascalCase(singularize(tableName))
 
 	var out strings.Builder
-	out.WriteString(fmt.Sprintf("result, err := %s.%s(", dt.config.StoreVar, methodName))
+	
+	// Check if result and err are already declared
+	resultDeclared := dt.symbols.isDeclared("result")
+	errDeclared := dt.symbols.isDeclared("err")
+	assignOp := ":="
+	if resultDeclared && errDeclared {
+		assignOp = "="
+	}
+	dt.symbols.markDeclared("result")
+	dt.symbols.markDeclared("err")
+	
+	out.WriteString(fmt.Sprintf("result, err %s %s.%s(", assignOp, dt.config.StoreVar, methodName))
 
 	insertFields := dt.extractInsertFields(s)
 	var argList []string
@@ -734,7 +776,7 @@ func (dt *dmlTranspiler) transpileInsertMock(s *ast.InsertStatement) (string, er
 	out.WriteString(dt.indentStr())
 	out.WriteString("if err != nil {\n")
 	out.WriteString(dt.indentStr())
-	out.WriteString("\treturn err\n")
+	out.WriteString("\t" + dt.buildErrorReturn() + "\n")
 	out.WriteString(dt.indentStr())
 	out.WriteString("}\n")
 	dt.emitResultHandling(&out, "")
@@ -783,9 +825,19 @@ func (dt *dmlTranspiler) transpileUpdateSQL(s *ast.UpdateStatement) (string, err
 	// Get the database variable (tx if in transaction, StoreVar otherwise)
 	dbVar := dt.getDBVar()
 
+	// Check if result and err are already declared
+	resultDeclared := dt.symbols.isDeclared("result")
+	errDeclared := dt.symbols.isDeclared("err")
+	assignOp := ":="
+	if resultDeclared && errDeclared {
+		assignOp = "="
+	}
+	dt.symbols.markDeclared("result")
+	dt.symbols.markDeclared("err")
+
 	out.WriteString("// UPDATE query\n")
 	out.WriteString(dt.indentStr())
-	out.WriteString(fmt.Sprintf("result, err := %s.ExecContext(ctx, %q", dbVar, query))
+	out.WriteString(fmt.Sprintf("result, err %s %s.ExecContext(ctx, %q", assignOp, dbVar, query))
 	for _, arg := range args {
 		out.WriteString(", " + arg)
 	}
@@ -793,7 +845,7 @@ func (dt *dmlTranspiler) transpileUpdateSQL(s *ast.UpdateStatement) (string, err
 	out.WriteString(dt.indentStr())
 	out.WriteString("if err != nil {\n")
 	out.WriteString(dt.indentStr())
-	out.WriteString("\treturn err\n")
+	out.WriteString("\t" + dt.buildErrorReturn() + "\n")
 	out.WriteString(dt.indentStr())
 	out.WriteString("}\n")
 	dt.emitResultHandling(&out, "Use result.RowsAffected() if needed")
@@ -910,7 +962,16 @@ func (dt *dmlTranspiler) transpileUpdateMock(s *ast.UpdateStatement) (string, er
 	methodName := "Update" + toPascalCase(singularize(tableName))
 
 	var out strings.Builder
-	out.WriteString(fmt.Sprintf("err := %s.%s(", dt.config.StoreVar, methodName))
+	
+	// Check if err is already declared
+	errDeclared := dt.symbols.isDeclared("err")
+	assignOp := ":="
+	if errDeclared {
+		assignOp = "="
+	}
+	dt.symbols.markDeclared("err")
+	
+	out.WriteString(fmt.Sprintf("err %s %s.%s(", assignOp, dt.config.StoreVar, methodName))
 
 	// Combine SET and WHERE fields
 	var argList []string
@@ -928,7 +989,7 @@ func (dt *dmlTranspiler) transpileUpdateMock(s *ast.UpdateStatement) (string, er
 	out.WriteString(dt.indentStr())
 	out.WriteString("if err != nil {\n")
 	out.WriteString(dt.indentStr())
-	out.WriteString("\treturn err\n")
+	out.WriteString("\t" + dt.buildErrorReturn() + "\n")
 	out.WriteString(dt.indentStr())
 	out.WriteString("}")
 
@@ -976,9 +1037,19 @@ func (dt *dmlTranspiler) transpileDeleteSQL(s *ast.DeleteStatement) (string, err
 	// Get the database variable (tx if in transaction, StoreVar otherwise)
 	dbVar := dt.getDBVar()
 
+	// Check if result and err are already declared
+	resultDeclared := dt.symbols.isDeclared("result")
+	errDeclared := dt.symbols.isDeclared("err")
+	assignOp := ":="
+	if resultDeclared && errDeclared {
+		assignOp = "="
+	}
+	dt.symbols.markDeclared("result")
+	dt.symbols.markDeclared("err")
+
 	out.WriteString("// DELETE query\n")
 	out.WriteString(dt.indentStr())
-	out.WriteString(fmt.Sprintf("result, err := %s.ExecContext(ctx, %q", dbVar, query))
+	out.WriteString(fmt.Sprintf("result, err %s %s.ExecContext(ctx, %q", assignOp, dbVar, query))
 	for _, arg := range args {
 		out.WriteString(", " + arg)
 	}
@@ -986,7 +1057,7 @@ func (dt *dmlTranspiler) transpileDeleteSQL(s *ast.DeleteStatement) (string, err
 	out.WriteString(dt.indentStr())
 	out.WriteString("if err != nil {\n")
 	out.WriteString(dt.indentStr())
-	out.WriteString("\treturn err\n")
+	out.WriteString("\t" + dt.buildErrorReturn() + "\n")
 	out.WriteString(dt.indentStr())
 	out.WriteString("}\n")
 	dt.emitResultHandling(&out, "Use result.RowsAffected() if needed")
@@ -1080,7 +1151,7 @@ func (dt *dmlTranspiler) transpileDeleteMock(s *ast.DeleteStatement) (string, er
 	out.WriteString(dt.indentStr())
 	out.WriteString("if err != nil {\n")
 	out.WriteString(dt.indentStr())
-	out.WriteString("\treturn err\n")
+	out.WriteString("\t" + dt.buildErrorReturn() + "\n")
 	out.WriteString(dt.indentStr())
 	out.WriteString("}")
 
@@ -1415,43 +1486,14 @@ func (dt *dmlTranspiler) transpileWithDelete(ws *ast.WithStatement, del *ast.Del
 }
 
 // substituteVariablesInQuery replaces @variable references with parameter placeholders
-// It correctly skips @symbols inside quoted strings (e.g., XPath '@id' attribute selectors)
 func (dt *dmlTranspiler) substituteVariablesInQuery(query string) (string, []string) {
 	var args []string
 	var result strings.Builder
 	paramIndex := 1 // Start at 1 for the existing getPlaceholder
 	
 	pos := 0
-	inSingleQuote := false
-	inDoubleQuote := false
-	
 	for pos < len(query) {
-		ch := query[pos]
-		
-		// Track quote state (handle escaped quotes)
-		if ch == '\'' && !inDoubleQuote {
-			// Check for escaped single quote ''
-			if pos+1 < len(query) && query[pos+1] == '\'' {
-				result.WriteByte(ch)
-				pos++
-				result.WriteByte(query[pos])
-				pos++
-				continue
-			}
-			inSingleQuote = !inSingleQuote
-			result.WriteByte(ch)
-			pos++
-			continue
-		}
-		if ch == '"' && !inSingleQuote {
-			inDoubleQuote = !inDoubleQuote
-			result.WriteByte(ch)
-			pos++
-			continue
-		}
-		
-		// Only process @ as variable reference if NOT inside quotes
-		if ch == '@' && !inSingleQuote && !inDoubleQuote && pos+1 < len(query) {
+		if query[pos] == '@' && pos+1 < len(query) {
 			// Skip @@global variables
 			if query[pos+1] == '@' {
 				result.WriteByte(query[pos])
@@ -1758,21 +1800,20 @@ func (dt *dmlTranspiler) transpileExecFunction(s *ast.ExecStatement, procName st
 	// Check if result variable is assigned
 	hasResultVar := s.ReturnVariable != nil
 
-	// Build argument list
-	var args []string
-	for _, p := range s.Parameters {
-		argVal, err := dt.transpileExpression(p.Value)
-		if err != nil {
-			return "", err
-		}
-		if p.Output {
-			argVal = "&" + argVal
-		}
-		args = append(args, argVal)
-	}
-
 	// Generate the call
 	if hasResultVar {
+		// Build argument list (all params passed, OUTPUT ones get &)
+		var args []string
+		for _, p := range s.Parameters {
+			argVal, err := dt.transpileExpression(p.Value)
+			if err != nil {
+				return "", err
+			}
+			if p.Output {
+				argVal = "&" + argVal
+			}
+			args = append(args, argVal)
+		}
 		resultVar := goIdentifier(s.ReturnVariable.Value)
 		out.WriteString(fmt.Sprintf("%s = %s(%s)", resultVar, funcName, strings.Join(args, ", ")))
 	} else {
@@ -1782,6 +1823,7 @@ func (dt *dmlTranspiler) transpileExecFunction(s *ast.ExecStatement, procName st
 			if p.Output {
 				varName := ""
 				if v, ok := p.Value.(*ast.Variable); ok {
+					// Don't call transpileExpression - just get the name without marking as used
 					varName = goIdentifier(strings.TrimPrefix(v.Name, "@"))
 				}
 				if varName != "" {
@@ -1790,7 +1832,7 @@ func (dt *dmlTranspiler) transpileExecFunction(s *ast.ExecStatement, procName st
 			}
 		}
 
-		// Build non-output args
+		// Build non-output args (these ARE being read, so transpileExpression is correct)
 		var callArgs []string
 		for _, p := range s.Parameters {
 			if !p.Output {
@@ -1853,9 +1895,17 @@ func (dt *dmlTranspiler) extractSelectAssignments(s *ast.SelectStatement) []varA
 		// Check for @var = expr pattern
 		if item.Variable != nil {
 			varName := goIdentifier(strings.TrimPrefix(item.Variable.Name, "@"))
+			colName := dt.exprToString(item.Expression)
+			
+			// For complex expressions (CASE, function calls, etc.), use the variable name
+			// as a hint for the column name since mock results need simple field names
+			if colName == "" || strings.Contains(colName, "(") || strings.Contains(colName, " ") {
+				colName = varName
+			}
+			
 			assignments = append(assignments, varAssignment{
 				varName: varName,
-				column:  dt.exprToString(item.Expression),
+				column:  colName,
 			})
 		}
 	}
@@ -2179,46 +2229,6 @@ func (dt *dmlTranspiler) recordTempTable(name string) {
 
 // Query building helpers
 
-// buildSelectColumnString builds a column string for SELECT, preserving quotes
-// around aliases that contain @ (FOR XML PATH attribute syntax) or /
-func (dt *dmlTranspiler) buildSelectColumnString(item ast.SelectColumn) string {
-	// Handle SELECT @var = expr pattern
-	if item.Variable != nil {
-		var result strings.Builder
-		result.WriteString(item.Variable.Name)
-		result.WriteString(" = ")
-		if item.Expression != nil {
-			result.WriteString(item.Expression.String())
-		}
-		return result.String()
-	}
-	
-	var result strings.Builder
-	
-	// Build expression part
-	if item.AllColumns {
-		result.WriteString("*")
-	} else if item.Expression != nil {
-		result.WriteString(item.Expression.String())
-	}
-	
-	// Add alias if present
-	if item.Alias != nil && item.Alias.Value != "" {
-		result.WriteString(" AS ")
-		alias := item.Alias.Value
-		// Quote aliases that contain @ or / (FOR XML PATH syntax)
-		if strings.ContainsAny(alias, "@/") {
-			result.WriteString("'")
-			result.WriteString(alias)
-			result.WriteString("'")
-		} else {
-			result.WriteString(alias)
-		}
-	}
-	
-	return result.String()
-}
-
 func (dt *dmlTranspiler) buildSelectQuery(s *ast.SelectStatement) (string, []string) {
 	// Build dialect-appropriate SELECT query
 	var query strings.Builder
@@ -2235,7 +2245,7 @@ func (dt *dmlTranspiler) buildSelectQuery(s *ast.SelectStatement) (string, []str
 			if item.Variable != nil && item.Expression != nil {
 				cols = append(cols, item.Expression.String())
 			} else {
-				cols = append(cols, dt.buildSelectColumnString(item))
+				cols = append(cols, item.String())
 			}
 		}
 		query.WriteString(strings.Join(cols, ", "))
@@ -2990,7 +3000,7 @@ func (t *transpiler) transpileOpenCursor(s *ast.OpenCursorStatement) (string, er
 	out.WriteString(t.indentStr())
 	out.WriteString("if err != nil {\n")
 	out.WriteString(t.indentStr())
-	out.WriteString("\treturn err\n")
+	out.WriteString("\t" + dt.buildErrorReturn() + "\n")
 	out.WriteString(t.indentStr())
 	out.WriteString("}\n")
 	out.WriteString(t.indentStr())
@@ -3218,7 +3228,7 @@ func (t *transpiler) transpileCursorWhile(whileStmt *ast.WhileStatement) (string
 	out.WriteString(t.indentStr())
 	out.WriteString(fmt.Sprintf("if err := %s.Scan(%s); err != nil {\n", cursor.rowsVar, scanList))
 	out.WriteString(t.indentStr())
-	out.WriteString("\treturn err\n")
+	out.WriteString("\t" + t.buildErrorReturn() + "\n")
 	out.WriteString(t.indentStr())
 	out.WriteString("}\n")
 	
@@ -3795,7 +3805,7 @@ func (dt *dmlTranspiler) transpileCreateTableSQL(s *ast.CreateTableStatement) (s
 	
 	out.WriteString(fmt.Sprintf("// CREATE TABLE %s\n", tableName))
 	out.WriteString(fmt.Sprintf("if _, err := %s.ExecContext(ctx, %q); err != nil {\n", dt.config.StoreVar, sql))
-	out.WriteString("\treturn err\n")
+	out.WriteString("\t" + dt.buildErrorReturn() + "\n")
 	out.WriteString("}")
 	
 	return out.String(), nil
@@ -3872,7 +3882,7 @@ func (dt *dmlTranspiler) transpileTruncateTable(s *ast.TruncateTableStatement) (
 		sql := "TRUNCATE TABLE " + tableName
 		out.WriteString(fmt.Sprintf("// TRUNCATE TABLE %s\n", tableName))
 		out.WriteString(fmt.Sprintf("if _, err := %s.ExecContext(ctx, %q); err != nil {\n", dt.config.StoreVar, sql))
-		out.WriteString("\treturn err\n")
+		out.WriteString("\t" + dt.buildErrorReturn() + "\n")
 		out.WriteString("}")
 	}
 	

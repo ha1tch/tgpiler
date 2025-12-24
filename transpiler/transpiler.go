@@ -116,7 +116,6 @@ type transpiler struct {
 	hasReturnCode bool
 	packageName   string
 	comments      *commentIndex
-	currentBlockID int // Current block ID for unused variable tracking
 	
 	// DML handling
 	dmlEnabled      bool
@@ -871,10 +870,12 @@ func (t *transpiler) transpileCreateProcedure(proc *ast.CreateProcedureStatement
 	t.inProcBody = false
 
 	// Emit blank assignments for genuinely unused local variables
+	// Skip this when the body is wrapped in TRY/CATCH (IIFE) since variables are scoped to the IIFE
 	endsWithReturn := t.blockEndsWithReturn(proc.Body)
 	unusedVars := t.symbols.getUnusedVars()
+	bodyHasTryCatch := proc.Body != nil && len(proc.Body.Statements) > 0 && t.bodyStartsWithTryCatch(proc.Body)
 	
-	if len(unusedVars) > 0 {
+	if len(unusedVars) > 0 && !bodyHasTryCatch {
 		if endsWithReturn {
 			// Block ends with return - insert suppress statements before the final return
 			// Find the last return statement in the output and insert before it
@@ -1008,10 +1009,12 @@ func (t *transpiler) transpileCreateFunction(fn *ast.CreateFunctionStatement) (s
 	t.inProcBody = false
 
 	// Emit blank assignments for genuinely unused local variables
+	// Skip this when the body is wrapped in TRY/CATCH (IIFE) since variables are scoped to the IIFE
 	endsWithReturn := t.blockEndsWithReturn(fn.Body)
 	unusedVars := t.symbols.getUnusedVars()
+	bodyHasTryCatch := fn.Body != nil && len(fn.Body.Statements) > 0 && t.bodyStartsWithTryCatch(fn.Body)
 	
-	if len(unusedVars) > 0 {
+	if len(unusedVars) > 0 && !bodyHasTryCatch {
 		if endsWithReturn {
 			// Block ends with return - insert suppress statements before the final return
 			content := out.String()
@@ -1244,6 +1247,21 @@ func (t *transpiler) blockEndsWithReturn(block *ast.BeginEndBlock) bool {
 	return false
 }
 
+// bodyStartsWithTryCatch checks if a block has a TRY/CATCH statement at the top level.
+// This is used to skip unused variable suppression when variables are scoped to an IIFE.
+func (t *transpiler) bodyStartsWithTryCatch(block *ast.BeginEndBlock) bool {
+	if block == nil || len(block.Statements) == 0 {
+		return false
+	}
+	// Check if any top-level statement is TRY/CATCH
+	for _, stmt := range block.Statements {
+		if _, isTryCatch := stmt.(*ast.TryCatchStatement); isTryCatch {
+			return true
+		}
+	}
+	return false
+}
+
 // buildReturnStatement generates a return statement with output params and optional return code.
 func (t *transpiler) buildReturnStatement(returnValue ast.Expression) string {
 	var parts []string
@@ -1274,6 +1292,40 @@ func (t *transpiler) buildReturnStatement(returnValue ast.Expression) string {
 	if len(parts) == 0 {
 		return "return"
 	}
+	return "return " + strings.Join(parts, ", ")
+}
+
+// buildErrorReturn generates a return statement with error for error handling.
+// Handles TRY/CATCH blocks specially since they're inside anonymous functions.
+func (t *transpiler) buildErrorReturn() string {
+	// In TRY block, we're inside an anonymous func() - cannot return values
+	// Panic with error to let defer/recover catch it
+	if t.inTryBlock {
+		return "panic(err)"
+	}
+	
+	// In CATCH block, we're inside a defer func - cannot return values
+	// Use _ = err to acknowledge error but continue
+	if t.inCatchBlock {
+		return "_ = err // Operation failed in error handler"
+	}
+
+	var parts []string
+	
+	// Add output params
+	for _, p := range t.outputParams {
+		paramName := goIdentifier(strings.TrimPrefix(p.Name, "@"))
+		parts = append(parts, paramName)
+	}
+	
+	// Add return code if present
+	if t.hasReturnCode {
+		parts = append(parts, "0")
+	}
+	
+	// Add error
+	parts = append(parts, "err")
+	
 	return "return " + strings.Join(parts, ", ")
 }
 
@@ -1322,12 +1374,6 @@ func (t *transpiler) transpileDeclare(decl *ast.DeclareStatement) (string, error
 		t.symbols.define(varName, typeInfoFromDataType(v.DataType))
 		// Mark as declared for unused variable tracking
 		t.symbols.markDeclared(varName)
-		// Track scope depth for unused var suppression (only suppress at function scope)
-		t.symbols.markDeclaredAtDepth(varName, t.indent)
-		// Track which block this variable was declared in
-		if t.currentBlockID > 0 {
-			t.symbols.markDeclaredInBlock(varName, t.currentBlockID)
-		}
 
 		// Look up comments for first variable in declaration
 		var prefix string
@@ -1433,11 +1479,16 @@ func (t *transpiler) transpileSet(set *ast.SetStatement) (string, error) {
 	}
 
 	// Only call ensureDecimal/ensureBool if we didn't already handle NULL
-	if varType.isDecimal && !isNull {
+	if varType != nil && varType.isDecimal && !isNull {
 		valExpr = t.ensureDecimal(set.Value, valExpr)
 	}
-	if varType.isBool && !isNull {
+	if varType != nil && varType.isBool && !isNull {
 		valExpr = t.ensureBool(set.Value, valExpr)
+	}
+
+	// Skip self-assignments (e.g., SET @x = ISNULL(@x, 0) for value types becomes x = x)
+	if varExpr == valExpr {
+		return fmt.Sprintf("%s// SET %s = %s (no-op, skipped)", prefix, varExpr, valExpr), nil
 	}
 
 	return fmt.Sprintf("%s%s = %s", prefix, varExpr, valExpr), nil
@@ -1468,11 +1519,15 @@ func (t *transpiler) transpileIf(ifStmt *ast.IfStatement) (string, error) {
 	out.WriteString(fmt.Sprintf("if %s {\n", cond))
 
 	t.indent++
+	// Push scope for if block - variables declared here are local to this block
+	savedSymbols := t.symbols
+	t.symbols = t.symbols.pushScope()
 	conseq, err := t.transpileStatementBlock(ifStmt.Consequence)
 	if err != nil {
 		return "", err
 	}
 	out.WriteString(conseq)
+	t.symbols = savedSymbols // Pop scope
 	t.indent--
 
 	if ifStmt.Alternative != nil {
@@ -1494,11 +1549,15 @@ func (t *transpiler) transpileIf(ifStmt *ast.IfStatement) (string, error) {
 		out.WriteString(t.indentStr())
 		out.WriteString("} else {\n")
 		t.indent++
+		// Push scope for else block
+		savedSymbols = t.symbols
+		t.symbols = t.symbols.pushScope()
 		alt, err := t.transpileStatementBlock(ifStmt.Alternative)
 		if err != nil {
 			return "", err
 		}
 		out.WriteString(alt)
+		t.symbols = savedSymbols // Pop scope
 		t.indent--
 	}
 
@@ -1533,10 +1592,6 @@ func (t *transpiler) transpileStatementBlock(stmt ast.Statement) (string, error)
 
 	// If it's a BEGIN/END block, transpile each statement
 	if block, ok := stmt.(*ast.BeginEndBlock); ok {
-		// Enter a new block scope for unused variable tracking
-		blockID := t.symbols.enterBlock()
-		t.currentBlockID = blockID
-		
 		for _, s := range block.Statements {
 			code, err := t.transpileStatement(s)
 			if err != nil {
@@ -1548,18 +1603,6 @@ func (t *transpiler) transpileStatementBlock(stmt ast.Statement) (string, error)
 				out.WriteString("\n")
 			}
 		}
-		
-		// Emit suppress statements for unused variables declared in THIS block
-		unusedVars := t.symbols.getUnusedVarsInBlock(blockID)
-		if len(unusedVars) > 0 {
-			for _, varName := range unusedVars {
-				out.WriteString(t.indentStr())
-				out.WriteString(fmt.Sprintf("_ = %s\n", varName))
-				// Mark as used so we don't suppress it again
-				t.symbols.markUsed(varName)
-			}
-		}
-		
 		return out.String(), nil
 	}
 
@@ -1600,11 +1643,15 @@ func (t *transpiler) transpileWhile(whileStmt *ast.WhileStatement) (string, erro
 	out.WriteString(fmt.Sprintf("for %s {\n", cond))
 
 	t.indent++
+	// Push scope for loop body
+	savedSymbols := t.symbols
+	t.symbols = t.symbols.pushScope()
 	body, err := t.transpileStatementBlock(whileStmt.Body)
 	if err != nil {
 		return "", err
 	}
 	out.WriteString(body)
+	t.symbols = savedSymbols // Pop scope
 	t.indent--
 
 	out.WriteString(t.indentStr())
@@ -1653,6 +1700,10 @@ func (t *transpiler) transpileTryCatch(tc *ast.TryCatchStatement) (string, error
 	// Set inCatchBlock so we can handle ERROR_* functions and XML building specially
 	wasInCatchBlock := t.inCatchBlock
 	t.inCatchBlock = true
+	
+	// Push a new scope for the defer func - variables declared here are local
+	savedSymbols := t.symbols
+	t.symbols = t.symbols.pushScope()
 
 	// If SPLogger is enabled, generate a CaptureError call at the start
 	if t.dmlEnabled && t.dmlConfig.UseSPLogger {
@@ -1690,6 +1741,9 @@ func (t *transpiler) transpileTryCatch(tc *ast.TryCatchStatement) (string, error
 			}
 		}
 	}
+	
+	// Pop the CATCH block scope
+	t.symbols = savedSymbols
 	t.inCatchBlock = wasInCatchBlock
 
 	t.indent--
@@ -1700,8 +1754,12 @@ func (t *transpiler) transpileTryCatch(tc *ast.TryCatchStatement) (string, error
 	out.WriteString("}()\n")
 
 	// TRY block - set flag to handle RETURN statements correctly
+	// Push a new scope for the IIFE - variables declared here are in the IIFE scope
 	wasInTryBlock := t.inTryBlock
 	t.inTryBlock = true
+	savedTrySymbols := t.symbols
+	t.symbols = t.symbols.pushScope()
+	
 	if tc.TryBlock != nil {
 		for _, stmt := range tc.TryBlock.Statements {
 			s, err := t.transpileStatement(stmt)
@@ -1715,6 +1773,20 @@ func (t *transpiler) transpileTryCatch(tc *ast.TryCatchStatement) (string, error
 			}
 		}
 	}
+	
+	// Emit suppression for unused variables declared in this scope (inside the IIFE)
+	unusedVars := t.symbols.getUnusedVars()
+	if len(unusedVars) > 0 {
+		out.WriteString(t.indentStr())
+		out.WriteString("// Suppress unused variable warnings\n")
+		for _, varName := range unusedVars {
+			out.WriteString(t.indentStr())
+			out.WriteString(fmt.Sprintf("_ = %s\n", varName))
+		}
+	}
+	
+	// Pop the TRY block scope
+	t.symbols = savedTrySymbols
 	t.inTryBlock = wasInTryBlock
 
 	t.indent--
@@ -1853,7 +1925,7 @@ func (t *transpiler) transpileBeginTransaction(s *ast.BeginTransactionStatement)
 	out.WriteString(t.indentStr())
 	out.WriteString("if err != nil {\n")
 	out.WriteString(t.indentStr())
-	out.WriteString("\treturn err\n")
+	out.WriteString("\t" + t.buildErrorReturn() + "\n")
 	out.WriteString(t.indentStr())
 	out.WriteString("}\n")
 	out.WriteString(t.indentStr())
@@ -1880,7 +1952,7 @@ func (t *transpiler) transpileCommitTransaction(s *ast.CommitTransactionStatemen
 	out.WriteString(t.indentStr())
 	out.WriteString("if err := tx.Commit(); err != nil {\n")
 	out.WriteString(t.indentStr())
-	out.WriteString("\treturn err\n")
+	out.WriteString("\t" + t.buildErrorReturn() + "\n")
 	out.WriteString(t.indentStr())
 	out.WriteString("}")
 	

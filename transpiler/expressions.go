@@ -220,7 +220,7 @@ func (t *transpiler) transpileInfixExpression(e *ast.InfixExpression) (string, e
 	// @Flag = 1 -> flag, @Flag = 0 -> !flag
 	// @Flag <> 1 -> !flag, @Flag <> 0 -> flag
 	if op == "=" || op == "<>" || op == "!=" {
-		if leftType.isBool {
+		if leftType != nil && leftType.isBool {
 			if lit, ok := e.Right.(*ast.IntegerLiteral); ok {
 				if lit.Value == 1 {
 					if op == "=" {
@@ -236,7 +236,7 @@ func (t *transpiler) transpileInfixExpression(e *ast.InfixExpression) (string, e
 				}
 			}
 		}
-		if rightType.isBool {
+		if rightType != nil && rightType.isBool {
 			if lit, ok := e.Left.(*ast.IntegerLiteral); ok {
 				if lit.Value == 1 {
 					if op == "=" {
@@ -254,7 +254,7 @@ func (t *transpiler) transpileInfixExpression(e *ast.InfixExpression) (string, e
 		}
 
 		// Handle string comparison with NULL - use empty string instead
-		if leftType.isString {
+		if leftType != nil && leftType.isString {
 			if _, ok := e.Right.(*ast.NullLiteral); ok {
 				if op == "=" {
 					return fmt.Sprintf("(%s == \"\")", left), nil
@@ -262,12 +262,33 @@ func (t *transpiler) transpileInfixExpression(e *ast.InfixExpression) (string, e
 				return fmt.Sprintf("(%s != \"\")", left), nil
 			}
 		}
-		if rightType.isString {
+		if rightType != nil && rightType.isString {
 			if _, ok := e.Left.(*ast.NullLiteral); ok {
 				if op == "=" {
 					return fmt.Sprintf("(%s == \"\")", right), nil
 				}
 				return fmt.Sprintf("(%s != \"\")", right), nil
+			}
+		}
+		
+		// Handle string comparison with integer literals
+		// SQL allows implicit conversion: @StringVar = 10 becomes stringVar == "10"
+		if leftType != nil && leftType.isString {
+			if lit, ok := e.Right.(*ast.IntegerLiteral); ok {
+				goOp := "=="
+				if op == "<>" || op == "!=" {
+					goOp = "!="
+				}
+				return fmt.Sprintf("(%s %s \"%d\")", left, goOp, lit.Value), nil
+			}
+		}
+		if rightType != nil && rightType.isString {
+			if lit, ok := e.Left.(*ast.IntegerLiteral); ok {
+				goOp := "=="
+				if op == "<>" || op == "!=" {
+					goOp = "!="
+				}
+				return fmt.Sprintf("(\"%d\" %s %s)", lit.Value, goOp, right), nil
 			}
 		}
 	}
@@ -832,12 +853,7 @@ func (t *transpiler) transpileFunctionCall(fc *ast.FunctionCall) (string, error)
 
 	case "CHARINDEX":
 		t.imports["strings"] = true
-		if len(args) >= 3 {
-			// CHARINDEX with start position: CHARINDEX(pattern, str, start)
-			// Use a helper function to search from position
-			// Note: T-SQL uses 1-based indexing, Go uses 0-based
-			return fmt.Sprintf("func() int32 { s := %s; p := %s; start := int(%s); if start < 1 { start = 1 }; if start > len(s) { return 0 }; idx := strings.Index(s[start-1:], p); if idx == -1 { return 0 }; return int32(idx + start) }()", args[1], args[0], args[2]), nil
-		} else if len(args) >= 2 {
+		if len(args) >= 2 {
 			// CHARINDEX returns 0 if not found, 1-based index otherwise
 			// strings.Index returns -1 if not found, 0-based index otherwise
 			return fmt.Sprintf("int32(strings.Index(%s, %s) + 1)", args[1], args[0]), nil
@@ -894,11 +910,36 @@ func (t *transpiler) transpileFunctionCall(fc *ast.FunctionCall) (string, error)
 		// For value types: use the value (Go doesn't have null for value types)
 		if len(args) == 2 {
 			argType := t.inferType(fc.Arguments[0])
-			if argType.isString {
+			if argType != nil && argType.isString {
 				return fmt.Sprintf("func() string { if %s != \"\" { return %s }; return %s }()", args[0], args[0], args[1]), nil
 			}
-			// For value types, just return the first value
-			// In a real scenario, you'd use sql.Null* types
+			if argType != nil && argType.isDateTime {
+				// For time.Time, check if zero
+				return fmt.Sprintf("func() time.Time { if !%s.IsZero() { return %s }; return %s }()", args[0], args[0], args[1]), nil
+			}
+			if argType != nil && argType.isDecimal {
+				// For decimal, check if zero
+				// If second arg is literal 0, use decimal.Zero
+				defaultVal := args[1]
+				if defaultVal == "0" || defaultVal == "0.0" {
+					defaultVal = "decimal.Zero"
+				}
+				return fmt.Sprintf("func() decimal.Decimal { if !%s.IsZero() { return %s }; return %s }()", args[0], args[0], defaultVal), nil
+			}
+			if argType != nil && argType.isBool {
+				// For bool, just use the value (no null concept for bool in Go)
+				// If both args are the same variable, just return the variable
+				if args[0] == args[1] {
+					return args[0], nil
+				}
+				// Otherwise return first arg (Go bool can't be null)
+				return args[0], nil
+			}
+			if argType != nil && argType.isNumeric {
+				// For numeric types, check if zero
+				return fmt.Sprintf("func() %s { if %s != 0 { return %s }; return %s }()", argType.goType, args[0], args[0], args[1]), nil
+			}
+			// For unknown types, return first value (simplified)
 			return args[0], nil
 		}
 
@@ -1094,6 +1135,7 @@ func (t *transpiler) transpileFunctionCall(fc *ast.FunctionCall) (string, error)
 
 	case "OBJECT_ID":
 		// OBJECT_ID('name') checks if database object exists
+		// Returns the object ID (int) if exists, NULL if not
 		// For temp tables: OBJECT_ID('tempdb..#tableName') checks temp table existence
 		if len(args) == 1 {
 			objName := strings.Trim(args[0], "\"")
@@ -1103,7 +1145,8 @@ func (t *transpiler) transpileFunctionCall(fc *ast.FunctionCall) (string, error)
 				parts := strings.Split(objName, "#")
 				if len(parts) >= 2 {
 					tableName := "#" + parts[len(parts)-1]
-					return fmt.Sprintf("tempTables.Exists(%q) /* OBJECT_ID check for temp table */", tableName), nil
+					// Return a value that can be null-checked: nil if not exists, 1 if exists
+					return fmt.Sprintf("func() interface{} { if tempTables.TempTableExists(%q) { return 1 }; return nil }()", tableName), nil
 				}
 			}
 			// For other objects, generate a comment
@@ -1519,15 +1562,51 @@ func (t *transpiler) transpileIsNullExpression(e *ast.IsNullExpression) (string,
 		return "", err
 	}
 
-	// For string types, NULL check becomes empty string check
+	// Infer type to determine appropriate null/zero check
 	exprType := t.inferType(e.Expr)
-	if exprType.isString {
+	
+	// For string types, NULL check becomes empty string check
+	if exprType != nil && exprType.isString {
 		if e.Not {
 			return fmt.Sprintf("(%s != \"\")", expr), nil
 		}
 		return fmt.Sprintf("(%s == \"\")", expr), nil
 	}
+	
+	// For datetime types (time.Time), use IsZero()
+	if exprType != nil && exprType.isDateTime {
+		if e.Not {
+			return fmt.Sprintf("(!%s.IsZero())", expr), nil
+		}
+		return fmt.Sprintf("(%s.IsZero())", expr), nil
+	}
+	
+	// For decimal types, use IsZero() method
+	if exprType != nil && exprType.isDecimal {
+		if e.Not {
+			return fmt.Sprintf("(!%s.IsZero())", expr), nil
+		}
+		return fmt.Sprintf("(%s.IsZero())", expr), nil
+	}
+	
+	// For numeric types (int32, int64, float64, etc.), use zero comparison
+	if exprType != nil && exprType.isNumeric {
+		if e.Not {
+			return fmt.Sprintf("(%s != 0)", expr), nil
+		}
+		return fmt.Sprintf("(%s == 0)", expr), nil
+	}
+	
+	// For bool types, check the value directly
+	if exprType != nil && exprType.isBool {
+		// In T-SQL, NULL for bit is typically false
+		if e.Not {
+			return fmt.Sprintf("(%s)", expr), nil // IS NOT NULL for bool = true
+		}
+		return fmt.Sprintf("(!%s)", expr), nil // IS NULL for bool = false
+	}
 
+	// Default: use nil check (for interface{} or unknown pointer types)
 	if e.Not {
 		return fmt.Sprintf("(%s != nil)", expr), nil
 	}
