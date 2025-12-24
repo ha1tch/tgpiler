@@ -24,13 +24,26 @@ type symbolTable struct {
 	
 	// Track variable reads to identify unused variables
 	usedVars map[string]bool
+	
+	// Track the scope depth where each variable was declared (for unused var detection)
+	// Variables declared in nested scopes (depth > 1) shouldn't be suppressed at function level
+	declaredAtDepth map[string]int
+	
+	// Track which block each variable was declared in (unique ID per block)
+	declaredInBlock map[string]int
+	
+	// Counter for generating unique block IDs
+	nextBlockID int
 }
 
 func newSymbolTable() *symbolTable {
 	return &symbolTable{
-		variables:    make(map[string]*typeInfo),
-		declaredVars: make(map[string]bool),
-		usedVars:     make(map[string]bool),
+		variables:       make(map[string]*typeInfo),
+		declaredVars:    make(map[string]bool),
+		usedVars:        make(map[string]bool),
+		declaredAtDepth: make(map[string]int),
+		declaredInBlock: make(map[string]int),
+		nextBlockID:     0,
 	}
 }
 
@@ -83,12 +96,61 @@ func (st *symbolTable) isUsed(name string) bool {
 	return false
 }
 
+// markDeclaredAtDepth records the scope depth where a variable was declared
+func (st *symbolTable) markDeclaredAtDepth(name string, depth int) {
+	st.declaredAtDepth[name] = depth
+}
+
 // getUnusedVars returns variables that were declared but never read
+// Only returns variables declared at the specified function scope depth (typically 1)
 func (st *symbolTable) getUnusedVars() []string {
 	var unused []string
 	for name := range st.declaredVars {
 		if !st.usedVars[name] {
+			// Only include variables declared at function scope (depth 1)
+			// Variables in nested blocks would cause "undefined" errors if suppressed at function level
+			if depth, ok := st.declaredAtDepth[name]; ok && depth > 1 {
+				continue
+			}
 			unused = append(unused, name)
+		}
+	}
+	return unused
+}
+
+// getUnusedVarsAtDepth returns unused variables declared at the specified depth
+// DEPRECATED: Use getUnusedVarsInBlock instead for proper block-scoped tracking
+func (st *symbolTable) getUnusedVarsAtDepth(targetDepth int) []string {
+	var unused []string
+	for name := range st.declaredVars {
+		if !st.usedVars[name] {
+			if depth, ok := st.declaredAtDepth[name]; ok && depth == targetDepth {
+				unused = append(unused, name)
+			}
+		}
+	}
+	return unused
+}
+
+// enterBlock allocates a new unique block ID and returns it
+func (st *symbolTable) enterBlock() int {
+	st.nextBlockID++
+	return st.nextBlockID
+}
+
+// markDeclaredInBlock records which block a variable was declared in
+func (st *symbolTable) markDeclaredInBlock(name string, blockID int) {
+	st.declaredInBlock[name] = blockID
+}
+
+// getUnusedVarsInBlock returns unused variables declared in the specified block
+func (st *symbolTable) getUnusedVarsInBlock(blockID int) []string {
+	var unused []string
+	for name := range st.declaredVars {
+		if !st.usedVars[name] {
+			if bid, ok := st.declaredInBlock[name]; ok && bid == blockID {
+				unused = append(unused, name)
+			}
 		}
 	}
 	return unused

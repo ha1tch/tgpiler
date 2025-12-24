@@ -179,7 +179,7 @@ func TestE2EExecuteJSON(t *testing.T) {
 		{
 			sqlFile: "../tsql_structured/01_json_value_extract.sql",
 			testCode: `
-				customerName, customerId, email := ParseCustomerJson(` + "`" + `{"customer":{"id":42,"name":"Alice","email":"alice@example.com"}}` + "`" + `)
+				customerName, customerId, email := r.ParseCustomerJson(ctx, ` + "`" + `{"customer":{"id":42,"name":"Alice","email":"alice@example.com"}}` + "`" + `)
 				fmt.Printf("%s,%d,%s\n", customerName, customerId, email)
 			`,
 			expected: "Alice,42,alice@example.com\n",
@@ -187,7 +187,7 @@ func TestE2EExecuteJSON(t *testing.T) {
 		{
 			sqlFile: "../tsql_structured/05_json_modify.sql",
 			testCode: `
-				result := UpdateCustomerJson(` + "`" + `{"customer":{"name":"Alice","email":"old@example.com"},"status":"inactive"}` + "`" + `, "alice@new.com", "555-1234", "active")
+				result := r.UpdateCustomerJson(ctx, ` + "`" + `{"customer":{"name":"Alice","email":"old@example.com"},"status":"inactive"}` + "`" + `, "alice@new.com", "555-1234", "active")
 				// Check result contains new email and phone
 				if strings.Contains(result, "alice@new.com") && strings.Contains(result, "555-1234") {
 					fmt.Println("OK")
@@ -225,7 +225,7 @@ func TestE2EExecuteXML(t *testing.T) {
 		{
 			sqlFile: "../tsql_structured/11_xml_value_extract.sql",
 			testCode: `
-				customerName, customerId, email := ParseCustomerXml("<customer><id>123</id><name>Bob</name><email>bob@test.com</email></customer>")
+				customerName, customerId, email := r.ParseCustomerXml(ctx, "<customer><id>123</id><name>Bob</name><email>bob@test.com</email></customer>")
 				fmt.Printf("%s,%d,%s\n", customerName, customerId, email)
 			`,
 			expected: "Bob,123,bob@test.com\n",
@@ -233,7 +233,7 @@ func TestE2EExecuteXML(t *testing.T) {
 		{
 			sqlFile: "../tsql_structured/13_xml_exist.sql",
 			testCode: `
-				isValid, hasCustomer, hasItems, hasShipping, msg := ValidateOrderXml("<order status=\"pending\"><customer>John</customer><items><item>Widget</item></items><shipping>Express</shipping></order>")
+				isValid, hasCustomer, hasItems, hasShipping, msg := r.ValidateOrderXml(ctx, "<order status=\"pending\"><customer>John</customer><items><item>Widget</item></items><shipping>Express</shipping></order>")
 				_ = msg
 				fmt.Printf("%v,%v,%v,%v\n", isValid, hasCustomer, hasItems, hasShipping)
 			`,
@@ -297,6 +297,7 @@ func transpileAndExecuteStructured(t *testing.T, workspace, tgpiler, sqlFile, te
 
 	// Build imports
 	var imports []string
+	imports = append(imports, `"context"`) // Always needed for DML functions
 	imports = append(imports, `"fmt"`)
 	imports = append(imports, `"strings"`) // Always needed for Contains check in tests
 	if usesDecimal {
@@ -388,6 +389,12 @@ func generateRuntimeStubs() string {
 	return `
 import "encoding/json"
 import "regexp"
+
+// Repository is the database wrapper used by transpiled code
+type Repository struct{}
+
+var ctx = context.Background()
+var r = &Repository{}
 
 // JsonValue extracts a scalar value from JSON using a path
 func JsonValue(jsonStr, path string) string {
@@ -533,7 +540,13 @@ import (
 )
 
 var ctx = context.Background()
-var r = struct{ db *sql.DB }{}
+
+// Repository is the database wrapper used by transpiled code
+type Repository struct {
+	db *sql.DB
+}
+
+var r = &Repository{}
 var tempTables = tsqlruntime.NewTempTableManager()
 var rowcount int32
 
