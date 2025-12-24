@@ -832,12 +832,7 @@ func (t *transpiler) transpileFunctionCall(fc *ast.FunctionCall) (string, error)
 
 	case "CHARINDEX":
 		t.imports["strings"] = true
-		if len(args) >= 3 {
-			// CHARINDEX with start position: CHARINDEX(pattern, str, start)
-			// Use a helper function to search from position
-			// Note: T-SQL uses 1-based indexing, Go uses 0-based
-			return fmt.Sprintf("func() int32 { s := %s; p := %s; start := int(%s); if start < 1 { start = 1 }; if start > len(s) { return 0 }; idx := strings.Index(s[start-1:], p); if idx == -1 { return 0 }; return int32(idx + start) }()", args[1], args[0], args[2]), nil
-		} else if len(args) >= 2 {
+		if len(args) >= 2 {
 			// CHARINDEX returns 0 if not found, 1-based index otherwise
 			// strings.Index returns -1 if not found, 0-based index otherwise
 			return fmt.Sprintf("int32(strings.Index(%s, %s) + 1)", args[1], args[0]), nil

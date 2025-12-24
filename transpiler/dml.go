@@ -1415,43 +1415,14 @@ func (dt *dmlTranspiler) transpileWithDelete(ws *ast.WithStatement, del *ast.Del
 }
 
 // substituteVariablesInQuery replaces @variable references with parameter placeholders
-// It correctly skips @symbols inside quoted strings (e.g., XPath '@id' attribute selectors)
 func (dt *dmlTranspiler) substituteVariablesInQuery(query string) (string, []string) {
 	var args []string
 	var result strings.Builder
 	paramIndex := 1 // Start at 1 for the existing getPlaceholder
 	
 	pos := 0
-	inSingleQuote := false
-	inDoubleQuote := false
-	
 	for pos < len(query) {
-		ch := query[pos]
-		
-		// Track quote state (handle escaped quotes)
-		if ch == '\'' && !inDoubleQuote {
-			// Check for escaped single quote ''
-			if pos+1 < len(query) && query[pos+1] == '\'' {
-				result.WriteByte(ch)
-				pos++
-				result.WriteByte(query[pos])
-				pos++
-				continue
-			}
-			inSingleQuote = !inSingleQuote
-			result.WriteByte(ch)
-			pos++
-			continue
-		}
-		if ch == '"' && !inSingleQuote {
-			inDoubleQuote = !inDoubleQuote
-			result.WriteByte(ch)
-			pos++
-			continue
-		}
-		
-		// Only process @ as variable reference if NOT inside quotes
-		if ch == '@' && !inSingleQuote && !inDoubleQuote && pos+1 < len(query) {
+		if query[pos] == '@' && pos+1 < len(query) {
 			// Skip @@global variables
 			if query[pos+1] == '@' {
 				result.WriteByte(query[pos])
@@ -2179,46 +2150,6 @@ func (dt *dmlTranspiler) recordTempTable(name string) {
 
 // Query building helpers
 
-// buildSelectColumnString builds a column string for SELECT, preserving quotes
-// around aliases that contain @ (FOR XML PATH attribute syntax) or /
-func (dt *dmlTranspiler) buildSelectColumnString(item ast.SelectColumn) string {
-	// Handle SELECT @var = expr pattern
-	if item.Variable != nil {
-		var result strings.Builder
-		result.WriteString(item.Variable.Name)
-		result.WriteString(" = ")
-		if item.Expression != nil {
-			result.WriteString(item.Expression.String())
-		}
-		return result.String()
-	}
-	
-	var result strings.Builder
-	
-	// Build expression part
-	if item.AllColumns {
-		result.WriteString("*")
-	} else if item.Expression != nil {
-		result.WriteString(item.Expression.String())
-	}
-	
-	// Add alias if present
-	if item.Alias != nil && item.Alias.Value != "" {
-		result.WriteString(" AS ")
-		alias := item.Alias.Value
-		// Quote aliases that contain @ or / (FOR XML PATH syntax)
-		if strings.ContainsAny(alias, "@/") {
-			result.WriteString("'")
-			result.WriteString(alias)
-			result.WriteString("'")
-		} else {
-			result.WriteString(alias)
-		}
-	}
-	
-	return result.String()
-}
-
 func (dt *dmlTranspiler) buildSelectQuery(s *ast.SelectStatement) (string, []string) {
 	// Build dialect-appropriate SELECT query
 	var query strings.Builder
@@ -2235,7 +2166,7 @@ func (dt *dmlTranspiler) buildSelectQuery(s *ast.SelectStatement) (string, []str
 			if item.Variable != nil && item.Expression != nil {
 				cols = append(cols, item.Expression.String())
 			} else {
-				cols = append(cols, dt.buildSelectColumnString(item))
+				cols = append(cols, item.String())
 			}
 		}
 		query.WriteString(strings.Join(cols, ", "))
