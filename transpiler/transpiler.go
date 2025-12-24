@@ -1527,6 +1527,11 @@ func (t *transpiler) transpileIf(ifStmt *ast.IfStatement) (string, error) {
 		return "", err
 	}
 	out.WriteString(conseq)
+	// Emit unused variable suppression for this scope before popping
+	unusedVars := t.symbols.getUnusedVars()
+	for _, v := range unusedVars {
+		out.WriteString(t.indentStr() + "_ = " + v + "\n")
+	}
 	t.symbols = savedSymbols // Pop scope
 	t.indent--
 
@@ -1557,6 +1562,11 @@ func (t *transpiler) transpileIf(ifStmt *ast.IfStatement) (string, error) {
 			return "", err
 		}
 		out.WriteString(alt)
+		// Emit unused variable suppression for else scope before popping
+		unusedVars = t.symbols.getUnusedVars()
+		for _, v := range unusedVars {
+			out.WriteString(t.indentStr() + "_ = " + v + "\n")
+		}
 		t.symbols = savedSymbols // Pop scope
 		t.indent--
 	}
@@ -1651,6 +1661,11 @@ func (t *transpiler) transpileWhile(whileStmt *ast.WhileStatement) (string, erro
 		return "", err
 	}
 	out.WriteString(body)
+	// Emit unused variable suppression for loop scope before popping
+	unusedVars := t.symbols.getUnusedVars()
+	for _, v := range unusedVars {
+		out.WriteString(t.indentStr() + "_ = " + v + "\n")
+	}
 	t.symbols = savedSymbols // Pop scope
 	t.indent--
 

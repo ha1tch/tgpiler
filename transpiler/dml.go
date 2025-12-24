@@ -1492,10 +1492,34 @@ func (dt *dmlTranspiler) substituteVariablesInQuery(query string) (string, []str
 	paramIndex := 1 // Start at 1 for the existing getPlaceholder
 	
 	pos := 0
+	inSingleQuote := false
 	for pos < len(query) {
-		if query[pos] == '@' && pos+1 < len(query) {
+		// Track whether we're inside a single-quoted string
+		if query[pos] == '\'' {
+			// Check for escaped quote ''
+			if pos+1 < len(query) && query[pos+1] == '\'' {
+				result.WriteByte(query[pos])
+				result.WriteByte(query[pos+1])
+				pos += 2
+				continue
+			}
+			inSingleQuote = !inSingleQuote
+			result.WriteByte(query[pos])
+			pos++
+			continue
+		}
+		
+		// Only substitute @variables when not inside quotes
+		if !inSingleQuote && query[pos] == '@' && pos+1 < len(query) {
 			// Skip @@global variables
 			if query[pos+1] == '@' {
+				result.WriteByte(query[pos])
+				pos++
+				continue
+			}
+			
+			// Skip XPath attributes (/@attr pattern - @ after /)
+			if pos > 0 && query[pos-1] == '/' {
 				result.WriteByte(query[pos])
 				pos++
 				continue

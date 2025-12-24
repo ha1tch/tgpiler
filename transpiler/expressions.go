@@ -192,7 +192,7 @@ func (t *transpiler) transpilePrefixExpression(e *ast.PrefixExpression) (string,
 	// Handle unary minus on decimal types
 	if op == "-" {
 		rightType := t.inferType(e.Right)
-		if rightType.isDecimal {
+		if rightType != nil && rightType.isDecimal {
 			return fmt.Sprintf("%s.Neg()", right), nil
 		}
 	}
@@ -294,14 +294,14 @@ func (t *transpiler) transpileInfixExpression(e *ast.InfixExpression) (string, e
 	}
 
 	// Check if either operand is decimal
-	if leftType.isDecimal || rightType.isDecimal {
+	if (leftType != nil && leftType.isDecimal) || (rightType != nil && rightType.isDecimal) {
 		return t.transpileDecimalInfix(left, right, e.Left, e.Right, leftType, rightType, op)
 	}
 
 	// Handle T-SQL BIT toggle pattern: 1 - @BitVar becomes !bitVar
 	// This is a common idiom for toggling a BIT value
 	if op == "-" {
-		if leftLit, ok := e.Left.(*ast.IntegerLiteral); ok && leftLit.Value == 1 && rightType.isBool {
+		if leftLit, ok := e.Left.(*ast.IntegerLiteral); ok && leftLit.Value == 1 && rightType != nil && rightType.isBool {
 			return fmt.Sprintf("!%s", right), nil
 		}
 	}
@@ -314,7 +314,7 @@ func (t *transpiler) transpileInfixExpression(e *ast.InfixExpression) (string, e
 	leftIsLiteral := isIntegerLiteral(e.Left)
 	rightIsLiteral := isIntegerLiteral(e.Right)
 
-	if isArithmetic && leftType.isNumeric && rightType.isNumeric && !leftIsLiteral && !rightIsLiteral {
+	if isArithmetic && leftType != nil && rightType != nil && leftType.isNumeric && rightType.isNumeric && !leftIsLiteral && !rightIsLiteral {
 		// Both are typed expressions - promote to the larger type
 		if leftType.goType != rightType.goType {
 			targetType := t.promoteNumericType(leftType.goType, rightType.goType)
@@ -328,7 +328,7 @@ func (t *transpiler) transpileInfixExpression(e *ast.InfixExpression) (string, e
 	}
 
 	// Handle time.Time comparisons - Go doesn't support comparison operators on structs
-	if leftType.isDateTime || rightType.isDateTime {
+	if (leftType != nil && leftType.isDateTime) || (rightType != nil && rightType.isDateTime) {
 		switch op {
 		case "=":
 			return fmt.Sprintf("%s.Equal(%s)", left, right), nil
@@ -357,10 +357,10 @@ func (t *transpiler) transpileDecimalInfix(left, right string, leftExpr, rightEx
 	// Ensure both operands are decimal
 	leftDec := left
 	rightDec := right
-	if !leftType.isDecimal {
+	if leftType == nil || !leftType.isDecimal {
 		leftDec = t.ensureDecimal(leftExpr, left)
 	}
-	if !rightType.isDecimal {
+	if rightType == nil || !rightType.isDecimal {
 		rightDec = t.ensureDecimal(rightExpr, right)
 	}
 
@@ -414,9 +414,9 @@ func (t *transpiler) ensureDecimal(expr ast.Expression, transpiled string) strin
 		return fmt.Sprintf("decimal.NewFromInt(%s)", transpiled)
 	}
 
-	// Float literal
+	// Float literal - use RequireFromString to avoid float64 precision loss
 	if _, ok := expr.(*ast.FloatLiteral); ok {
-		return fmt.Sprintf("decimal.NewFromFloat(%s)", transpiled)
+		return fmt.Sprintf("decimal.RequireFromString(\"%s\")", transpiled)
 	}
 
 	// Integer variable/expression
@@ -495,15 +495,15 @@ func (t *transpiler) inferType(expr ast.Expression) *typeInfo {
 		leftType := t.inferType(e.Left)
 		rightType := t.inferType(e.Right)
 		// If either is decimal, result is decimal
-		if leftType.isDecimal || rightType.isDecimal {
+		if (leftType != nil && leftType.isDecimal) || (rightType != nil && rightType.isDecimal) {
 			return &typeInfo{goType: "decimal.Decimal", isDecimal: true, isNumeric: true}
 		}
 		// If either is float, result is float
-		if leftType.goType == "float64" || rightType.goType == "float64" {
+		if (leftType != nil && leftType.goType == "float64") || (rightType != nil && rightType.goType == "float64") {
 			return &typeInfo{goType: "float64", isNumeric: true}
 		}
 		// For integers, promote to the larger type
-		if leftType.isNumeric && rightType.isNumeric {
+		if leftType != nil && rightType != nil && leftType.isNumeric && rightType.isNumeric {
 			// Integer literals adapt to the other operand's type
 			_, leftIsLiteral := e.Left.(*ast.IntegerLiteral)
 			_, rightIsLiteral := e.Right.(*ast.IntegerLiteral)
@@ -767,6 +767,38 @@ func isIntegerLiteral(expr ast.Expression) bool {
 	return false
 }
 
+// isFloatLiteral checks if a string looks like a Go float literal (e.g., "0.08", "3.14")
+func isFloatLiteral(s string) bool {
+	if len(s) == 0 {
+		return false
+	}
+	// Must contain a decimal point
+	if !strings.Contains(s, ".") {
+		return false
+	}
+	// Allow optional leading minus
+	start := 0
+	if s[0] == '-' {
+		start = 1
+	}
+	if start >= len(s) {
+		return false
+	}
+	// Check each character is digit or decimal point
+	hasDot := false
+	for i := start; i < len(s); i++ {
+		if s[i] == '.' {
+			if hasDot {
+				return false // multiple dots
+			}
+			hasDot = true
+		} else if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return hasDot
+}
+
 func (t *transpiler) transpileFunctionCall(fc *ast.FunctionCall) (string, error) {
 	funcName := ""
 	if id, ok := fc.Function.(*ast.Identifier); ok {
@@ -854,8 +886,16 @@ func (t *transpiler) transpileFunctionCall(fc *ast.FunctionCall) (string, error)
 	case "CHARINDEX":
 		t.imports["strings"] = true
 		if len(args) >= 2 {
-			// CHARINDEX returns 0 if not found, 1-based index otherwise
+			// CHARINDEX(substring, string [, start_position])
+			// returns 0 if not found, 1-based index otherwise
 			// strings.Index returns -1 if not found, 0-based index otherwise
+			if len(args) == 3 {
+				// With start position: need to slice string and adjust result
+				// CHARINDEX(@sub, @str, @start) where @start is 1-based
+				// = strings.Index(@str[@start-1:], @sub) + @start (if found), else 0
+				return fmt.Sprintf("func() int32 { idx := strings.Index((%s)[int(%s)-1:], %s); if idx < 0 { return 0 }; return int32(idx) + %s }()", 
+					args[1], args[2], args[0], args[2]), nil
+			}
 			return fmt.Sprintf("int32(strings.Index(%s, %s) + 1)", args[1], args[0]), nil
 		}
 
@@ -920,9 +960,12 @@ func (t *transpiler) transpileFunctionCall(fc *ast.FunctionCall) (string, error)
 			if argType != nil && argType.isDecimal {
 				// For decimal, check if zero
 				// If second arg is literal 0, use decimal.Zero
+				// If second arg is a float literal, convert to decimal using RequireFromString
 				defaultVal := args[1]
 				if defaultVal == "0" || defaultVal == "0.0" {
 					defaultVal = "decimal.Zero"
+				} else if isFloatLiteral(defaultVal) {
+					defaultVal = fmt.Sprintf("decimal.RequireFromString(\"%s\")", defaultVal)
 				}
 				return fmt.Sprintf("func() decimal.Decimal { if !%s.IsZero() { return %s }; return %s }()", args[0], args[0], defaultVal), nil
 			}
@@ -1484,6 +1527,13 @@ func (t *transpiler) transpileCastExpression(c *ast.CastExpression) (string, err
 		return fmt.Sprintf("float64(%s)", expr), nil
 	case "decimal.Decimal":
 		t.imports["github.com/shopspring/decimal"] = true
+		// For literals, use RequireFromString to avoid float64 precision loss
+		if _, ok := c.Expression.(*ast.FloatLiteral); ok {
+			return fmt.Sprintf("decimal.RequireFromString(\"%s\")", expr), nil
+		}
+		if _, ok := c.Expression.(*ast.IntegerLiteral); ok {
+			return fmt.Sprintf("decimal.NewFromInt(%s)", expr), nil
+		}
 		return fmt.Sprintf("decimal.NewFromFloat(float64(%s))", expr), nil
 	default:
 		return fmt.Sprintf("%s(%s)", goType, expr), nil
@@ -1550,6 +1600,13 @@ func (t *transpiler) transpileConvertExpression(c *ast.ConvertExpression) (strin
 		return fmt.Sprintf("float64(%s)", expr), nil
 	case "decimal.Decimal":
 		t.imports["github.com/shopspring/decimal"] = true
+		// For literals, use RequireFromString to avoid float64 precision loss
+		if _, ok := c.Expression.(*ast.FloatLiteral); ok {
+			return fmt.Sprintf("decimal.RequireFromString(\"%s\")", expr), nil
+		}
+		if _, ok := c.Expression.(*ast.IntegerLiteral); ok {
+			return fmt.Sprintf("decimal.NewFromInt(%s)", expr), nil
+		}
 		return fmt.Sprintf("decimal.NewFromFloat(float64(%s))", expr), nil
 	default:
 		return fmt.Sprintf("%s(%s)", goType, expr), nil
