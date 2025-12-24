@@ -116,6 +116,7 @@ type transpiler struct {
 	hasReturnCode bool
 	packageName   string
 	comments      *commentIndex
+	currentBlockID int // Current block ID for unused variable tracking
 	
 	// DML handling
 	dmlEnabled      bool
@@ -1321,6 +1322,12 @@ func (t *transpiler) transpileDeclare(decl *ast.DeclareStatement) (string, error
 		t.symbols.define(varName, typeInfoFromDataType(v.DataType))
 		// Mark as declared for unused variable tracking
 		t.symbols.markDeclared(varName)
+		// Track scope depth for unused var suppression (only suppress at function scope)
+		t.symbols.markDeclaredAtDepth(varName, t.indent)
+		// Track which block this variable was declared in
+		if t.currentBlockID > 0 {
+			t.symbols.markDeclaredInBlock(varName, t.currentBlockID)
+		}
 
 		// Look up comments for first variable in declaration
 		var prefix string
@@ -1376,9 +1383,18 @@ func (t *transpiler) transpileSet(set *ast.SetStatement) (string, error) {
 		return fmt.Sprintf("// SET %s %s (ignored)", set.Option, set.OnOff), nil
 	}
 
-	varExpr, err := t.transpileExpression(set.Variable)
-	if err != nil {
-		return "", err
+	// For variable assignment, get the variable name directly without marking as "used"
+	// (writing to a variable is not "using" it for unused variable detection)
+	var varExpr string
+	if v, ok := set.Variable.(*ast.Variable); ok {
+		varExpr = goIdentifier(v.Name)
+	} else {
+		// For complex expressions (method calls etc), use transpileExpression
+		var err error
+		varExpr, err = t.transpileExpression(set.Variable)
+		if err != nil {
+			return "", err
+		}
 	}
 
 	// Look up comments for this SET statement
@@ -1517,6 +1533,10 @@ func (t *transpiler) transpileStatementBlock(stmt ast.Statement) (string, error)
 
 	// If it's a BEGIN/END block, transpile each statement
 	if block, ok := stmt.(*ast.BeginEndBlock); ok {
+		// Enter a new block scope for unused variable tracking
+		blockID := t.symbols.enterBlock()
+		t.currentBlockID = blockID
+		
 		for _, s := range block.Statements {
 			code, err := t.transpileStatement(s)
 			if err != nil {
@@ -1528,6 +1548,18 @@ func (t *transpiler) transpileStatementBlock(stmt ast.Statement) (string, error)
 				out.WriteString("\n")
 			}
 		}
+		
+		// Emit suppress statements for unused variables declared in THIS block
+		unusedVars := t.symbols.getUnusedVarsInBlock(blockID)
+		if len(unusedVars) > 0 {
+			for _, varName := range unusedVars {
+				out.WriteString(t.indentStr())
+				out.WriteString(fmt.Sprintf("_ = %s\n", varName))
+				// Mark as used so we don't suppress it again
+				t.symbols.markUsed(varName)
+			}
+		}
+		
 		return out.String(), nil
 	}
 
