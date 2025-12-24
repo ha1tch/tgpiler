@@ -1,0 +1,506 @@
+syntax = "proto3";
+
+package moneysend.transfer.v1;
+
+option go_package = "github.com/ha1tch/moneysend/proto/transfer/v1;transferv1";
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/wrappers.proto";
+
+// TransferService handles quotes, transfer initiation, and lifecycle management
+service TransferService {
+  // Quotes & Rates
+  rpc GetTransferQuote(GetTransferQuoteRequest) returns (GetTransferQuoteResponse);
+  rpc GetCurrentExchangeRate(GetCurrentExchangeRateRequest) returns (GetExchangeRateResponse);
+  rpc GetExchangeRateByCorridorCode(GetExchangeRateByCorridorCodeRequest) returns (GetExchangeRateResponse);
+  rpc CalculateFees(CalculateFeesRequest) returns (CalculateFeesResponse);
+  rpc ValidatePromoCode(ValidatePromoCodeRequest) returns (ValidatePromoCodeResponse);
+  
+  // Corridors
+  rpc GetCorridorByCode(GetCorridorByCodeRequest) returns (GetCorridorResponse);
+  rpc GetCorridorByCountries(GetCorridorByCountriesRequest) returns (GetCorridorResponse);
+  rpc ListActiveCorridors(ListActiveCorridorsRequest) returns (ListCorridorsResponse);
+  rpc ListCorridorsByDestination(ListCorridorsByDestinationRequest) returns (ListCorridorsResponse);
+  
+  // Transfer Lifecycle
+  rpc InitiateTransfer(InitiateTransferRequest) returns (InitiateTransferResponse);
+  rpc GetTransferById(GetTransferByIdRequest) returns (GetTransferResponse);
+  rpc GetTransferByNumber(GetTransferByNumberRequest) returns (GetTransferResponse);
+  rpc GetTransferByExternalId(GetTransferByExternalIdRequest) returns (GetTransferResponse);
+  rpc ListTransfersByCustomer(ListTransfersByCustomerRequest) returns (ListTransfersResponse);
+  rpc ListTransfersByStatus(ListTransfersByStatusRequest) returns (ListTransfersResponse);
+  rpc GetTransferStatusHistory(GetTransferStatusHistoryRequest) returns (GetTransferStatusHistoryResponse);
+  
+  // Transfer Status Updates
+  rpc ConfirmPayment(ConfirmPaymentRequest) returns (ConfirmPaymentResponse);
+  rpc ProcessTransfer(ProcessTransferRequest) returns (ProcessTransferResponse);
+  rpc SendToPartner(SendToPartnerRequest) returns (SendToPartnerResponse);
+  rpc CompleteTransfer(CompleteTransferRequest) returns (CompleteTransferResponse);
+  rpc CancelTransfer(CancelTransferRequest) returns (CancelTransferResponse);
+  rpc FailTransfer(FailTransferRequest) returns (FailTransferResponse);
+  rpc RefundTransfer(RefundTransferRequest) returns (RefundTransferResponse);
+  rpc HoldTransfer(HoldTransferRequest) returns (HoldTransferResponse);
+  rpc ReleaseTransferHold(ReleaseTransferHoldRequest) returns (ReleaseTransferHoldResponse);
+  
+  // Batch Operations
+  rpc GetPendingTransfers(GetPendingTransfersRequest) returns (ListTransfersResponse);
+  rpc GetTransfersRequiringAction(GetTransfersRequiringActionRequest) returns (ListTransfersResponse);
+}
+
+// Enums
+enum TransferStatus {
+  TRANSFER_STATUS_UNSPECIFIED = 0;
+  TRANSFER_STATUS_CREATED = 1;
+  TRANSFER_STATUS_PENDING_PAYMENT = 2;
+  TRANSFER_STATUS_PAYMENT_RECEIVED = 3;
+  TRANSFER_STATUS_COMPLIANCE_REVIEW = 4;
+  TRANSFER_STATUS_PROCESSING = 5;
+  TRANSFER_STATUS_SENT_TO_PARTNER = 6;
+  TRANSFER_STATUS_PAYOUT_PENDING = 7;
+  TRANSFER_STATUS_COMPLETED = 8;
+  TRANSFER_STATUS_CANCELLED = 9;
+  TRANSFER_STATUS_REFUNDED = 10;
+  TRANSFER_STATUS_FAILED = 11;
+  TRANSFER_STATUS_ON_HOLD = 12;
+}
+
+enum ComplianceStatus {
+  COMPLIANCE_STATUS_UNSPECIFIED = 0;
+  COMPLIANCE_STATUS_PENDING = 1;
+  COMPLIANCE_STATUS_CLEARED = 2;
+  COMPLIANCE_STATUS_FLAGGED = 3;
+  COMPLIANCE_STATUS_BLOCKED = 4;
+}
+
+enum PayoutMethod {
+  PAYOUT_METHOD_UNSPECIFIED = 0;
+  PAYOUT_METHOD_BANK_DEPOSIT = 1;
+  PAYOUT_METHOD_CASH_PICKUP = 2;
+  PAYOUT_METHOD_MOBILE_WALLET = 3;
+  PAYOUT_METHOD_HOME_DELIVERY = 4;
+}
+
+enum SourceChannel {
+  SOURCE_CHANNEL_UNSPECIFIED = 0;
+  SOURCE_CHANNEL_WEB = 1;
+  SOURCE_CHANNEL_MOBILE_IOS = 2;
+  SOURCE_CHANNEL_MOBILE_ANDROID = 3;
+  SOURCE_CHANNEL_API = 4;
+}
+
+// Core Messages
+message Corridor {
+  int32 corridor_id = 1;
+  string corridor_code = 2;
+  string display_name = 3;
+  string origin_country = 4;
+  string destination_country = 5;
+  string origin_currency = 6;
+  string destination_currency = 7;
+  double min_send_amount = 8;
+  double max_send_amount = 9;
+  string supported_payout_methods = 10;
+  int32 estimated_delivery_minutes = 11;
+  string cutoff_time_utc = 12;
+  bool is_active = 13;
+  double current_rate = 14;
+}
+
+message ExchangeRate {
+  int64 rate_id = 1;
+  int32 corridor_id = 2;
+  string corridor_code = 3;
+  double mid_market_rate = 4;
+  double buy_rate = 5;
+  double sell_rate = 6;
+  double spread = 7;
+  google.protobuf.Timestamp effective_from = 8;
+  string rate_source = 9;
+  string origin_currency = 10;
+  string destination_currency = 11;
+}
+
+message Transfer {
+  int64 transfer_id = 1;
+  string transfer_number = 2;
+  string external_id = 3;
+  int64 customer_id = 4;
+  int64 beneficiary_id = 5;
+  int32 corridor_id = 6;
+  double send_amount = 7;
+  string send_currency = 8;
+  double receive_amount = 9;
+  string receive_currency = 10;
+  double exchange_rate = 11;
+  google.protobuf.Timestamp rate_locked_at = 12;
+  google.protobuf.Timestamp rate_locked_until = 13;
+  double total_fees = 14;
+  double transfer_fee = 15;
+  double fx_margin = 16;
+  double promo_discount = 17;
+  string promo_code = 18;
+  double total_charged = 19;
+  PayoutMethod payout_method = 20;
+  int64 payout_bank_account_id = 21;
+  int64 payout_wallet_id = 22;
+  int32 payout_partner_id = 23;
+  string payout_reference = 24;
+  string cash_pickup_code = 25;
+  string cash_pickup_location = 26;
+  TransferStatus status = 27;
+  string sub_status = 28;
+  string status_reason = 29;
+  ComplianceStatus compliance_status = 30;
+  google.protobuf.Timestamp compliance_reviewed_at = 31;
+  string compliance_reviewed_by = 32;
+  double risk_score = 33;
+  string purpose = 34;
+  string purpose_description = 35;
+  google.protobuf.Timestamp created_at = 36;
+  google.protobuf.Timestamp updated_at = 37;
+  google.protobuf.Timestamp payment_received_at = 38;
+  google.protobuf.Timestamp processing_started_at = 39;
+  google.protobuf.Timestamp sent_to_partner_at = 40;
+  google.protobuf.Timestamp completed_at = 41;
+  google.protobuf.Timestamp cancelled_at = 42;
+  google.protobuf.Timestamp expected_delivery_at = 43;
+  SourceChannel source_channel = 44;
+  BeneficiarySummary beneficiary = 45;
+  string corridor_code = 46;
+  string corridor_name = 47;
+}
+
+message TransferSummary {
+  int64 transfer_id = 1;
+  string transfer_number = 2;
+  string external_id = 3;
+  double send_amount = 4;
+  string send_currency = 5;
+  double receive_amount = 6;
+  string receive_currency = 7;
+  double exchange_rate = 8;
+  double total_fees = 9;
+  double total_charged = 10;
+  PayoutMethod payout_method = 11;
+  TransferStatus status = 12;
+  ComplianceStatus compliance_status = 13;
+  google.protobuf.Timestamp created_at = 14;
+  google.protobuf.Timestamp completed_at = 15;
+  google.protobuf.Timestamp expected_delivery_at = 16;
+  string beneficiary_first_name = 17;
+  string beneficiary_last_name = 18;
+  string beneficiary_country = 19;
+  string corridor_name = 20;
+}
+
+message BeneficiarySummary {
+  string first_name = 1;
+  string last_name = 2;
+  string country = 3;
+}
+
+message StatusHistoryEntry {
+  int64 history_id = 1;
+  TransferStatus previous_status = 2;
+  TransferStatus new_status = 3;
+  string sub_status = 4;
+  string reason = 5;
+  string changed_by = 6;
+  google.protobuf.Timestamp changed_at = 7;
+  string notes = 8;
+}
+
+message Quote {
+  string corridor_code = 1;
+  double send_amount = 2;
+  string send_currency = 3;
+  double receive_amount = 4;
+  string receive_currency = 5;
+  double exchange_rate = 6;
+  double mid_market_rate = 7;
+  double transfer_fee = 8;
+  double fx_margin = 9;
+  double promo_discount = 10;
+  double total_fees = 11;
+  double total_charged = 12;
+  PayoutMethod payout_method = 13;
+  google.protobuf.Timestamp rate_valid_until = 14;
+  google.protobuf.Timestamp expected_delivery = 15;
+}
+
+// Request/Response Messages
+
+// Quote Requests
+message GetTransferQuoteRequest {
+  int64 customer_id = 1;
+  int32 corridor_id = 2;
+  double send_amount = 3;
+  PayoutMethod payout_method = 4;
+  string promo_code = 5;
+}
+
+message GetTransferQuoteResponse {
+  bool success = 1;
+  string error_code = 2;
+  string error_message = 3;
+  Quote quote = 4;
+}
+
+message GetCurrentExchangeRateRequest {
+  int32 corridor_id = 1;
+}
+
+message GetExchangeRateByCorridorCodeRequest {
+  string corridor_code = 1;
+}
+
+message GetExchangeRateResponse {
+  ExchangeRate rate = 1;
+}
+
+message CalculateFeesRequest {
+  int32 corridor_id = 1;
+  PayoutMethod payout_method = 2;
+  double send_amount = 3;
+  string promo_code = 4;
+}
+
+message CalculateFeesResponse {
+  double base_fee = 1;
+  double promo_discount = 2;
+  double total_fee = 3;
+  string fee_type = 4;
+}
+
+message ValidatePromoCodeRequest {
+  string promo_code = 1;
+  int64 customer_id = 2;
+  int32 corridor_id = 3;
+  double send_amount = 4;
+}
+
+message ValidatePromoCodeResponse {
+  bool is_valid = 1;
+  string error_code = 2;
+  string error_message = 3;
+  string discount_type = 4;
+  double discount_value = 5;
+  double max_discount_amount = 6;
+}
+
+// Corridor Requests
+message GetCorridorByCodeRequest {
+  string corridor_code = 1;
+}
+
+message GetCorridorByCountriesRequest {
+  string origin_country = 1;
+  string destination_country = 2;
+}
+
+message GetCorridorResponse {
+  Corridor corridor = 1;
+}
+
+message ListActiveCorridorsRequest {
+  string origin_country = 1;
+}
+
+message ListCorridorsByDestinationRequest {
+  string destination_country = 1;
+}
+
+message ListCorridorsResponse {
+  repeated Corridor corridors = 1;
+}
+
+// Transfer Lifecycle Requests
+message InitiateTransferRequest {
+  int64 customer_id = 1;
+  int64 beneficiary_id = 2;
+  int32 corridor_id = 3;
+  double send_amount = 4;
+  PayoutMethod payout_method = 5;
+  int64 payout_bank_account_id = 6;
+  int64 payout_wallet_id = 7;
+  string promo_code = 8;
+  string purpose = 9;
+  string purpose_description = 10;
+  SourceChannel source_channel = 11;
+  string source_ip = 12;
+  string device_fingerprint = 13;
+}
+
+message InitiateTransferResponse {
+  bool success = 1;
+  string error_code = 2;
+  string error_message = 3;
+  int64 transfer_id = 4;
+  string external_id = 5;
+  string transfer_number = 6;
+  double send_amount = 7;
+  string send_currency = 8;
+  double receive_amount = 9;
+  string receive_currency = 10;
+  double exchange_rate = 11;
+  double total_fees = 12;
+  double total_charged = 13;
+  google.protobuf.Timestamp rate_lock_until = 14;
+  TransferStatus status = 15;
+}
+
+message GetTransferByIdRequest {
+  int64 transfer_id = 1;
+}
+
+message GetTransferByNumberRequest {
+  string transfer_number = 1;
+}
+
+message GetTransferByExternalIdRequest {
+  string external_id = 1;
+}
+
+message GetTransferResponse {
+  Transfer transfer = 1;
+}
+
+message ListTransfersByCustomerRequest {
+  int64 customer_id = 1;
+  TransferStatus status = 2;
+  google.protobuf.Timestamp start_date = 3;
+  google.protobuf.Timestamp end_date = 4;
+  int32 page_number = 5;
+  int32 page_size = 6;
+}
+
+message ListTransfersByStatusRequest {
+  TransferStatus status = 1;
+  int32 page_number = 2;
+  int32 page_size = 3;
+}
+
+message ListTransfersResponse {
+  repeated TransferSummary transfers = 1;
+  int32 total_count = 2;
+}
+
+message GetTransferStatusHistoryRequest {
+  int64 transfer_id = 1;
+}
+
+message GetTransferStatusHistoryResponse {
+  repeated StatusHistoryEntry entries = 1;
+}
+
+// Status Update Requests
+message ConfirmPaymentRequest {
+  int64 transfer_id = 1;
+  int64 funding_source_id = 2;
+  string gateway_transaction_id = 3;
+  string confirmed_by = 4;
+}
+
+message ConfirmPaymentResponse {
+  bool success = 1;
+  string error_code = 2;
+  string error_message = 3;
+}
+
+message ProcessTransferRequest {
+  int64 transfer_id = 1;
+  string processed_by = 2;
+}
+
+message ProcessTransferResponse {
+  bool success = 1;
+  string error_code = 2;
+}
+
+message SendToPartnerRequest {
+  int64 transfer_id = 1;
+  string partner_reference = 2;
+  string sent_by = 3;
+}
+
+message SendToPartnerResponse {
+  bool success = 1;
+  string error_code = 2;
+}
+
+message CompleteTransferRequest {
+  int64 transfer_id = 1;
+  string partner_reference = 2;
+  string completed_by = 3;
+}
+
+message CompleteTransferResponse {
+  bool success = 1;
+  string error_code = 2;
+}
+
+message CancelTransferRequest {
+  int64 transfer_id = 1;
+  string reason = 2;
+  string cancelled_by = 3;
+}
+
+message CancelTransferResponse {
+  bool success = 1;
+  string error_code = 2;
+  string error_message = 3;
+}
+
+message FailTransferRequest {
+  int64 transfer_id = 1;
+  string reason = 2;
+  string failed_by = 3;
+}
+
+message FailTransferResponse {
+  bool success = 1;
+  string error_code = 2;
+}
+
+message RefundTransferRequest {
+  int64 transfer_id = 1;
+  string reason = 2;
+  string refunded_by = 3;
+}
+
+message RefundTransferResponse {
+  bool success = 1;
+  string error_code = 2;
+  string error_message = 3;
+}
+
+message HoldTransferRequest {
+  int64 transfer_id = 1;
+  string reason = 2;
+  string held_by = 3;
+}
+
+message HoldTransferResponse {
+  bool success = 1;
+  string error_code = 2;
+}
+
+message ReleaseTransferHoldRequest {
+  int64 transfer_id = 1;
+  string reason = 2;
+  string released_by = 3;
+}
+
+message ReleaseTransferHoldResponse {
+  bool success = 1;
+  string error_code = 2;
+}
+
+message GetPendingTransfersRequest {
+  TransferStatus status = 1;
+  int32 limit = 2;
+}
+
+message GetTransfersRequiringActionRequest {
+  int32 limit = 1;
+}

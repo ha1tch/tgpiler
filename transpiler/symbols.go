@@ -21,12 +21,16 @@ type symbolTable struct {
 	
 	// Track Go variable declarations (to use = vs :=)
 	declaredVars map[string]bool
+	
+	// Track variable reads to identify unused variables
+	usedVars map[string]bool
 }
 
 func newSymbolTable() *symbolTable {
 	return &symbolTable{
 		variables:    make(map[string]*typeInfo),
 		declaredVars: make(map[string]bool),
+		usedVars:     make(map[string]bool),
 	}
 }
 
@@ -58,6 +62,36 @@ func (st *symbolTable) isDeclared(name string) bool {
 		return st.parent.isDeclared(name)
 	}
 	return false
+}
+
+// markUsed marks a variable as having been read/used
+func (st *symbolTable) markUsed(name string) {
+	st.usedVars[name] = true
+	if st.parent != nil {
+		st.parent.markUsed(name)
+	}
+}
+
+// isUsed checks if a variable has been read/used
+func (st *symbolTable) isUsed(name string) bool {
+	if st.usedVars[name] {
+		return true
+	}
+	if st.parent != nil {
+		return st.parent.isUsed(name)
+	}
+	return false
+}
+
+// getUnusedVars returns variables that were declared but never read
+func (st *symbolTable) getUnusedVars() []string {
+	var unused []string
+	for name := range st.declaredVars {
+		if !st.usedVars[name] {
+			unused = append(unused, name)
+		}
+	}
+	return unused
 }
 
 // typeInfoFromDataType creates typeInfo from a T-SQL DataType.

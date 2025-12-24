@@ -1,0 +1,355 @@
+syntax = "proto3";
+
+package moneysend.config.v1;
+
+option go_package = "github.com/ha1tch/moneysend/proto/config/v1;configv1";
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/wrappers.proto";
+
+// ConfigService handles system configuration and promotions
+service ConfigService {
+  // System Configuration
+  rpc GetConfigValue(GetConfigValueRequest) returns (GetConfigValueResponse);
+  rpc GetAllConfiguration(GetAllConfigurationRequest) returns (GetAllConfigurationResponse);
+  rpc SetConfigValue(SetConfigValueRequest) returns (SetConfigValueResponse);
+  rpc DeleteConfigValue(DeleteConfigValueRequest) returns (DeleteConfigValueResponse);
+  
+  // Country Configuration
+  rpc GetCountryConfiguration(GetCountryConfigurationRequest) returns (GetCountryConfigurationResponse);
+  rpc ListCountryConfigurations(ListCountryConfigurationsRequest) returns (ListCountryConfigurationsResponse);
+  rpc UpdateCountryConfiguration(UpdateCountryConfigurationRequest) returns (UpdateCountryConfigurationResponse);
+  rpc EnableCountryForSending(EnableCountryRequest) returns (EnableCountryResponse);
+  rpc DisableCountryForSending(DisableCountryRequest) returns (DisableCountryResponse);
+  
+  // Promotions
+  rpc CreatePromoCode(CreatePromoCodeRequest) returns (CreatePromoCodeResponse);
+  rpc GetPromoCodeByCode(GetPromoCodeByCodeRequest) returns (GetPromoCodeResponse);
+  rpc ListPromoCodes(ListPromoCodesRequest) returns (ListPromoCodesResponse);
+  rpc UpdatePromoCode(UpdatePromoCodeRequest) returns (UpdatePromoCodeResponse);
+  rpc DeactivatePromoCode(DeactivatePromoCodeRequest) returns (DeactivatePromoCodeResponse);
+  rpc GetPromoCodeUsage(GetPromoCodeUsageRequest) returns (GetPromoCodeUsageResponse);
+  rpc CheckPromoEligibility(CheckPromoEligibilityRequest) returns (CheckPromoEligibilityResponse);
+  rpc GenerateBulkPromoCodes(GenerateBulkPromoCodesRequest) returns (GenerateBulkPromoCodesResponse);
+  rpc GetActivePromotionsForCustomer(GetActivePromotionsForCustomerRequest) returns (GetActivePromotionsResponse);
+}
+
+// Enums
+enum ConfigType {
+  CONFIG_TYPE_UNSPECIFIED = 0;
+  CONFIG_TYPE_STRING = 1;
+  CONFIG_TYPE_INT = 2;
+  CONFIG_TYPE_DECIMAL = 3;
+  CONFIG_TYPE_BOOL = 4;
+  CONFIG_TYPE_JSON = 5;
+}
+
+enum RiskLevel {
+  RISK_LEVEL_UNSPECIFIED = 0;
+  RISK_LEVEL_LOW = 1;
+  RISK_LEVEL_STANDARD = 2;
+  RISK_LEVEL_HIGH = 3;
+  RISK_LEVEL_PROHIBITED = 4;
+}
+
+enum DiscountType {
+  DISCOUNT_TYPE_UNSPECIFIED = 0;
+  DISCOUNT_TYPE_FLAT_FEE = 1;
+  DISCOUNT_TYPE_PERCENTAGE_FEE = 2;
+  DISCOUNT_TYPE_FREE_TRANSFER = 3;
+  DISCOUNT_TYPE_BETTER_RATE = 4;
+}
+
+enum PromoStatus {
+  PROMO_STATUS_UNSPECIFIED = 0;
+  PROMO_STATUS_ACTIVE = 1;
+  PROMO_STATUS_EXPIRED = 2;
+  PROMO_STATUS_UPCOMING = 3;
+  PROMO_STATUS_INACTIVE = 4;
+}
+
+// Core Messages
+message ConfigEntry {
+  string config_key = 1;
+  string config_value = 2;
+  ConfigType config_type = 3;
+  string description = 4;
+  google.protobuf.Timestamp updated_at = 5;
+  string updated_by = 6;
+}
+
+message CountryConfig {
+  string country_code = 1;
+  string country_name = 2;
+  bool requires_source_of_funds = 3;
+  bool requires_purpose = 4;
+  double max_daily_limit = 5;
+  RiskLevel risk_level = 6;
+  bool is_sending_enabled = 7;
+  bool is_receiving_enabled = 8;
+}
+
+message PromoCode {
+  int32 promo_code_id = 1;
+  string code = 2;
+  string promo_name = 3;
+  string description = 4;
+  DiscountType discount_type = 5;
+  double discount_value = 6;
+  double max_discount_amount = 7;
+  double min_send_amount = 8;
+  double max_send_amount = 9;
+  string eligible_corridors = 10;
+  bool new_customers_only = 11;
+  int32 max_uses_total = 12;
+  int32 max_uses_per_customer = 13;
+  int32 current_usage_count = 14;
+  google.protobuf.Timestamp valid_from = 15;
+  google.protobuf.Timestamp valid_to = 16;
+  bool is_active = 17;
+  google.protobuf.Timestamp created_at = 18;
+  string created_by = 19;
+  PromoStatus status = 20;
+}
+
+message PromoCodeSummary {
+  int32 promo_code_id = 1;
+  string code = 2;
+  string promo_name = 3;
+  DiscountType discount_type = 4;
+  double discount_value = 5;
+  int32 max_uses_total = 6;
+  int32 current_usage_count = 7;
+  google.protobuf.Timestamp valid_from = 8;
+  google.protobuf.Timestamp valid_to = 9;
+  bool is_active = 10;
+  PromoStatus status = 11;
+}
+
+message PromoUsage {
+  int64 usage_id = 1;
+  int64 customer_id = 2;
+  string customer_email = 3;
+  string first_name = 4;
+  string last_name = 5;
+  int64 transfer_id = 6;
+  string transfer_number = 7;
+  double send_amount = 8;
+  string send_currency = 9;
+  double discount_applied = 10;
+  google.protobuf.Timestamp used_at = 11;
+}
+
+// Request/Response Messages
+
+// System Configuration
+message GetConfigValueRequest {
+  string config_key = 1;
+}
+
+message GetConfigValueResponse {
+  ConfigEntry config = 1;
+}
+
+message GetAllConfigurationRequest {
+  string prefix = 1;
+}
+
+message GetAllConfigurationResponse {
+  repeated ConfigEntry configs = 1;
+}
+
+message SetConfigValueRequest {
+  string config_key = 1;
+  string config_value = 2;
+  ConfigType config_type = 3;
+  string description = 4;
+  string updated_by = 5;
+}
+
+message SetConfigValueResponse {
+  bool success = 1;
+}
+
+message DeleteConfigValueRequest {
+  string config_key = 1;
+  string deleted_by = 2;
+}
+
+message DeleteConfigValueResponse {
+  int32 deleted = 1;
+}
+
+// Country Configuration
+message GetCountryConfigurationRequest {
+  string country_code = 1;
+}
+
+message GetCountryConfigurationResponse {
+  CountryConfig config = 1;
+}
+
+message ListCountryConfigurationsRequest {
+  google.protobuf.BoolValue sending_enabled = 1;
+  google.protobuf.BoolValue receiving_enabled = 2;
+  RiskLevel risk_level = 3;
+}
+
+message ListCountryConfigurationsResponse {
+  repeated CountryConfig countries = 1;
+}
+
+message UpdateCountryConfigurationRequest {
+  string country_code = 1;
+  google.protobuf.StringValue country_name = 2;
+  google.protobuf.BoolValue requires_source_of_funds = 3;
+  google.protobuf.BoolValue requires_purpose = 4;
+  google.protobuf.DoubleValue max_daily_limit = 5;
+  RiskLevel risk_level = 6;
+  google.protobuf.BoolValue is_sending_enabled = 7;
+  google.protobuf.BoolValue is_receiving_enabled = 8;
+  string updated_by = 9;
+}
+
+message UpdateCountryConfigurationResponse {
+  bool success = 1;
+}
+
+message EnableCountryRequest {
+  string country_code = 1;
+  string enabled_by = 2;
+}
+
+message EnableCountryResponse {
+  bool success = 1;
+}
+
+message DisableCountryRequest {
+  string country_code = 1;
+  string disabled_by = 2;
+  string reason = 3;
+}
+
+message DisableCountryResponse {
+  bool success = 1;
+}
+
+// Promotions
+message CreatePromoCodeRequest {
+  string code = 1;
+  string promo_name = 2;
+  string description = 3;
+  DiscountType discount_type = 4;
+  double discount_value = 5;
+  double max_discount_amount = 6;
+  double min_send_amount = 7;
+  double max_send_amount = 8;
+  string eligible_corridors = 9;
+  bool new_customers_only = 10;
+  int32 max_uses_total = 11;
+  int32 max_uses_per_customer = 12;
+  google.protobuf.Timestamp valid_from = 13;
+  google.protobuf.Timestamp valid_to = 14;
+  string created_by = 15;
+}
+
+message CreatePromoCodeResponse {
+  bool success = 1;
+  string error_code = 2;
+  int32 promo_code_id = 3;
+}
+
+message GetPromoCodeByCodeRequest {
+  string code = 1;
+}
+
+message GetPromoCodeResponse {
+  PromoCode promo_code = 1;
+}
+
+message ListPromoCodesRequest {
+  PromoStatus status = 1;
+  int32 page_number = 2;
+  int32 page_size = 3;
+}
+
+message ListPromoCodesResponse {
+  repeated PromoCodeSummary promo_codes = 1;
+  int32 total_count = 2;
+}
+
+message UpdatePromoCodeRequest {
+  int32 promo_code_id = 1;
+  google.protobuf.StringValue promo_name = 2;
+  google.protobuf.StringValue description = 3;
+  google.protobuf.Int32Value max_uses_total = 4;
+  google.protobuf.Int32Value max_uses_per_customer = 5;
+  google.protobuf.Timestamp valid_to = 6;
+  google.protobuf.BoolValue is_active = 7;
+  string updated_by = 8;
+}
+
+message UpdatePromoCodeResponse {
+  bool success = 1;
+  string error_code = 2;
+}
+
+message DeactivatePromoCodeRequest {
+  int32 promo_code_id = 1;
+  string deactivated_by = 2;
+}
+
+message DeactivatePromoCodeResponse {
+  bool success = 1;
+}
+
+message GetPromoCodeUsageRequest {
+  int32 promo_code_id = 1;
+  int32 page_number = 2;
+  int32 page_size = 3;
+}
+
+message GetPromoCodeUsageResponse {
+  repeated PromoUsage usages = 1;
+  int32 total_usages = 2;
+  double total_discount_given = 3;
+  int32 unique_customers = 4;
+}
+
+message CheckPromoEligibilityRequest {
+  string code = 1;
+  int64 customer_id = 2;
+  int32 corridor_id = 3;
+  double send_amount = 4;
+}
+
+message CheckPromoEligibilityResponse {
+  bool is_eligible = 1;
+  string reason = 2;
+}
+
+message GenerateBulkPromoCodesRequest {
+  string prefix = 1;
+  int32 count = 2;
+  string promo_name = 3;
+  DiscountType discount_type = 4;
+  double discount_value = 5;
+  int32 max_uses_per_customer = 6;
+  google.protobuf.Timestamp valid_from = 7;
+  google.protobuf.Timestamp valid_to = 8;
+  string created_by = 9;
+}
+
+message GenerateBulkPromoCodesResponse {
+  bool success = 1;
+  string error_code = 2;
+  int32 generated_count = 3;
+}
+
+message GetActivePromotionsForCustomerRequest {
+  int64 customer_id = 1;
+}
+
+message GetActivePromotionsResponse {
+  repeated PromoCode promotions = 1;
+}

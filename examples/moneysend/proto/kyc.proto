@@ -1,0 +1,176 @@
+syntax = "proto3";
+
+package moneysend.kyc.v1;
+
+option go_package = "github.com/ha1tch/moneysend/proto/kyc/v1;kycv1";
+
+import "google/protobuf/timestamp.proto";
+
+// KYCService handles identity document submission and verification
+service KYCService {
+  // Document Submission
+  rpc SubmitDocument(SubmitDocumentRequest) returns (SubmitDocumentResponse);
+  rpc GetDocumentById(GetDocumentByIdRequest) returns (GetDocumentResponse);
+  rpc GetDocumentsByCustomer(GetDocumentsByCustomerRequest) returns (GetDocumentsResponse);
+  
+  // Document Review (for agents)
+  rpc ApproveDocument(ApproveDocumentRequest) returns (ApproveDocumentResponse);
+  rpc RejectDocument(RejectDocumentRequest) returns (RejectDocumentResponse);
+  rpc ListPendingKYCReviews(ListPendingKYCReviewsRequest) returns (ListPendingKYCReviewsResponse);
+  
+  // Document Lifecycle
+  rpc ListExpiringDocuments(ListExpiringDocumentsRequest) returns (ListExpiringDocumentsResponse);
+  rpc RequestDocumentResubmission(RequestDocumentResubmissionRequest) returns (RequestDocumentResubmissionResponse);
+}
+
+// Enums
+enum DocumentType {
+  DOCUMENT_TYPE_UNSPECIFIED = 0;
+  DOCUMENT_TYPE_PASSPORT = 1;
+  DOCUMENT_TYPE_DRIVERS_LICENSE = 2;
+  DOCUMENT_TYPE_NATIONAL_ID = 3;
+  DOCUMENT_TYPE_UTILITY_BILL = 4;
+  DOCUMENT_TYPE_BANK_STATEMENT = 5;
+}
+
+enum VerificationStatus {
+  VERIFICATION_STATUS_UNSPECIFIED = 0;
+  VERIFICATION_STATUS_PENDING = 1;
+  VERIFICATION_STATUS_VERIFIED = 2;
+  VERIFICATION_STATUS_REJECTED = 3;
+  VERIFICATION_STATUS_EXPIRED = 4;
+}
+
+// Core Messages
+message Document {
+  int64 document_id = 1;
+  int64 customer_id = 2;
+  DocumentType document_type = 3;
+  string document_number = 4;
+  string issuing_country = 5;
+  string issue_date = 6;
+  string expiry_date = 7;
+  string front_image_path = 8;
+  string back_image_path = 9;
+  VerificationStatus verification_status = 10;
+  google.protobuf.Timestamp verified_at = 11;
+  string verified_by = 12;
+  string rejection_reason = 13;
+  google.protobuf.Timestamp submitted_at = 14;
+  google.protobuf.Timestamp updated_at = 15;
+}
+
+message DocumentWithCustomer {
+  int64 document_id = 1;
+  int64 customer_id = 2;
+  DocumentType document_type = 3;
+  string document_number = 4;
+  string issuing_country = 5;
+  google.protobuf.Timestamp submitted_at = 6;
+  string customer_first_name = 7;
+  string customer_last_name = 8;
+  string customer_email = 9;
+  string customer_country = 10;
+  string customer_risk_level = 11;
+  int32 hours_pending = 12;
+}
+
+message ExpiringDocument {
+  int64 document_id = 1;
+  int64 customer_id = 2;
+  DocumentType document_type = 3;
+  string expiry_date = 4;
+  int32 days_until_expiry = 5;
+  string first_name = 6;
+  string last_name = 7;
+  string email = 8;
+}
+
+// Request/Response Messages
+message SubmitDocumentRequest {
+  int64 customer_id = 1;
+  DocumentType document_type = 2;
+  string document_number = 3;
+  string issuing_country = 4;
+  string issue_date = 5;
+  string expiry_date = 6;
+  string front_image_path = 7;
+  string back_image_path = 8;
+}
+
+message SubmitDocumentResponse {
+  bool success = 1;
+  string error_code = 2;
+  string error_message = 3;
+  int64 document_id = 4;
+}
+
+message GetDocumentByIdRequest {
+  int64 document_id = 1;
+}
+
+message GetDocumentResponse {
+  Document document = 1;
+  string customer_first_name = 2;
+  string customer_last_name = 3;
+  string customer_email = 4;
+}
+
+message GetDocumentsByCustomerRequest {
+  int64 customer_id = 1;
+}
+
+message GetDocumentsResponse {
+  repeated Document documents = 1;
+}
+
+message ApproveDocumentRequest {
+  int64 document_id = 1;
+  string approved_by = 2;
+  string notes = 3;
+}
+
+message ApproveDocumentResponse {
+  bool success = 1;
+  string error_code = 2;
+}
+
+message RejectDocumentRequest {
+  int64 document_id = 1;
+  string rejected_by = 2;
+  string rejection_reason = 3;
+}
+
+message RejectDocumentResponse {
+  bool success = 1;
+  string error_code = 2;
+}
+
+message ListPendingKYCReviewsRequest {
+  int32 page_number = 1;
+  int32 page_size = 2;
+}
+
+message ListPendingKYCReviewsResponse {
+  repeated DocumentWithCustomer documents = 1;
+  int32 total_count = 2;
+}
+
+message ListExpiringDocumentsRequest {
+  int32 days_until_expiry = 1;
+}
+
+message ListExpiringDocumentsResponse {
+  repeated ExpiringDocument documents = 1;
+}
+
+message RequestDocumentResubmissionRequest {
+  int64 customer_id = 1;
+  DocumentType document_type = 2;
+  string reason = 3;
+  string requested_by = 4;
+}
+
+message RequestDocumentResubmissionResponse {
+  bool success = 1;
+}

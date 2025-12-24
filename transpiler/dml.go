@@ -27,19 +27,59 @@ type DMLConfig struct {
 	// Target backend
 	Backend BackendType
 
+	// Fallback backend for operations that don't map to primary backend
+	// e.g., temp table operations when Backend=grpc should fall back to sql
+	FallbackBackend  BackendType
+	FallbackExplicit bool // True if user explicitly set --fallback-backend
+
 	// SQL dialect (postgres, mysql, sqlite, sqlserver)
 	SQLDialect string
 
 	// Repository/store variable name (e.g., "r.db", "r.store", "r.client")
 	StoreVar string
 
+	// Receiver configuration for generated functions
+	Receiver     string // Receiver variable name (e.g., "r") - empty means no receiver
+	ReceiverType string // Receiver type (e.g., "*Repository", "*Service")
+
+	// GO statement handling
+	PreserveGo bool // If true, don't strip GO statements (default: false, strip them)
+
+	// Sequence handling mode
+	// "db" - use database features (RETURNING id for Postgres, LAST_INSERT_ID() for MySQL)
+	// "uuid" - generate uuid.New() application-side
+	// "stub" - generate TODO placeholder
+	SequenceMode string
+
+	// NEWID() handling mode
+	// "app" - generate uuid.New() application-side (default, recommended)
+	// "db" - use database-specific UUID function
+	// "grpc" - call gRPC ID service
+	// "mock" - generate predictable sequential UUIDs for testing
+	// "stub" - generate TODO placeholder
+	NewidMode string
+
+	// gRPC client variable for --newid=grpc mode
+	IDServiceVar string
+
+	// DDL handling
+	// SkipDDL: skip CREATE TABLE/VIEW/INDEX/SEQUENCE with warning (default: true)
+	// StrictDDL: fail on any DDL statement
+	// ExtractDDL: file path to extract skipped DDL
+	SkipDDL    bool
+	StrictDDL  bool
+	ExtractDDL string
+
 	// Whether to use transactions
 	UseTransactions bool
 
 	// gRPC backend options
-	GRPCClientVar string            // gRPC client variable name (e.g., "client", "svc")
-	GRPCMappings  map[string]string // procedure -> service.method
-	ProtoPackage  string            // Proto package for gRPC
+	GRPCClientVar    string            // gRPC client variable name (e.g., "client", "svc")
+	GRPCMappings     map[string]string // procedure -> service.method
+	ProtoPackage     string            // Proto package for gRPC
+	TableToService   map[string]string // table -> service name (e.g., "Products" -> "CatalogService")
+	TableToClient    map[string]string // table -> client variable (e.g., "Products" -> "catalogClient")
+	ServiceToPackage map[string]string // service -> proto package (e.g., "CatalogService" -> "catalogpb")
 
 	// Mock backend options
 	MockStoreVar string // Mock store variable name (e.g., "store", "mockDB")
@@ -52,23 +92,40 @@ type DMLConfig struct {
 	SPLoggerFile   string // File path for file logger
 	SPLoggerFormat string // Format for file logger: json, text
 	GenLoggerInit  bool   // Generate logger initialization code
+	
+	// Annotation level: none, minimal, standard, verbose
+	// minimal: TODO markers for patterns needing attention
+	// standard: TODOs + Original SQL comments
+	// verbose: All of the above + type annotations + section markers
+	AnnotateLevel string
 }
 
 // DefaultDMLConfig returns sensible defaults.
 func DefaultDMLConfig() DMLConfig {
 	return DMLConfig{
-		Backend:         BackendSQL,
-		SQLDialect:      "postgres",
-		StoreVar:        "r.db",
-		UseTransactions: false,
-		GRPCClientVar:   "client",
-		GRPCMappings:    make(map[string]string),
-		MockStoreVar:    "store",
-		UseSPLogger:     false,
-		SPLoggerVar:     "spLogger",
-		SPLoggerType:    "slog",
-		SPLoggerTable:   "Error.LogForStoreProcedure",
-		SPLoggerFormat:  "json",
+		Backend:          BackendSQL,
+		FallbackBackend:  BackendSQL, // For temp tables when using grpc/mock
+		SQLDialect:       "postgres",
+		StoreVar:         "r.db",
+		Receiver:         "r",
+		ReceiverType:     "*Repository",
+		SequenceMode:     "db",
+		NewidMode:        "app",
+		SkipDDL:          true,
+		StrictDDL:        false,
+		UseTransactions:  false,
+		GRPCClientVar:    "client",
+		GRPCMappings:     make(map[string]string),
+		TableToService:   make(map[string]string),
+		TableToClient:    make(map[string]string),
+		ServiceToPackage: make(map[string]string),
+		MockStoreVar:     "store",
+		UseSPLogger:      false,
+		SPLoggerVar:      "spLogger",
+		SPLoggerType:     "slog",
+		SPLoggerTable:    "Error.LogForStoreProcedure",
+		SPLoggerFormat:   "json",
+		AnnotateLevel:    "none",
 	}
 }
 
@@ -78,8 +135,29 @@ type dmlTranspiler struct {
 	config DMLConfig
 }
 
+// emitResultHandling generates the appropriate result handling code
+// If usesRowCount is true, captures rowsAffected; otherwise discards result
+func (dt *dmlTranspiler) emitResultHandling(out *strings.Builder, comment string) {
+	out.WriteString(dt.indentStr())
+	if dt.usesRowCount {
+		out.WriteString("if ra, raErr := result.RowsAffected(); raErr == nil { rowsAffected = int32(ra) }")
+	} else {
+		out.WriteString("_ = result")
+		if comment != "" {
+			out.WriteString(" // " + comment)
+		}
+	}
+}
+
 // buildErrorReturn generates a return statement with error for DML operations
+// In CATCH blocks (defer func), cannot return values - operations fail silently
 func (dt *dmlTranspiler) buildErrorReturn() string {
+	// In CATCH block, we're inside a defer func - cannot return values
+	// Use _ = err to acknowledge error but continue
+	if dt.transpiler.inCatchBlock {
+		return "_ = err // Operation failed in error handler"
+	}
+
 	var parts []string
 	
 	// Add output params
@@ -106,7 +184,11 @@ func (t *transpiler) transpileSelect(s *ast.SelectStatement) (string, error) {
 }
 
 func (dt *dmlTranspiler) transpileSelect(s *ast.SelectStatement) (string, error) {
-	switch dt.config.Backend {
+	// Determine effective backend (use fallback for temp tables)
+	tableName := dt.extractMainTable(s)
+	backend := dt.getEffectiveBackend(tableName)
+	
+	switch backend {
 	case BackendSQL:
 		return dt.transpileSelectSQL(s)
 	case BackendGRPC:
@@ -132,6 +214,10 @@ func (dt *dmlTranspiler) transpileSelectSQL(s *ast.SelectStatement) (string, err
 
 	// Build the query string
 	query, args := dt.buildSelectQuery(s)
+	
+	// Post-process to catch any remaining @variable references
+	query, extraArgs := dt.substituteVariablesInQuery(query)
+	args = append(args, extraArgs...)
 	
 	// Get the database variable (tx if in transaction, StoreVar otherwise)
 	dbVar := dt.getDBVar()
@@ -217,8 +303,18 @@ func (dt *dmlTranspiler) transpileSelectIntoVars(s *ast.SelectStatement, assignm
 	// This function uses sql.ErrNoRows
 	dt.imports["database/sql"] = true
 
+	// Emit original SQL if requested
+	if dt.emitOriginal() {
+		out.WriteString(fmt.Sprintf("// Original: %s\n", truncateSQL(s.String(), 100)))
+		out.WriteString(dt.indentStr())
+	}
+
 	// Build query
 	query, args := dt.buildSelectQuery(s)
+	
+	// Post-process to catch any remaining @variable references
+	query, extraArgs := dt.substituteVariablesInQuery(query)
+	args = append(args, extraArgs...)
 	
 	// Get the database variable (tx if in transaction, StoreVar otherwise)
 	dbVar := dt.getDBVar()
@@ -258,24 +354,60 @@ func (dt *dmlTranspiler) transpileSelectIntoVars(s *ast.SelectStatement, assignm
 
 // transpileSelectGRPC generates gRPC client code for SELECT.
 func (dt *dmlTranspiler) transpileSelectGRPC(s *ast.SelectStatement) (string, error) {
-	// For gRPC, we need to map the SELECT to a service method
-	// This requires knowing which service/method corresponds to this query
-
+	// Check if this is a SELECT INTO variable assignment
+	assignments := dt.extractSelectAssignments(s)
+	
 	// Extract table name to determine service
 	tableName := dt.extractMainTable(s)
+	
+	// If no table (SELECT of local variables only), skip gRPC call
+	if tableName == "" {
+		// This is something like SELECT @var AS Name or SELECT @a, @b
+		// Just return a comment - the variables are already in scope
+		return "// SELECT of local variables (no gRPC call needed)", nil
+	}
+	
 	methodName := dt.inferGRPCMethod(s, tableName)
 
-	var out strings.Builder
-	out.WriteString(fmt.Sprintf("// gRPC call: %s\n", methodName))
-	out.WriteString(dt.indentStr())
-	out.WriteString(fmt.Sprintf("resp, err := %s.%s(ctx, &%s.%sRequest{\n",
-		dt.config.StoreVar, methodName, dt.config.ProtoPackage, methodName))
+	// Get client variable and proto package for this table
+	clientVar := dt.getGRPCClientForTable(tableName)
+	protoPackage := dt.getProtoPackageForTable(tableName)
 
-	// Add request fields from WHERE clause
-	whereFields := dt.extractWhereFields(s)
+	var out strings.Builder
+	out.WriteString(fmt.Sprintf("// gRPC call: %s.%s\n", clientVar, methodName))
+	out.WriteString(dt.indentStr())
+
+	// Build the request
+	if protoPackage != "" {
+		out.WriteString(fmt.Sprintf("resp, err := %s.%s(ctx, &%s.%sRequest{\n",
+			clientVar, methodName, protoPackage, methodName))
+	} else {
+		out.WriteString(fmt.Sprintf("resp, err := %s.%s(ctx, &%sRequest{\n",
+			clientVar, methodName, methodName))
+	}
+
+	// Add request fields from WHERE clause (variables and literals)
+	whereFields := dt.extractWhereFieldsWithLiterals(s)
+	hasComplexFields := false
+	var complexWarnings []string
 	for _, wf := range whereFields {
+		if wf.isComplex {
+			hasComplexFields = true
+			complexWarnings = append(complexWarnings, fmt.Sprintf("%s: %s", wf.column, wf.rawExpr))
+			continue // Skip complex fields in request
+		}
 		out.WriteString(dt.indentStr())
-		out.WriteString(fmt.Sprintf("\t%s: %s,\n", goExportedIdentifier(wf.column), wf.variable))
+		out.WriteString(fmt.Sprintf("\t%s: %s,\n", goExportedIdentifier(wf.column), wf.value))
+	}
+	
+	// Add warning comment for complex fields that were skipped
+	if hasComplexFields {
+		out.WriteString(dt.indentStr())
+		out.WriteString("\t// WARNING: Complex WHERE expressions skipped (require manual conversion):\n")
+		for _, w := range complexWarnings {
+			out.WriteString(dt.indentStr())
+			out.WriteString(fmt.Sprintf("\t//   %s\n", w))
+		}
 	}
 
 	out.WriteString(dt.indentStr())
@@ -283,11 +415,29 @@ func (dt *dmlTranspiler) transpileSelectGRPC(s *ast.SelectStatement) (string, er
 	out.WriteString(dt.indentStr())
 	out.WriteString("if err != nil {\n")
 	out.WriteString(dt.indentStr())
-	out.WriteString("\treturn err\n")
+	out.WriteString("\t")
+	out.WriteString(dt.buildErrorReturn())
+	out.WriteString("\n")
 	out.WriteString(dt.indentStr())
 	out.WriteString("}\n")
-	out.WriteString(dt.indentStr())
-	out.WriteString("_ = resp // TODO: use response")
+	
+	// If we have SELECT INTO assignments, extract values from response
+	if len(assignments) > 0 {
+		out.WriteString(dt.indentStr())
+		out.WriteString("if resp != nil {\n")
+		for _, a := range assignments {
+			out.WriteString(dt.indentStr())
+			// Map column name to proto field name (PascalCase)
+			protoField := goExportedIdentifier(a.column)
+			out.WriteString(fmt.Sprintf("\t%s = resp.%s\n", a.varName, protoField))
+		}
+		out.WriteString(dt.indentStr())
+		out.WriteString("}")
+	} else {
+		// No assignments - just note the response is available
+		out.WriteString(dt.indentStr())
+		out.WriteString("_ = resp // TODO: use response")
+	}
 
 	return out.String(), nil
 }
@@ -314,8 +464,7 @@ func (dt *dmlTranspiler) transpileSelectMock(s *ast.SelectStatement) (string, er
 	out.WriteString("\treturn err\n")
 	out.WriteString(dt.indentStr())
 	out.WriteString("}\n")
-	out.WriteString(dt.indentStr())
-	out.WriteString("_ = result // TODO: use result")
+	dt.emitResultHandling(&out, "TODO: use result")
 
 	return out.String(), nil
 }
@@ -323,6 +472,10 @@ func (dt *dmlTranspiler) transpileSelectMock(s *ast.SelectStatement) (string, er
 // transpileSelectInline generates inline SQL string.
 func (dt *dmlTranspiler) transpileSelectInline(s *ast.SelectStatement) (string, error) {
 	query, args := dt.buildSelectQuery(s)
+	
+	// Post-process to catch any remaining @variable references
+	query, extraArgs := dt.substituteVariablesInQuery(query)
+	args = append(args, extraArgs...)
 
 	var out strings.Builder
 	out.WriteString(fmt.Sprintf("query := %q\n", query))
@@ -343,7 +496,11 @@ func (t *transpiler) transpileInsert(s *ast.InsertStatement) (string, error) {
 }
 
 func (dt *dmlTranspiler) transpileInsert(s *ast.InsertStatement) (string, error) {
-	switch dt.config.Backend {
+	// Determine effective backend (use fallback for temp tables)
+	tableName := dt.extractInsertTable(s)
+	backend := dt.getEffectiveBackend(tableName)
+	
+	switch backend {
 	case BackendSQL:
 		return dt.transpileInsertSQL(s)
 	case BackendGRPC:
@@ -358,7 +515,17 @@ func (dt *dmlTranspiler) transpileInsert(s *ast.InsertStatement) (string, error)
 func (dt *dmlTranspiler) transpileInsertSQL(s *ast.InsertStatement) (string, error) {
 	var out strings.Builder
 
+	// Emit original SQL if requested
+	if dt.emitOriginal() {
+		out.WriteString(fmt.Sprintf("// Original: %s\n", truncateSQL(s.String(), 100)))
+		out.WriteString(dt.indentStr())
+	}
+
 	query, args := dt.buildInsertQuery(s)
+	
+	// Post-process to catch any remaining @variable references
+	query, extraArgs := dt.substituteVariablesInQuery(query)
+	args = append(args, extraArgs...)
 	
 	// Get the database variable (tx if in transaction, StoreVar otherwise)
 	dbVar := dt.getDBVar()
@@ -371,6 +538,10 @@ func (dt *dmlTranspiler) transpileInsertSQL(s *ast.InsertStatement) (string, err
 
 	if hasOutput && dt.config.SQLDialect == "postgres" {
 		// PostgreSQL: use RETURNING
+		if dt.emitTODOs() {
+			out.WriteString("// TODO(tgpiler): OUTPUT clause converted to RETURNING - verify column mapping\n")
+			out.WriteString(dt.indentStr())
+		}
 		out.WriteString(fmt.Sprintf("row := %s.QueryRowContext(ctx, %q", dbVar, query))
 		for _, arg := range args {
 			out.WriteString(", " + arg)
@@ -419,8 +590,7 @@ func (dt *dmlTranspiler) transpileInsertSQL(s *ast.InsertStatement) (string, err
 		}
 		out.WriteString(dt.indentStr())
 		out.WriteString("}\n")
-		out.WriteString(dt.indentStr())
-		out.WriteString("_ = result // Use result.LastInsertId() if needed")
+		dt.emitResultHandling(&out, "Use result.LastInsertId() if needed")
 	}
 
 	return out.String(), nil
@@ -428,16 +598,28 @@ func (dt *dmlTranspiler) transpileInsertSQL(s *ast.InsertStatement) (string, err
 
 func (dt *dmlTranspiler) transpileInsertGRPC(s *ast.InsertStatement) (string, error) {
 	tableName := dt.extractInsertTable(s)
-	methodName := "Create" + toPascalCase(singularize(tableName))
+
+	// Detect verb from INSERT columns/values
+	insertFields := dt.extractInsertFields(s)
+	methodName := dt.inferInsertGRPCMethod(tableName, insertFields)
+
+	// Get client variable and proto package for this table
+	clientVar := dt.getGRPCClientForTable(tableName)
+	protoPackage := dt.getProtoPackageForTable(tableName)
 
 	var out strings.Builder
-	out.WriteString(fmt.Sprintf("// gRPC call: %s\n", methodName))
+	out.WriteString(fmt.Sprintf("// gRPC call: %s.%s\n", clientVar, methodName))
 	out.WriteString(dt.indentStr())
-	out.WriteString(fmt.Sprintf("resp, err := %s.%s(ctx, &%s.%sRequest{\n",
-		dt.config.StoreVar, methodName, dt.config.ProtoPackage, methodName))
+
+	if protoPackage != "" {
+		out.WriteString(fmt.Sprintf("resp, err := %s.%s(ctx, &%s.%sRequest{\n",
+			clientVar, methodName, protoPackage, methodName))
+	} else {
+		out.WriteString(fmt.Sprintf("resp, err := %s.%s(ctx, &%sRequest{\n",
+			clientVar, methodName, methodName))
+	}
 
 	// Add request fields from INSERT columns/values
-	insertFields := dt.extractInsertFields(s)
 	for _, f := range insertFields {
 		out.WriteString(dt.indentStr())
 		out.WriteString(fmt.Sprintf("\t%s: %s,\n", goExportedIdentifier(f.column), f.value))
@@ -448,13 +630,91 @@ func (dt *dmlTranspiler) transpileInsertGRPC(s *ast.InsertStatement) (string, er
 	out.WriteString(dt.indentStr())
 	out.WriteString("if err != nil {\n")
 	out.WriteString(dt.indentStr())
-	out.WriteString("\treturn err\n")
+	out.WriteString("\t")
+	out.WriteString(dt.buildErrorReturn())
+	out.WriteString("\n")
 	out.WriteString(dt.indentStr())
 	out.WriteString("}\n")
-	out.WriteString(dt.indentStr())
-	out.WriteString("_ = resp")
+	
+	// Handle OUTPUT clause - extract returned values from response
+	outputVars := dt.extractInsertOutputVars(s)
+	if len(outputVars) > 0 {
+		out.WriteString(dt.indentStr())
+		out.WriteString("if resp != nil {\n")
+		for _, ov := range outputVars {
+			out.WriteString(dt.indentStr())
+			// Map INSERTED.ColName to resp.ColName
+			protoField := goExportedIdentifier(ov.column)
+			out.WriteString(fmt.Sprintf("\t%s = resp.%s\n", ov.variable, protoField))
+		}
+		out.WriteString(dt.indentStr())
+		out.WriteString("}")
+	} else {
+		out.WriteString(dt.indentStr())
+		out.WriteString("_ = resp")
+	}
 
 	return out.String(), nil
+}
+
+// extractInsertOutputVars extracts variable assignments from OUTPUT clause.
+// Handles patterns like: OUTPUT INSERTED.LogId INTO @NewId
+func (dt *dmlTranspiler) extractInsertOutputVars(s *ast.InsertStatement) []struct{ column, variable string } {
+	var outputs []struct{ column, variable string }
+	
+	if s.Output == nil {
+		return outputs
+	}
+	
+	// The Output clause contains columns like INSERTED.LogId
+	// Check if Output has columns
+	if s.Output.Columns != nil {
+		for _, col := range s.Output.Columns {
+			colName := ""
+			// Try to extract column name from INSERTED.ColName pattern
+			if qid, ok := col.Expression.(*ast.QualifiedIdentifier); ok && len(qid.Parts) >= 2 {
+				// Last part is the column name (e.g., "LogId" from "INSERTED.LogId")
+				colName = qid.Parts[len(qid.Parts)-1].Value
+			} else if id, ok := col.Expression.(*ast.Identifier); ok {
+				colName = id.Value
+			}
+			
+			if colName != "" {
+				// Use the column name as variable name (lowercase first letter)
+				// The caller should have a variable declared with matching or similar name
+				varName := goIdentifier(colName)
+				
+				outputs = append(outputs, struct{ column, variable string }{
+					column:   colName,
+					variable: varName,
+				})
+			}
+		}
+	}
+	
+	return outputs
+}
+
+// inferInsertGRPCMethod determines the gRPC method name for an INSERT statement.
+func (dt *dmlTranspiler) inferInsertGRPCMethod(table string, fields []insertField) string {
+	entityName := toPascalCase(singularize(table))
+	
+	// Check for verb hints in column/value names
+	for _, f := range fields {
+		if verb := extractActionVerb(f.column); verb != "" {
+			if !verbConflictsWithEntity(verb, entityName) {
+				return verb + entityName
+			}
+		}
+		if verb := extractActionVerb(f.value); verb != "" {
+			if !verbConflictsWithEntity(verb, entityName) {
+				return verb + entityName
+			}
+		}
+	}
+
+	// Default to Create
+	return "Create" + entityName
 }
 
 func (dt *dmlTranspiler) transpileInsertMock(s *ast.InsertStatement) (string, error) {
@@ -477,8 +737,7 @@ func (dt *dmlTranspiler) transpileInsertMock(s *ast.InsertStatement) (string, er
 	out.WriteString("\treturn err\n")
 	out.WriteString(dt.indentStr())
 	out.WriteString("}\n")
-	out.WriteString(dt.indentStr())
-	out.WriteString("_ = result")
+	dt.emitResultHandling(&out, "")
 
 	return out.String(), nil
 }
@@ -490,7 +749,11 @@ func (t *transpiler) transpileUpdate(s *ast.UpdateStatement) (string, error) {
 }
 
 func (dt *dmlTranspiler) transpileUpdate(s *ast.UpdateStatement) (string, error) {
-	switch dt.config.Backend {
+	// Determine effective backend (use fallback for temp tables)
+	tableName := dt.extractUpdateTable(s)
+	backend := dt.getEffectiveBackend(tableName)
+	
+	switch backend {
 	case BackendSQL:
 		return dt.transpileUpdateSQL(s)
 	case BackendGRPC:
@@ -505,7 +768,17 @@ func (dt *dmlTranspiler) transpileUpdate(s *ast.UpdateStatement) (string, error)
 func (dt *dmlTranspiler) transpileUpdateSQL(s *ast.UpdateStatement) (string, error) {
 	var out strings.Builder
 
+	// Emit original SQL if requested
+	if dt.emitOriginal() {
+		out.WriteString(fmt.Sprintf("// Original: %s\n", truncateSQL(s.String(), 100)))
+		out.WriteString(dt.indentStr())
+	}
+
 	query, args := dt.buildUpdateQuery(s)
+	
+	// Post-process to catch any remaining @variable references
+	query, extraArgs := dt.substituteVariablesInQuery(query)
+	args = append(args, extraArgs...)
 	
 	// Get the database variable (tx if in transaction, StoreVar otherwise)
 	dbVar := dt.getDBVar()
@@ -523,31 +796,42 @@ func (dt *dmlTranspiler) transpileUpdateSQL(s *ast.UpdateStatement) (string, err
 	out.WriteString("\treturn err\n")
 	out.WriteString(dt.indentStr())
 	out.WriteString("}\n")
-	out.WriteString(dt.indentStr())
-	out.WriteString("_ = result // Use result.RowsAffected() if needed")
+	dt.emitResultHandling(&out, "Use result.RowsAffected() if needed")
 
 	return out.String(), nil
 }
 
 func (dt *dmlTranspiler) transpileUpdateGRPC(s *ast.UpdateStatement) (string, error) {
 	tableName := dt.extractUpdateTable(s)
-	methodName := "Update" + toPascalCase(singularize(tableName))
+
+	// Extract SET and WHERE fields for verb detection
+	setFields := dt.extractUpdateSetFields(s)
+	whereFields := dt.extractWhereFieldsFromUpdate(s)
+	methodName := dt.inferUpdateGRPCMethod(tableName, setFields, whereFields)
+
+	// Get client variable and proto package for this table
+	clientVar := dt.getGRPCClientForTable(tableName)
+	protoPackage := dt.getProtoPackageForTable(tableName)
 
 	var out strings.Builder
-	out.WriteString(fmt.Sprintf("// gRPC call: %s\n", methodName))
+	out.WriteString(fmt.Sprintf("// gRPC call: %s.%s\n", clientVar, methodName))
 	out.WriteString(dt.indentStr())
-	out.WriteString(fmt.Sprintf("resp, err := %s.%s(ctx, &%s.%sRequest{\n",
-		dt.config.StoreVar, methodName, dt.config.ProtoPackage, methodName))
+
+	if protoPackage != "" {
+		out.WriteString(fmt.Sprintf("resp, err := %s.%s(ctx, &%s.%sRequest{\n",
+			clientVar, methodName, protoPackage, methodName))
+	} else {
+		out.WriteString(fmt.Sprintf("resp, err := %s.%s(ctx, &%sRequest{\n",
+			clientVar, methodName, methodName))
+	}
 
 	// Add SET fields
-	setFields := dt.extractUpdateSetFields(s)
 	for _, f := range setFields {
 		out.WriteString(dt.indentStr())
 		out.WriteString(fmt.Sprintf("\t%s: %s,\n", goExportedIdentifier(f.column), f.value))
 	}
 
 	// Add WHERE fields (for identifying the record)
-	whereFields := dt.extractWhereFieldsFromUpdate(s)
 	for _, wf := range whereFields {
 		out.WriteString(dt.indentStr())
 		out.WriteString(fmt.Sprintf("\t%s: %s,\n", goExportedIdentifier(wf.column), wf.variable))
@@ -558,13 +842,67 @@ func (dt *dmlTranspiler) transpileUpdateGRPC(s *ast.UpdateStatement) (string, er
 	out.WriteString(dt.indentStr())
 	out.WriteString("if err != nil {\n")
 	out.WriteString(dt.indentStr())
-	out.WriteString("\treturn err\n")
+	out.WriteString("\t")
+	out.WriteString(dt.buildErrorReturn())
+	out.WriteString("\n")
 	out.WriteString(dt.indentStr())
 	out.WriteString("}\n")
 	out.WriteString(dt.indentStr())
 	out.WriteString("_ = resp")
 
 	return out.String(), nil
+}
+
+// inferUpdateGRPCMethod determines the gRPC method name for an UPDATE statement.
+// This is where state transition verbs (Approve, Reject, Suspend, etc.) are most important.
+func (dt *dmlTranspiler) inferUpdateGRPCMethod(table string, setFields []setField, whereFields []whereField) string {
+	entityName := toPascalCase(singularize(table))
+	
+	// Check SET columns for state transition verbs
+	// e.g., UPDATE Orders SET ApprovalStatus = 'Approved' → ApproveOrder
+	for _, f := range setFields {
+		// Check column name
+		if verb := extractActionVerb(f.column); verb != "" {
+			// Skip if verb would duplicate or is a prefix of entity name
+			// e.g., Transfer + Transfer, Transfer + TransferAccounting
+			if !verbConflictsWithEntity(verb, entityName) {
+				return verb + entityName
+			}
+		}
+		// Check value for state indicators (e.g., 'Approved', 'Rejected', 'Suspended')
+		if verb := extractActionVerb(f.value); verb != "" {
+			if !verbConflictsWithEntity(verb, entityName) {
+				return verb + entityName
+			}
+		}
+	}
+
+	// Check WHERE clause for verb hints
+	for _, wf := range whereFields {
+		if verb := extractActionVerb(wf.column); verb != "" {
+			if !verbConflictsWithEntity(verb, entityName) {
+				return verb + entityName
+			}
+		}
+		if verb := extractActionVerb(wf.variable); verb != "" {
+			if !verbConflictsWithEntity(verb, entityName) {
+				return verb + entityName
+			}
+		}
+	}
+
+	// Default to Update
+	return "Update" + entityName
+}
+
+// verbConflictsWithEntity returns true if using the verb would create a redundant
+// or confusing method name. This happens when:
+// - verb equals entity (Transfer + Transfer = TransferTransfer)
+// - entity starts with verb (Transfer + TransferAccounting = TransferTransferAccounting)
+func verbConflictsWithEntity(verb, entity string) bool {
+	verbLower := strings.ToLower(verb)
+	entityLower := strings.ToLower(entity)
+	return verbLower == entityLower || strings.HasPrefix(entityLower, verbLower)
 }
 
 func (dt *dmlTranspiler) transpileUpdateMock(s *ast.UpdateStatement) (string, error) {
@@ -604,7 +942,11 @@ func (t *transpiler) transpileDelete(s *ast.DeleteStatement) (string, error) {
 }
 
 func (dt *dmlTranspiler) transpileDelete(s *ast.DeleteStatement) (string, error) {
-	switch dt.config.Backend {
+	// Determine effective backend (use fallback for temp tables)
+	tableName := dt.extractDeleteTable(s)
+	backend := dt.getEffectiveBackend(tableName)
+	
+	switch backend {
 	case BackendSQL:
 		return dt.transpileDeleteSQL(s)
 	case BackendGRPC:
@@ -619,7 +961,17 @@ func (dt *dmlTranspiler) transpileDelete(s *ast.DeleteStatement) (string, error)
 func (dt *dmlTranspiler) transpileDeleteSQL(s *ast.DeleteStatement) (string, error) {
 	var out strings.Builder
 
+	// Emit original SQL if requested
+	if dt.emitOriginal() {
+		out.WriteString(fmt.Sprintf("// Original: %s\n", truncateSQL(s.String(), 100)))
+		out.WriteString(dt.indentStr())
+	}
+
 	query, args := dt.buildDeleteQuery(s)
+	
+	// Post-process to catch any remaining @variable references
+	query, extraArgs := dt.substituteVariablesInQuery(query)
+	args = append(args, extraArgs...)
 	
 	// Get the database variable (tx if in transaction, StoreVar otherwise)
 	dbVar := dt.getDBVar()
@@ -637,24 +989,35 @@ func (dt *dmlTranspiler) transpileDeleteSQL(s *ast.DeleteStatement) (string, err
 	out.WriteString("\treturn err\n")
 	out.WriteString(dt.indentStr())
 	out.WriteString("}\n")
-	out.WriteString(dt.indentStr())
-	out.WriteString("_ = result // Use result.RowsAffected() if needed")
+	dt.emitResultHandling(&out, "Use result.RowsAffected() if needed")
 
 	return out.String(), nil
 }
 
 func (dt *dmlTranspiler) transpileDeleteGRPC(s *ast.DeleteStatement) (string, error) {
 	tableName := dt.extractDeleteTable(s)
-	methodName := "Delete" + toPascalCase(singularize(tableName))
+
+	// Extract WHERE fields for verb detection
+	whereFields := dt.extractWhereFieldsFromDelete(s)
+	methodName := dt.inferDeleteGRPCMethod(tableName, whereFields)
+
+	// Get client variable and proto package for this table
+	clientVar := dt.getGRPCClientForTable(tableName)
+	protoPackage := dt.getProtoPackageForTable(tableName)
 
 	var out strings.Builder
-	out.WriteString(fmt.Sprintf("// gRPC call: %s\n", methodName))
+	out.WriteString(fmt.Sprintf("// gRPC call: %s.%s\n", clientVar, methodName))
 	out.WriteString(dt.indentStr())
-	out.WriteString(fmt.Sprintf("resp, err := %s.%s(ctx, &%s.%sRequest{\n",
-		dt.config.StoreVar, methodName, dt.config.ProtoPackage, methodName))
+
+	if protoPackage != "" {
+		out.WriteString(fmt.Sprintf("resp, err := %s.%s(ctx, &%s.%sRequest{\n",
+			clientVar, methodName, protoPackage, methodName))
+	} else {
+		out.WriteString(fmt.Sprintf("resp, err := %s.%s(ctx, &%sRequest{\n",
+			clientVar, methodName, methodName))
+	}
 
 	// Add WHERE fields (for identifying the record)
-	whereFields := dt.extractWhereFieldsFromDelete(s)
 	for _, wf := range whereFields {
 		out.WriteString(dt.indentStr())
 		out.WriteString(fmt.Sprintf("\t%s: %s,\n", goExportedIdentifier(wf.column), wf.variable))
@@ -665,13 +1028,38 @@ func (dt *dmlTranspiler) transpileDeleteGRPC(s *ast.DeleteStatement) (string, er
 	out.WriteString(dt.indentStr())
 	out.WriteString("if err != nil {\n")
 	out.WriteString(dt.indentStr())
-	out.WriteString("\treturn err\n")
+	out.WriteString("\t")
+	out.WriteString(dt.buildErrorReturn())
+	out.WriteString("\n")
 	out.WriteString(dt.indentStr())
 	out.WriteString("}\n")
 	out.WriteString(dt.indentStr())
 	out.WriteString("_ = resp")
 
 	return out.String(), nil
+}
+
+// inferDeleteGRPCMethod determines the gRPC method name for a DELETE statement.
+// Detects verbs like Cancel, Revoke, Terminate, Remove, Purge, etc.
+func (dt *dmlTranspiler) inferDeleteGRPCMethod(table string, whereFields []whereField) string {
+	entityName := toPascalCase(singularize(table))
+	
+	// Check WHERE clause for verb hints
+	for _, wf := range whereFields {
+		if verb := extractActionVerb(wf.column); verb != "" {
+			if !verbConflictsWithEntity(verb, entityName) {
+				return verb + entityName
+			}
+		}
+		if verb := extractActionVerb(wf.variable); verb != "" {
+			if !verbConflictsWithEntity(verb, entityName) {
+				return verb + entityName
+			}
+		}
+	}
+
+	// Default to Delete
+	return "Delete" + entityName
 }
 
 func (dt *dmlTranspiler) transpileDeleteMock(s *ast.DeleteStatement) (string, error) {
@@ -917,8 +1305,7 @@ func (dt *dmlTranspiler) transpileWithInsert(ws *ast.WithStatement, ins *ast.Ins
 	out.WriteString("\n")
 	out.WriteString(dt.indentStr())
 	out.WriteString("}\n")
-	out.WriteString(dt.indentStr())
-	out.WriteString("_ = result")
+	dt.emitResultHandling(&out, "")
 
 	return out.String(), nil
 }
@@ -970,8 +1357,7 @@ func (dt *dmlTranspiler) transpileWithUpdate(ws *ast.WithStatement, upd *ast.Upd
 	out.WriteString("\n")
 	out.WriteString(dt.indentStr())
 	out.WriteString("}\n")
-	out.WriteString(dt.indentStr())
-	out.WriteString("_ = result")
+	dt.emitResultHandling(&out, "")
 
 	return out.String(), nil
 }
@@ -1023,8 +1409,7 @@ func (dt *dmlTranspiler) transpileWithDelete(ws *ast.WithStatement, del *ast.Del
 	out.WriteString("\n")
 	out.WriteString(dt.indentStr())
 	out.WriteString("}\n")
-	out.WriteString(dt.indentStr())
-	out.WriteString("_ = result")
+	dt.emitResultHandling(&out, "")
 
 	return out.String(), nil
 }
@@ -1070,7 +1455,32 @@ func (dt *dmlTranspiler) substituteVariablesInQuery(query string) (string, []str
 		pos++
 	}
 	
-	return result.String(), args
+	// Apply dialect-specific SQL normalization
+	finalQuery := dt.normalizeDialectSQL(result.String())
+	
+	return finalQuery, args
+}
+
+// normalizeDialectSQL converts T-SQL specific syntax to target dialect
+func (dt *dmlTranspiler) normalizeDialectSQL(query string) string {
+	if dt.config.SQLDialect == "postgres" {
+		// ISNULL(x, y) -> COALESCE(x, y)
+		query = strings.ReplaceAll(query, "ISNULL(", "COALESCE(")
+		query = strings.ReplaceAll(query, "isnull(", "COALESCE(")
+		query = strings.ReplaceAll(query, "Isnull(", "COALESCE(")
+		query = strings.ReplaceAll(query, "IsNull(", "COALESCE(")
+		
+		// GETDATE() -> NOW()
+		query = strings.ReplaceAll(query, "GETDATE()", "NOW()")
+		query = strings.ReplaceAll(query, "getdate()", "NOW()")
+		query = strings.ReplaceAll(query, "GetDate()", "NOW()")
+		
+		// LEN(x) -> LENGTH(x)
+		query = strings.ReplaceAll(query, "LEN(", "LENGTH(")
+		query = strings.ReplaceAll(query, "len(", "LENGTH(")
+		query = strings.ReplaceAll(query, "Len(", "LENGTH(")
+	}
+	return query
 }
 
 // isAlphaForCTE checks if a character is alphabetic
@@ -1091,7 +1501,6 @@ func (t *transpiler) transpileExec(s *ast.ExecStatement) (string, error) {
 
 func (dt *dmlTranspiler) transpileExec(s *ast.ExecStatement) (string, error) {
 	// EXEC calls another stored procedure
-	// In transpiled code, this becomes a Go function call
 	procName := ""
 	if s.Procedure != nil {
 		procName = s.Procedure.String()
@@ -1099,6 +1508,218 @@ func (dt *dmlTranspiler) transpileExec(s *ast.ExecStatement) (string, error) {
 
 	// Clean up procedure name (remove dbo. prefix, etc.)
 	procName = cleanProcedureName(procName)
+
+	// Check if gRPC backend with explicit mapping
+	if dt.config.Backend == BackendGRPC {
+		if mapping, ok := dt.lookupGRPCMapping(procName); ok {
+			return dt.transpileExecGRPC(s, procName, mapping)
+		}
+		// Even without explicit mapping, try to infer gRPC method
+		if dt.config.ProtoPackage != "" || len(dt.config.TableToService) > 0 {
+			return dt.transpileExecGRPCInferred(s, procName)
+		}
+	}
+
+	// Default: generate Go function call
+	return dt.transpileExecFunction(s, procName)
+}
+
+// lookupGRPCMapping checks GRPCMappings for a procedure name.
+// Tries various name formats: exact, without prefix, normalized.
+func (dt *dmlTranspiler) lookupGRPCMapping(procName string) (string, bool) {
+	if dt.config.GRPCMappings == nil {
+		return "", false
+	}
+
+	// Try exact match
+	if mapping, ok := dt.config.GRPCMappings[procName]; ok {
+		return mapping, true
+	}
+
+	// Try without common prefixes
+	normalized := procName
+	for _, prefix := range []string{"usp_", "sp_", "proc_", "p_", "dbo."} {
+		normalized = strings.TrimPrefix(strings.ToLower(normalized), prefix)
+	}
+
+	for key, mapping := range dt.config.GRPCMappings {
+		keyNorm := key
+		for _, prefix := range []string{"usp_", "sp_", "proc_", "p_", "dbo."} {
+			keyNorm = strings.TrimPrefix(strings.ToLower(keyNorm), prefix)
+		}
+		if keyNorm == normalized {
+			return mapping, true
+		}
+	}
+
+	return "", false
+}
+
+// transpileExecGRPC generates a gRPC call for EXEC with explicit mapping.
+func (dt *dmlTranspiler) transpileExecGRPC(s *ast.ExecStatement, procName, mapping string) (string, error) {
+	// Parse mapping: "ServiceName.MethodName" or just "MethodName"
+	parts := strings.Split(mapping, ".")
+	var serviceName, methodName string
+	if len(parts) == 2 {
+		serviceName = parts[0]
+		methodName = parts[1]
+	} else {
+		methodName = mapping
+	}
+
+	// Determine client variable
+	clientVar := dt.config.GRPCClientVar
+	if clientVar == "" || clientVar == "client" {
+		clientVar = dt.config.StoreVar
+	}
+	if serviceName != "" {
+		// Use service-specific client
+		clientVar = toLowerCamel(serviceName) + "Client"
+	}
+
+	// Determine proto package
+	protoPackage := dt.config.ProtoPackage
+	if serviceName != "" {
+		// First check explicit service-to-package mapping
+		if dt.config.ServiceToPackage != nil {
+			if pkg, ok := dt.config.ServiceToPackage[serviceName]; ok {
+				protoPackage = pkg
+			} else {
+				// Infer from service name
+				protoPackage = inferProtoPackage(serviceName)
+			}
+		} else {
+			// Infer from service name
+			protoPackage = inferProtoPackage(serviceName)
+		}
+	}
+
+	var out strings.Builder
+	out.WriteString(fmt.Sprintf("// EXEC %s -> gRPC %s\n", procName, mapping))
+	out.WriteString(dt.indentStr())
+
+	// Build request struct
+	if protoPackage != "" {
+		out.WriteString(fmt.Sprintf("resp, err := %s.%s(ctx, &%s.%sRequest{\n",
+			clientVar, methodName, protoPackage, methodName))
+	} else {
+		out.WriteString(fmt.Sprintf("resp, err := %s.%s(ctx, &%sRequest{\n",
+			clientVar, methodName, methodName))
+	}
+
+	// Add parameters as request fields
+	for _, p := range s.Parameters {
+		fieldName := ""
+		if p.Name != "" {
+			fieldName = goExportedIdentifier(strings.TrimPrefix(p.Name, "@"))
+		}
+		argVal, err := dt.transpileExpression(p.Value)
+		if err != nil {
+			return "", err
+		}
+		if fieldName != "" {
+			out.WriteString(dt.indentStr())
+			out.WriteString(fmt.Sprintf("\t%s: %s,\n", fieldName, argVal))
+		}
+	}
+
+	out.WriteString(dt.indentStr())
+	out.WriteString("})\n")
+	out.WriteString(dt.indentStr())
+	out.WriteString("if err != nil {\n")
+	out.WriteString(dt.indentStr())
+	out.WriteString("\t")
+	out.WriteString(dt.buildErrorReturn())
+	out.WriteString("\n")
+	out.WriteString(dt.indentStr())
+	out.WriteString("}\n")
+	out.WriteString(dt.indentStr())
+	out.WriteString("_ = resp // TODO: use response")
+
+	return out.String(), nil
+}
+
+// transpileExecGRPCInferred generates a gRPC call by inferring method from procedure name.
+func (dt *dmlTranspiler) transpileExecGRPCInferred(s *ast.ExecStatement, procName string) (string, error) {
+	// Infer method name from procedure name using verb detection
+	methodName := dt.inferMethodFromProcedure(procName)
+
+	clientVar := dt.config.GRPCClientVar
+	if clientVar == "" || clientVar == "client" {
+		clientVar = dt.config.StoreVar
+	}
+
+	protoPackage := dt.config.ProtoPackage
+
+	var out strings.Builder
+	out.WriteString(fmt.Sprintf("// EXEC %s -> gRPC %s (inferred)\n", procName, methodName))
+	out.WriteString(dt.indentStr())
+
+	if protoPackage != "" {
+		out.WriteString(fmt.Sprintf("resp, err := %s.%s(ctx, &%s.%sRequest{\n",
+			clientVar, methodName, protoPackage, methodName))
+	} else {
+		out.WriteString(fmt.Sprintf("resp, err := %s.%s(ctx, &%sRequest{\n",
+			clientVar, methodName, methodName))
+	}
+
+	// Add parameters as request fields
+	for _, p := range s.Parameters {
+		fieldName := ""
+		if p.Name != "" {
+			fieldName = goExportedIdentifier(strings.TrimPrefix(p.Name, "@"))
+		}
+		argVal, err := dt.transpileExpression(p.Value)
+		if err != nil {
+			return "", err
+		}
+		if fieldName != "" {
+			out.WriteString(dt.indentStr())
+			out.WriteString(fmt.Sprintf("\t%s: %s,\n", fieldName, argVal))
+		}
+	}
+
+	out.WriteString(dt.indentStr())
+	out.WriteString("})\n")
+	out.WriteString(dt.indentStr())
+	out.WriteString("if err != nil {\n")
+	out.WriteString(dt.indentStr())
+	out.WriteString("\t")
+	out.WriteString(dt.buildErrorReturn())
+	out.WriteString("\n")
+	out.WriteString(dt.indentStr())
+	out.WriteString("}\n")
+	out.WriteString(dt.indentStr())
+	out.WriteString("_ = resp // TODO: use response")
+
+	return out.String(), nil
+}
+
+// inferMethodFromProcedure infers a gRPC method name from a stored procedure name.
+func (dt *dmlTranspiler) inferMethodFromProcedure(procName string) string {
+	// Remove common prefixes
+	name := procName
+	for _, prefix := range []string{"usp_", "sp_", "proc_", "p_"} {
+		if strings.HasPrefix(strings.ToLower(name), prefix) {
+			name = name[len(prefix):]
+			break
+		}
+	}
+
+	// The procedure name likely already follows VerbEntity pattern
+	// e.g., usp_GetProductById -> GetProductById -> GetProduct
+	// e.g., usp_ApproveLoan -> ApproveLoan
+
+	// Remove ById suffix if present
+	if strings.HasSuffix(name, "ById") {
+		name = strings.TrimSuffix(name, "ById")
+	}
+
+	return toPascalCase(name)
+}
+
+// transpileExecFunction generates a Go function call for EXEC (default behavior).
+func (dt *dmlTranspiler) transpileExecFunction(s *ast.ExecStatement, procName string) (string, error) {
 	funcName := goExportedIdentifier(procName)
 
 	var out strings.Builder
@@ -1170,6 +1791,15 @@ type whereField struct {
 	column   string
 	variable string
 	operator string
+}
+
+// whereFieldWithValue holds a WHERE condition that can be either a variable or literal
+type whereFieldWithValue struct {
+	column    string
+	value     string // Go code for the value (variable name or literal)
+	operator  string
+	isComplex bool   // True if expression couldn't be converted to Go
+	rawExpr   string // Original T-SQL for complex expressions
 }
 
 type insertField struct {
@@ -1253,6 +1883,129 @@ func (dt *dmlTranspiler) walkWhereExpr(expr ast.Expression, fields *[]whereField
 				operator: op,
 			})
 		}
+	}
+}
+
+// extractWhereFieldsWithLiterals extracts fields from WHERE clause including literals.
+// This is used for gRPC request building where we want both variables and literal values.
+func (dt *dmlTranspiler) extractWhereFieldsWithLiterals(s *ast.SelectStatement) []whereFieldWithValue {
+	var fields []whereFieldWithValue
+
+	if s.Where == nil {
+		return fields
+	}
+
+	dt.walkWhereExprWithLiterals(s.Where, &fields)
+	return fields
+}
+
+func (dt *dmlTranspiler) walkWhereExprWithLiterals(expr ast.Expression, fields *[]whereFieldWithValue) {
+	if expr == nil {
+		return
+	}
+
+	switch e := expr.(type) {
+	case *ast.InfixExpression:
+		op := strings.ToUpper(e.Operator)
+		if op == "AND" || op == "OR" {
+			dt.walkWhereExprWithLiterals(e.Left, fields)
+			dt.walkWhereExprWithLiterals(e.Right, fields)
+			return
+		}
+
+		// Extract column name from left side
+		colName := ""
+		if id, ok := e.Left.(*ast.Identifier); ok {
+			colName = id.Value
+		} else if qid, ok := e.Left.(*ast.QualifiedIdentifier); ok {
+			if len(qid.Parts) > 0 {
+				colName = qid.Parts[len(qid.Parts)-1].Value
+			}
+		}
+
+		if colName == "" {
+			return
+		}
+
+		// Extract value from right side - could be variable or literal
+		var value string
+		var isComplex bool
+		switch v := e.Right.(type) {
+		case *ast.Variable:
+			value = goIdentifier(strings.TrimPrefix(v.Name, "@"))
+		case *ast.StringLiteral:
+			value = fmt.Sprintf("%q", v.Value)
+		case *ast.IntegerLiteral:
+			value = fmt.Sprintf("%d", v.Value)
+		case *ast.FloatLiteral:
+			value = fmt.Sprintf("%v", v.Value)
+		case *ast.NullLiteral:
+			value = "nil"
+		case *ast.Identifier:
+			// Could be TRUE/FALSE or a column reference
+			upper := strings.ToUpper(v.Value)
+			if upper == "TRUE" {
+				value = "true"
+			} else if upper == "FALSE" {
+				value = "false"
+			} else {
+				value = goIdentifier(v.Value)
+			}
+		case *ast.FunctionCall:
+			// Try to transpile simple functions, mark complex ones
+			if goVal, ok := dt.tryTranspileSimpleFunc(v); ok {
+				value = goVal
+			} else {
+				isComplex = true
+			}
+		default:
+			// For other complex expressions, mark as needing manual handling
+			isComplex = true
+		}
+
+		if value != "" && !isComplex {
+			*fields = append(*fields, whereFieldWithValue{
+				column:   colName,
+				value:    value,
+				operator: op,
+			})
+		} else if isComplex {
+			// Add with complexity marker for proper handling
+			*fields = append(*fields, whereFieldWithValue{
+				column:    colName,
+				value:     "",
+				operator:  op,
+				isComplex: true,
+				rawExpr:   dt.exprToString(e.Right),
+			})
+		}
+	}
+}
+
+// tryTranspileSimpleFunc attempts to convert simple T-SQL functions to Go.
+// Returns the Go code and true if successful, empty and false otherwise.
+func (dt *dmlTranspiler) tryTranspileSimpleFunc(f *ast.FunctionCall) (string, bool) {
+	// Extract function name
+	funcName := ""
+	if id, ok := f.Function.(*ast.Identifier); ok {
+		funcName = strings.ToUpper(id.Value)
+	} else if qid, ok := f.Function.(*ast.QualifiedIdentifier); ok && len(qid.Parts) > 0 {
+		funcName = strings.ToUpper(qid.Parts[len(qid.Parts)-1].Value)
+	}
+	if funcName == "" {
+		return "", false
+	}
+	
+	switch funcName {
+	case "GETDATE", "GETUTCDATE", "SYSDATETIME", "SYSUTCDATETIME":
+		dt.imports["time"] = true
+		return "time.Now()", true
+	case "NEWID":
+		dt.imports["github.com/google/uuid"] = true
+		return "uuid.New().String()", true
+	default:
+		// DATEADD, DATEDIFF, CAST, etc. are too complex for inline conversion
+		return "", false
 	}
 }
 
@@ -1364,6 +2117,37 @@ func (dt *dmlTranspiler) extractDeleteTable(s *ast.DeleteStatement) string {
 	return ""
 }
 
+// isTempTable returns true if the table name indicates a temp table.
+// T-SQL temp tables start with # (local) or ## (global).
+func isTempTable(tableName string) bool {
+	return strings.HasPrefix(tableName, "#")
+}
+
+// getEffectiveBackend returns the backend to use for a given table.
+// For temp tables, it returns the fallback backend (typically SQL).
+// For regular tables, it returns the primary backend.
+// Also tracks temp tables encountered for warning purposes.
+func (dt *dmlTranspiler) getEffectiveBackend(tableName string) BackendType {
+	if isTempTable(tableName) {
+		// Record this temp table for warning purposes
+		dt.recordTempTable(tableName)
+		if dt.config.FallbackBackend != "" {
+			return dt.config.FallbackBackend
+		}
+	}
+	return dt.config.Backend
+}
+
+// recordTempTable adds a temp table name to the tracking list (deduped).
+func (dt *dmlTranspiler) recordTempTable(name string) {
+	for _, existing := range dt.transpiler.tempTablesUsed {
+		if existing == name {
+			return
+		}
+	}
+	dt.transpiler.tempTablesUsed = append(dt.transpiler.tempTablesUsed, name)
+}
+
 // Query building helpers
 
 func (dt *dmlTranspiler) buildSelectQuery(s *ast.SelectStatement) (string, []string) {
@@ -1374,11 +2158,16 @@ func (dt *dmlTranspiler) buildSelectQuery(s *ast.SelectStatement) (string, []str
 
 	query.WriteString("SELECT ")
 
-	// Columns
+	// Columns - strip @Var = assignment syntax (handled by Scan)
 	if s.Columns != nil {
 		var cols []string
 		for _, item := range s.Columns {
-			cols = append(cols, item.String())
+			// If this is a SELECT @var = expr, output only expr
+			if item.Variable != nil && item.Expression != nil {
+				cols = append(cols, item.Expression.String())
+			} else {
+				cols = append(cols, item.String())
+			}
 		}
 		query.WriteString(strings.Join(cols, ", "))
 	}
@@ -1425,7 +2214,7 @@ func (dt *dmlTranspiler) buildInsertQuery(s *ast.InsertStatement) (string, []str
 		query.WriteString(")")
 	}
 
-	// VALUES
+	// VALUES or SELECT
 	if s.Values != nil && len(s.Values) > 0 && len(s.Values[0]) > 0 {
 		query.WriteString(" VALUES (")
 		var placeholders []string
@@ -1437,6 +2226,14 @@ func (dt *dmlTranspiler) buildInsertQuery(s *ast.InsertStatement) (string, []str
 		}
 		query.WriteString(strings.Join(placeholders, ", "))
 		query.WriteString(")")
+	} else if s.Select != nil {
+		// INSERT...SELECT
+		query.WriteString(" ")
+		selectQuery, selectArgs := dt.buildSelectQuery(s.Select)
+		query.WriteString(selectQuery)
+		args = append(args, selectArgs...)
+	} else if s.DefaultValues {
+		query.WriteString(" DEFAULT VALUES")
 	}
 
 	return stripTableHints(query.String()), args
@@ -1759,22 +2556,248 @@ func (dt *dmlTranspiler) isSingleRowSelect(s *ast.SelectStatement) bool {
 
 // Method name inference
 
+// inferGRPCMethod determines the gRPC method name for a SELECT statement.
+// Priority: explicit GRPCMappings > table-to-service + verb detection > default inference
 func (dt *dmlTranspiler) inferGRPCMethod(s *ast.SelectStatement, table string) string {
 	whereFields := dt.extractWhereFields(s)
+	entityName := toPascalCase(singularize(table))
 
+	// Check for verb hints in WHERE clause variable names
+	verb := dt.detectVerbFromWhereFields(whereFields)
+	if verb != "" && !verbConflictsWithEntity(verb, entityName) {
+		return verb + entityName
+	}
+
+	// Check for verb hints in column names being selected
+	verb = dt.detectVerbFromSelectColumns(s)
+	if verb != "" && !verbConflictsWithEntity(verb, entityName) {
+		return verb + entityName
+	}
+
+	// Default inference based on query pattern
 	if len(whereFields) == 0 {
-		return "List" + toPascalCase(pluralize(table))
+		// Apply toPascalCase first, then pluralize to preserve word boundaries
+		return "List" + pluralize(toPascalCase(table))
 	}
 
 	if len(whereFields) == 1 {
 		col := whereFields[0].column
 		if strings.ToLower(col) == "id" || strings.HasSuffix(strings.ToLower(col), "_id") {
-			return "Get" + toPascalCase(singularize(table))
+			return "Get" + entityName
 		}
-		return "Get" + toPascalCase(singularize(table)) + "By" + toPascalCase(col)
+		return "Get" + entityName + "By" + toPascalCase(col)
 	}
 
-	return "Find" + toPascalCase(pluralize(table))
+	// Apply toPascalCase first, then pluralize to preserve word boundaries
+	return "Find" + pluralize(toPascalCase(table))
+}
+
+// detectVerbFromWhereFields looks for action verbs in WHERE clause variable/column names.
+func (dt *dmlTranspiler) detectVerbFromWhereFields(whereFields []whereField) string {
+	for _, wf := range whereFields {
+		// Check variable name for verb hints
+		if wf.variable != "" {
+			if verb := extractActionVerb(wf.variable); verb != "" {
+				return verb
+			}
+		}
+		// Check column name for verb hints
+		if verb := extractActionVerb(wf.column); verb != "" {
+			return verb
+		}
+	}
+	return ""
+}
+
+// detectVerbFromSelectColumns looks for action verbs in selected column names.
+func (dt *dmlTranspiler) detectVerbFromSelectColumns(s *ast.SelectStatement) string {
+	if s.Columns == nil {
+		return ""
+	}
+	for _, item := range s.Columns {
+		if item.Alias != nil {
+			if verb := extractActionVerb(item.Alias.Value); verb != "" {
+				return verb
+			}
+		}
+		// Check column expression for identifiers
+		if ident, ok := item.Expression.(*ast.Identifier); ok {
+			if verb := extractActionVerb(ident.Value); verb != "" {
+				return verb
+			}
+		}
+	}
+	return ""
+}
+
+// extractActionVerb detects business process verbs in identifiers.
+// Returns the verb in PascalCase if found, empty string otherwise.
+func extractActionVerb(name string) string {
+	nameLower := strings.ToLower(name)
+
+	// Verb patterns in priority order (longer/more specific patterns first)
+	// This ensures "deactivate" is matched before "activate", etc.
+	verbPatterns := []struct {
+		verb     string
+		patterns []string
+	}{
+		// Compound verbs first (to avoid substring issues)
+		{"Countersign", []string{"countersign", "countersigned", "countersigning"}},
+		{"Deactivate", []string{"deactivate", "deactivated", "deactivating", "deactivation"}},
+		{"Acknowledge", []string{"acknowledge", "acknowledged", "acknowledging", "acknowledgment", "acknowledgement"}},
+
+		// Approval workflow verbs
+		{"Approve", []string{"approve", "approved", "approving", "approval"}},
+		{"Reject", []string{"reject", "rejected", "rejecting", "rejection"}},
+		{"Certify", []string{"certify", "certified", "certifying", "certification"}},
+		{"Attest", []string{"attest", "attested", "attesting", "attestation"}},
+		{"Review", []string{"review", "reviewed", "reviewing"}},
+		{"Assess", []string{"assess", "assessed", "assessing", "assessment"}},
+		{"Audit", []string{"audit", "audited", "auditing"}},
+		{"Authorize", []string{"authorize", "authorized", "authorizing", "authorization"}},
+		{"Grant", []string{"grant", "granted", "granting"}},
+		{"Deny", []string{"deny", "denied", "denying", "denial"}},
+		{"Escalate", []string{"escalate", "escalated", "escalating", "escalation"}},
+		{"Delegate", []string{"delegate", "delegated", "delegating", "delegation"}},
+
+		// Lifecycle verbs
+		{"Suspend", []string{"suspend", "suspended", "suspending", "suspension"}},
+		{"Resume", []string{"resume", "resumed", "resuming"}},
+		{"Cancel", []string{"cancel", "cancelled", "canceled", "cancelling", "canceling", "cancellation"}},
+		{"Terminate", []string{"terminate", "terminated", "terminating", "termination"}},
+		{"Complete", []string{"complete", "completed", "completing", "completion"}},
+		{"Finalize", []string{"finalize", "finalized", "finalizing", "finalization"}},
+		{"Activate", []string{"activate", "activated", "activating", "activation"}},
+
+		// Communication verbs
+		{"Notify", []string{"notify", "notified", "notifying", "notification"}},
+		{"Alert", []string{"alert", "alerted", "alerting"}},
+
+		// Signing verbs
+		{"Sign", []string{"sign", "signed", "signing", "signature"}},
+
+		// Calculation verbs
+		{"Calculate", []string{"calculate", "calculated", "calculating", "calculation"}},
+		{"Compute", []string{"compute", "computed", "computing", "computation"}},
+		{"Estimate", []string{"estimate", "estimated", "estimating", "estimation"}},
+
+		// Validation verbs
+		{"Validate", []string{"validate", "validated", "validating", "validation"}},
+		{"Verify", []string{"verify", "verified", "verifying", "verification"}},
+
+		// Transfer verbs
+		{"Transfer", []string{"transfer", "transferred", "transferring"}},
+		{"Submit", []string{"submit", "submitted", "submitting", "submission"}},
+	}
+
+	for _, vp := range verbPatterns {
+		for _, pattern := range vp.patterns {
+			if strings.Contains(nameLower, pattern) {
+				return vp.verb
+			}
+		}
+	}
+
+	return ""
+}
+
+// getGRPCClientForTable returns the gRPC client variable for a table based on configuration.
+func (dt *dmlTranspiler) getGRPCClientForTable(table string) string {
+	tableLower := strings.ToLower(table)
+
+	// Check explicit table-to-client mapping
+	if dt.config.TableToClient != nil {
+		if client, ok := dt.config.TableToClient[table]; ok {
+			return client
+		}
+		if client, ok := dt.config.TableToClient[tableLower]; ok {
+			return client
+		}
+	}
+
+	// Check table-to-service mapping and derive client name
+	if dt.config.TableToService != nil {
+		if service, ok := dt.config.TableToService[table]; ok {
+			return toLowerCamel(service) + "Client"
+		}
+		if service, ok := dt.config.TableToService[tableLower]; ok {
+			return toLowerCamel(service) + "Client"
+		}
+	}
+
+	// Check explicit GRPCClientVar if set to non-default
+	if dt.config.GRPCClientVar != "" && dt.config.GRPCClientVar != "client" {
+		return dt.config.GRPCClientVar
+	}
+
+	// Fall back to StoreVar for backwards compatibility
+	if dt.config.StoreVar != "" {
+		return dt.config.StoreVar
+	}
+
+	// Final fallback
+	return "client"
+}
+
+// getProtoPackageForTable returns the proto package for a table based on configuration.
+func (dt *dmlTranspiler) getProtoPackageForTable(table string) string {
+	tableLower := strings.ToLower(table)
+
+	// Check table-to-service, then service-to-package
+	if dt.config.TableToService != nil {
+		var service string
+		if svc, ok := dt.config.TableToService[table]; ok {
+			service = svc
+		} else if svc, ok := dt.config.TableToService[tableLower]; ok {
+			service = svc
+		}
+		if service != "" {
+			// First check explicit service-to-package mapping
+			if dt.config.ServiceToPackage != nil {
+				if pkg, ok := dt.config.ServiceToPackage[service]; ok {
+					return pkg
+				}
+			}
+			// Infer proto package from service name: CatalogService -> catalogpb
+			return inferProtoPackage(service)
+		}
+	}
+
+	// Fall back to config default
+	return dt.config.ProtoPackage
+}
+
+// inferProtoPackage derives a proto package name from a service name.
+// Examples:
+//   - CatalogService -> catalogpb
+//   - OrderService -> orderpb
+//   - UserAccountService -> useraccountpb
+func inferProtoPackage(serviceName string) string {
+	// Remove common suffixes
+	name := serviceName
+	for _, suffix := range []string{"Service", "Svc", "API", "Api"} {
+		if strings.HasSuffix(name, suffix) {
+			name = strings.TrimSuffix(name, suffix)
+			break
+		}
+	}
+
+	// Convert to lowercase and add pb suffix
+	return strings.ToLower(name) + "pb"
+}
+
+// toLowerCamel converts PascalCase to lowerCamelCase
+func toLowerCamel(s string) string {
+	if s == "" {
+		return s
+	}
+	// Find first lowercase letter or end of string
+	for i, r := range s {
+		if i > 0 && (r >= 'a' && r <= 'z') {
+			return strings.ToLower(s[:i-1]) + s[i-1:]
+		}
+	}
+	return strings.ToLower(s)
 }
 
 func (dt *dmlTranspiler) inferMockMethod(s *ast.SelectStatement, table string) string {
@@ -1880,6 +2903,11 @@ func (t *transpiler) transpileOpenCursor(s *ast.OpenCursorStatement) (string, er
 	// Build the query
 	dt := &dmlTranspiler{transpiler: t, config: t.dmlConfig}
 	query, args := dt.buildSelectQuery(cursor.query)
+	
+	// Post-process to catch any remaining @variable references
+	query, extraArgs := dt.substituteVariablesInQuery(query)
+	args = append(args, extraArgs...)
+	
 	dbVar := dt.getDBVar()
 	
 	var out strings.Builder
@@ -2356,12 +3384,34 @@ func cleanProcedureName(name string) string {
 }
 
 func toPascalCase(s string) string {
+	// Strip T-SQL-specific prefixes
+	s = strings.TrimPrefix(s, "#")  // temp table prefix
+	s = strings.TrimPrefix(s, "##") // global temp table prefix
+	s = strings.TrimPrefix(s, "@")  // variable prefix
+	s = strings.TrimPrefix(s, "@@") // system variable prefix
+	
+	// Check if string is ALL_CAPS or ALL_CAPS_WITH_UNDERSCORES
+	// If so, try smart word splitting first
+	if isAllCapsOrUnderscored(s) {
+		if strings.Contains(s, "_") {
+			// Has underscores - just lowercase and let normal processing handle it
+			s = strings.ToLower(s)
+		} else {
+			// No underscores - try to split using known words
+			if split := splitAllCapsIdentifier(s); split != "" {
+				return split
+			}
+			// Fallback to simple lowercase
+			s = strings.ToLower(s)
+		}
+	}
+	
 	result := make([]byte, 0, len(s))
 	capitalizeNext := true
 
 	for i := 0; i < len(s); i++ {
 		c := s[i]
-		if c == '_' || c == '-' || c == ' ' {
+		if c == '_' || c == '-' || c == ' ' || c == '#' || c == '@' {
 			capitalizeNext = true
 			continue
 		}
@@ -2375,32 +3425,159 @@ func toPascalCase(s string) string {
 	return string(result)
 }
 
+// knownWords contains words used for splitting ALL_CAPS identifiers.
+// Ordered by length (longest first) to ensure greedy matching.
+// IMPORTANT: Avoid plural forms that could cause false matches (e.g., "orders" matching "orderstatushistory")
+// This list includes verbs from extractActionVerb plus common domain nouns.
+var knownWords = []string{
+	// Long compound words first (12+ chars)
+	"reconciliation", "configuration", "authentication", "authorization",
+	"infrastructure", "implementation", "administration", "communication",
+	// 10-11 char words
+	"notification", "transaction", "institution", "beneficiary",
+	"calculation", "reservation", "information", "description", "destination",
+	"integration", "progression", "termination", "confirmation", 
+	"subscription", "registration", "processing", "settlement",
+	"accounting", "compliance", "validation", "permission", "preference",
+	"credential", "parameter", "statement", "operation", "attributes", "attribute",
+	// 8-9 char words
+	"inventory", "reference", "transfer", "customer", "location",
+	"address", "payment", "product", "message", "request", "response",
+	"balance", "account", "exchange", "generate", "calculate", "terminate",
+	"complete", "finalize", "activate", "validate", "deactivate",
+	"authorize", "transmitter", "category", "currency", "receiver",
+	"currency", "history",
+	// 7 char words  
+	"network", "partner", "process", "service", "detail", "summary",
+	"pending", "blocked", "invoice", "receipt", "refund", "session",
+	"storage", "version", "channel", "country", "default", "enabled",
+	"expired", "failure", "success", "warning", "primary", "foreign",
+	"general", "approve", "certify", "suspend", "escalate", "delegate",
+	"global", "number", "string", "closed",
+	// 6 char words
+	"status", "result", "source", "target", "amount", "active",
+	"locked", "return", "sender", "record", "report", "reject",
+	"attest", "review", "assess", "resume", "cancel", "notify",
+	"verify", "submit", "credit", "charge", "scheme", "entity",
+	"action", "config", "domain", "format", "method", "payer",
+	// 5 char words
+	"event", "order", "query", "level", "limit", "total", "price",
+	"error", "alert", "audit", "grant", "claim", "batch", "queue",
+	"agent", "store", "index", "count", "value", "state", "input",
+	"valid", "payee", "item", "note",
+	// 4 char words
+	"user", "role", "type", "code", "date", "time", "cart", "name",
+	"rate", "xref", "send", "move", "find", "list", "open", "data",
+	"mode", "plan", "rule", "step", "task", "unit", "zone", "area",
+	"bank", "card", "case", "cash", "file", "flag", "flow", "form",
+	"hash", "hold", "host", "kind", "last", "link", "loan", "mail",
+	"mark", "memo", "meta", "next", "node", "page", "path", "port",
+	"post", "rank", "risk", "sign", "size", "slot", "sort", "spec",
+	"sync", "term", "text", "tier", "week", "year", "test", "prod",
+	// 3 char words
+	"add", "get", "set", "new", "old", "all", "any", "key", "log",
+	"net", "pix", "tax", "fee", "ref", "max", "min", "sum", "avg",
+	"day", "end", "row", "col", "seq", "msg", "err", "req",
+	// 2 char words (last)
+	"id", "to", "by", "of", "in", "on", "at", "is", "as", "or", "st",
+}
+
+// splitAllCapsIdentifier attempts to split an ALL_CAPS identifier into PascalCase
+// using known words. Returns empty string if splitting fails.
+// Example: "TRANSFEREVENTNOTE" → "TransferEventNote"
+func splitAllCapsIdentifier(s string) string {
+	if len(s) == 0 {
+		return ""
+	}
+	
+	lower := strings.ToLower(s)
+	var result strings.Builder
+	
+	for len(lower) > 0 {
+		matched := false
+		
+		// Try to match known words (longest first due to ordering)
+		for _, word := range knownWords {
+			if strings.HasPrefix(lower, word) {
+				// Found a match - capitalize first letter
+				result.WriteString(strings.ToUpper(word[:1]) + word[1:])
+				lower = lower[len(word):]
+				matched = true
+				break
+			}
+		}
+		
+		if !matched {
+			// No known word matched - check if remaining is very short
+			if len(lower) <= 2 {
+				// Just capitalize what's left (likely an abbreviation like "Id")
+				result.WriteString(strings.ToUpper(lower[:1]) + lower[1:])
+				lower = ""
+			} else {
+				// Can't split this identifier reliably
+				return ""
+			}
+		}
+	}
+	
+	return result.String()
+}
+
+// isAllCapsOrUnderscored returns true if the string is ALL_CAPS or ALL_CAPS_WITH_UNDERSCORES.
+// This helps detect T-SQL naming conventions like ST_ADD_NOTIFICATION that need
+// special handling for PascalCase conversion.
+func isAllCapsOrUnderscored(s string) bool {
+	if len(s) == 0 {
+		return false
+	}
+	hasLetter := false
+	for _, c := range s {
+		if c >= 'a' && c <= 'z' {
+			return false // Has lowercase, not ALL_CAPS
+		}
+		if c >= 'A' && c <= 'Z' {
+			hasLetter = true
+		}
+	}
+	return hasLetter // Must have at least one letter
+}
+
 func singularize(s string) string {
-	s = strings.ToLower(s)
-	if strings.HasSuffix(s, "ies") {
+	lower := strings.ToLower(s)
+	
+	// Check suffix patterns (case-insensitive) but preserve original casing
+	if strings.HasSuffix(lower, "ies") {
 		return s[:len(s)-3] + "y"
 	}
-	if strings.HasSuffix(s, "es") {
+	if strings.HasSuffix(lower, "es") {
 		return s[:len(s)-2]
 	}
-	if strings.HasSuffix(s, "s") && !strings.HasSuffix(s, "ss") {
+	if strings.HasSuffix(lower, "s") && !strings.HasSuffix(lower, "ss") {
 		return s[:len(s)-1]
 	}
 	return s
 }
 
 func pluralize(s string) string {
-	s = strings.ToLower(s)
-	if strings.HasSuffix(s, "y") && len(s) > 1 {
+	lower := strings.ToLower(s)
+	
+	// If already looks plural (ends in 's' but not 'ss', 'us', 'is'), return as-is
+	// This handles cases like "Attributes" → "Attributes" (not "Attributeses")
+	if strings.HasSuffix(lower, "s") && !strings.HasSuffix(lower, "ss") &&
+		!strings.HasSuffix(lower, "us") && !strings.HasSuffix(lower, "is") {
+		return s
+	}
+	
+	if strings.HasSuffix(lower, "y") && len(s) > 1 {
 		// Check if preceded by consonant
-		prev := s[len(s)-2]
+		prev := lower[len(lower)-2]
 		if prev != 'a' && prev != 'e' && prev != 'i' && prev != 'o' && prev != 'u' {
 			return s[:len(s)-1] + "ies"
 		}
 	}
-	if strings.HasSuffix(s, "s") || strings.HasSuffix(s, "x") ||
-		strings.HasSuffix(s, "z") || strings.HasSuffix(s, "ch") ||
-		strings.HasSuffix(s, "sh") {
+	if strings.HasSuffix(lower, "x") || strings.HasSuffix(lower, "z") ||
+		strings.HasSuffix(lower, "ch") || strings.HasSuffix(lower, "sh") ||
+		strings.HasSuffix(lower, "ss") {
 		return s + "es"
 	}
 	return s + "s"
@@ -2445,6 +3622,12 @@ func (dt *dmlTranspiler) transpileCreateTempTable(s *ast.CreateTableStatement) (
 	
 	tableName := s.Name.String()
 	var out strings.Builder
+	
+	// Add TODO marker if requested
+	if dt.emitTODOs() {
+		out.WriteString("// TODO(tgpiler): Temp table uses in-memory tsqlruntime.TempTables - verify initialisation\n")
+		out.WriteString(dt.indentStr())
+	}
 	
 	// Generate column definitions
 	out.WriteString("// CREATE TABLE " + tableName + "\n")

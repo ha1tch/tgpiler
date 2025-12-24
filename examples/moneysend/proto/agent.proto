@@ -1,0 +1,296 @@
+syntax = "proto3";
+
+package moneysend.agent.v1;
+
+option go_package = "github.com/ha1tch/moneysend/proto/agent/v1;agentv1";
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/wrappers.proto";
+
+// AgentService handles internal staff management and activity tracking
+service AgentService {
+  // Agent Management
+  rpc CreateAgent(CreateAgentRequest) returns (CreateAgentResponse);
+  rpc GetAgentById(GetAgentByIdRequest) returns (GetAgentResponse);
+  rpc GetAgentByEmployeeId(GetAgentByEmployeeIdRequest) returns (GetAgentResponse);
+  rpc UpdateAgent(UpdateAgentRequest) returns (UpdateAgentResponse);
+  rpc UpdateAgentPermissions(UpdateAgentPermissionsRequest) returns (UpdateAgentPermissionsResponse);
+  rpc SuspendAgent(SuspendAgentRequest) returns (SuspendAgentResponse);
+  rpc ReactivateAgent(ReactivateAgentRequest) returns (ReactivateAgentResponse);
+  rpc ListAgents(ListAgentsRequest) returns (ListAgentsResponse);
+  
+  // Authentication & Activity
+  rpc RecordAgentLogin(RecordAgentLoginRequest) returns (RecordAgentLoginResponse);
+  rpc LogAgentActivity(LogAgentActivityRequest) returns (LogAgentActivityResponse);
+  rpc GetAgentActivityLog(GetAgentActivityLogRequest) returns (GetAgentActivityLogResponse);
+  
+  // Permissions & Performance
+  rpc CheckAgentPermission(CheckAgentPermissionRequest) returns (CheckAgentPermissionResponse);
+  rpc GetAgentsByPermission(GetAgentsByPermissionRequest) returns (ListAgentsResponse);
+  rpc GetAgentPerformanceStats(GetAgentPerformanceStatsRequest) returns (GetAgentPerformanceStatsResponse);
+  rpc GetAgentWorkload(GetAgentWorkloadRequest) returns (GetAgentWorkloadResponse);
+}
+
+// Enums
+enum AgentRole {
+  AGENT_ROLE_UNSPECIFIED = 0;
+  AGENT_ROLE_AGENT = 1;
+  AGENT_ROLE_SUPERVISOR = 2;
+  AGENT_ROLE_COMPLIANCE_OFFICER = 3;
+  AGENT_ROLE_ADMIN = 4;
+}
+
+enum AgentStatus {
+  AGENT_STATUS_UNSPECIFIED = 0;
+  AGENT_STATUS_ACTIVE = 1;
+  AGENT_STATUS_SUSPENDED = 2;
+}
+
+enum Permission {
+  PERMISSION_UNSPECIFIED = 0;
+  PERMISSION_REVIEW_KYC = 1;
+  PERMISSION_APPROVE_TRANSFERS = 2;
+  PERMISSION_MANAGE_CUSTOMERS = 3;
+  PERMISSION_FILE_SARS = 4;
+  PERMISSION_MANAGE_PARTNERS = 5;
+  PERMISSION_VIEW_REPORTS = 6;
+}
+
+// Core Messages
+message Agent {
+  int32 agent_id = 1;
+  string employee_id = 2;
+  string email = 3;
+  string first_name = 4;
+  string last_name = 5;
+  AgentRole role = 6;
+  string department = 7;
+  AgentPermissions permissions = 8;
+  AgentStatus status = 9;
+  google.protobuf.Timestamp created_at = 10;
+  google.protobuf.Timestamp last_login_at = 11;
+}
+
+message AgentSummary {
+  int32 agent_id = 1;
+  string employee_id = 2;
+  string email = 3;
+  string first_name = 4;
+  string last_name = 5;
+  AgentRole role = 6;
+  string department = 7;
+  AgentStatus status = 8;
+  google.protobuf.Timestamp created_at = 9;
+  google.protobuf.Timestamp last_login_at = 10;
+}
+
+message AgentPermissions {
+  bool can_review_kyc = 1;
+  bool can_approve_transfers = 2;
+  bool can_manage_customers = 3;
+  bool can_file_sars = 4;
+  bool can_manage_partners = 5;
+  bool can_view_reports = 6;
+}
+
+message AgentActivityLogEntry {
+  int64 log_id = 1;
+  int32 agent_id = 2;
+  string employee_id = 3;
+  string agent_name = 4;
+  string activity_type = 5;
+  string entity_type = 6;
+  int64 entity_id = 7;
+  string description = 8;
+  string ip_address = 9;
+  google.protobuf.Timestamp logged_at = 10;
+}
+
+message KYCReviewStats {
+  int32 total_documents_reviewed = 1;
+  int32 approved = 2;
+  int32 rejected = 3;
+  double avg_review_minutes = 4;
+}
+
+message TransferReviewStats {
+  int32 total_transfers_reviewed = 1;
+  int32 cleared = 2;
+  int32 blocked = 3;
+}
+
+message ScreeningResolutionStats {
+  int32 total_screenings_resolved = 1;
+  int32 true_positives = 2;
+  int32 false_positives = 3;
+}
+
+message ActivityTypeSummary {
+  string activity_type = 1;
+  int32 count = 2;
+}
+
+message AgentWorkloadEntry {
+  int32 agent_id = 1;
+  string employee_id = 2;
+  string agent_name = 3;
+  AgentRole role = 4;
+  int32 pending_kyc_documents = 5;
+  int32 flagged_transfers = 6;
+  int32 pending_screenings = 7;
+}
+
+// Request/Response Messages
+message CreateAgentRequest {
+  string employee_id = 1;
+  string email = 2;
+  string first_name = 3;
+  string last_name = 4;
+  AgentRole role = 5;
+  string department = 6;
+}
+
+message CreateAgentResponse {
+  bool success = 1;
+  string error_code = 2;
+  int32 agent_id = 3;
+}
+
+message GetAgentByIdRequest {
+  int32 agent_id = 1;
+}
+
+message GetAgentByEmployeeIdRequest {
+  string employee_id = 1;
+}
+
+message GetAgentResponse {
+  Agent agent = 1;
+}
+
+message UpdateAgentRequest {
+  int32 agent_id = 1;
+  google.protobuf.StringValue first_name = 2;
+  google.protobuf.StringValue last_name = 3;
+  AgentRole role = 4;
+  google.protobuf.StringValue department = 5;
+}
+
+message UpdateAgentResponse {
+  bool success = 1;
+  string error_code = 2;
+}
+
+message UpdateAgentPermissionsRequest {
+  int32 agent_id = 1;
+  google.protobuf.BoolValue can_review_kyc = 2;
+  google.protobuf.BoolValue can_approve_transfers = 3;
+  google.protobuf.BoolValue can_manage_customers = 4;
+  google.protobuf.BoolValue can_file_sars = 5;
+  google.protobuf.BoolValue can_manage_partners = 6;
+  google.protobuf.BoolValue can_view_reports = 7;
+  string updated_by = 8;
+}
+
+message UpdateAgentPermissionsResponse {
+  bool success = 1;
+}
+
+message SuspendAgentRequest {
+  int32 agent_id = 1;
+  string suspended_by = 2;
+}
+
+message SuspendAgentResponse {
+  bool success = 1;
+}
+
+message ReactivateAgentRequest {
+  int32 agent_id = 1;
+  string reactivated_by = 2;
+}
+
+message ReactivateAgentResponse {
+  bool success = 1;
+}
+
+message ListAgentsRequest {
+  AgentRole role = 1;
+  string department = 2;
+  AgentStatus status = 3;
+}
+
+message ListAgentsResponse {
+  repeated AgentSummary agents = 1;
+}
+
+message RecordAgentLoginRequest {
+  string employee_id = 1;
+  string ip_address = 2;
+}
+
+message RecordAgentLoginResponse {
+  bool success = 1;
+  string error_code = 2;
+  int32 agent_id = 3;
+}
+
+message LogAgentActivityRequest {
+  int32 agent_id = 1;
+  string activity_type = 2;
+  string entity_type = 3;
+  int64 entity_id = 4;
+  string description = 5;
+  string ip_address = 6;
+}
+
+message LogAgentActivityResponse {
+  bool success = 1;
+  int64 log_id = 2;
+}
+
+message GetAgentActivityLogRequest {
+  int32 agent_id = 1;
+  string activity_type = 2;
+  google.protobuf.Timestamp start_date = 3;
+  google.protobuf.Timestamp end_date = 4;
+  int32 page_number = 5;
+  int32 page_size = 6;
+}
+
+message GetAgentActivityLogResponse {
+  repeated AgentActivityLogEntry entries = 1;
+  int32 total_count = 2;
+}
+
+message CheckAgentPermissionRequest {
+  string employee_id = 1;
+  Permission permission = 2;
+}
+
+message CheckAgentPermissionResponse {
+  bool has_permission = 1;
+}
+
+message GetAgentsByPermissionRequest {
+  Permission permission = 1;
+}
+
+message GetAgentPerformanceStatsRequest {
+  int32 agent_id = 1;
+  string start_date = 2;
+  string end_date = 3;
+}
+
+message GetAgentPerformanceStatsResponse {
+  KYCReviewStats kyc_reviews = 1;
+  TransferReviewStats transfer_reviews = 2;
+  ScreeningResolutionStats screening_resolutions = 3;
+  repeated ActivityTypeSummary activity_summary = 4;
+}
+
+message GetAgentWorkloadRequest {}
+
+message GetAgentWorkloadResponse {
+  repeated AgentWorkloadEntry agents = 1;
+}

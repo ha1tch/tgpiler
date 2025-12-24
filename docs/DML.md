@@ -74,6 +74,40 @@ config := transpiler.DMLConfig{
 }
 ```
 
+### Fallback Backend for Temp Tables
+
+When using `--backend=grpc` or `--backend=mock`, temp table operations (`#tableName`) cannot be meaningfully converted to service calls. The `--fallback-backend` flag specifies how to handle these:
+
+```bash
+# Temp tables use SQL, regular tables use gRPC
+tgpiler --dml --backend=grpc --grpc-package=orderpb --fallback-backend=sql input.sql
+
+# Default: fallback-backend=sql when not specified
+tgpiler --dml --backend=grpc --grpc-package=orderpb input.sql
+# Shows: info: Temp tables detected (#tmpTable) with --grpc backend. Using --fallback-backend=sql (default).
+```
+
+**CLI Options:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--fallback-backend` | `sql` | Backend for temp table operations: `sql`, `mock` |
+
+**Generated Code Example:**
+
+```go
+// Regular table → gRPC
+resp, err := r.db.GetOrderByOrderId(ctx, &orderpb.GetOrderByOrderIdRequest{
+    OrderId: orderId,
+})
+
+// Temp table → SQL fallback
+result, err := r.db.ExecContext(ctx, 
+    "INSERT INTO #TempResults SELECT OrderId, Total FROM Orders WHERE CustomerId = $1",
+    customerId)
+```
+```
+
 ## SQL Dialects
 
 tgpiler adapts generated SQL to the target dialect:

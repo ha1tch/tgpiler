@@ -1,0 +1,460 @@
+syntax = "proto3";
+
+package moneysend.beneficiary.v1;
+
+option go_package = "github.com/ha1tch/moneysend/proto/beneficiary/v1;beneficiaryv1";
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/wrappers.proto";
+
+// BeneficiaryService handles recipient management and payout destinations
+service BeneficiaryService {
+  // Beneficiary CRUD
+  rpc CreateBeneficiary(CreateBeneficiaryRequest) returns (CreateBeneficiaryResponse);
+  rpc GetBeneficiaryById(GetBeneficiaryByIdRequest) returns (GetBeneficiaryResponse);
+  rpc GetBeneficiaryByExternalId(GetBeneficiaryByExternalIdRequest) returns (GetBeneficiaryResponse);
+  rpc UpdateBeneficiary(UpdateBeneficiaryRequest) returns (UpdateBeneficiaryResponse);
+  rpc DeactivateBeneficiary(DeactivateBeneficiaryRequest) returns (DeactivateBeneficiaryResponse);
+  rpc ReactivateBeneficiary(ReactivateBeneficiaryRequest) returns (ReactivateBeneficiaryResponse);
+  rpc SetFavoriteBeneficiary(SetFavoriteBeneficiaryRequest) returns (SetFavoriteBeneficiaryResponse);
+  rpc ListBeneficiariesByCustomer(ListBeneficiariesByCustomerRequest) returns (ListBeneficiariesResponse);
+  rpc SearchBeneficiaries(SearchBeneficiariesRequest) returns (SearchBeneficiariesResponse);
+  
+  // Bank Accounts
+  rpc AddBeneficiaryBankAccount(AddBeneficiaryBankAccountRequest) returns (AddBeneficiaryBankAccountResponse);
+  rpc UpdateBeneficiaryBankAccount(UpdateBeneficiaryBankAccountRequest) returns (UpdateBeneficiaryBankAccountResponse);
+  rpc RemoveBeneficiaryBankAccount(RemoveBeneficiaryBankAccountRequest) returns (RemoveBeneficiaryBankAccountResponse);
+  rpc SetPrimaryBankAccount(SetPrimaryBankAccountRequest) returns (SetPrimaryBankAccountResponse);
+  rpc GetBankAccountsByBeneficiary(GetBankAccountsByBeneficiaryRequest) returns (GetBankAccountsResponse);
+  
+  // Mobile Wallets
+  rpc AddBeneficiaryMobileWallet(AddBeneficiaryMobileWalletRequest) returns (AddBeneficiaryMobileWalletResponse);
+  rpc RemoveBeneficiaryMobileWallet(RemoveBeneficiaryMobileWalletRequest) returns (RemoveBeneficiaryMobileWalletResponse);
+  rpc GetMobileWalletsByBeneficiary(GetMobileWalletsByBeneficiaryRequest) returns (GetMobileWalletsResponse);
+  
+  // Screening
+  rpc ScreenBeneficiary(ScreenBeneficiaryRequest) returns (ScreenBeneficiaryResponse);
+  rpc GetBeneficiaryScreeningStatus(GetBeneficiaryScreeningStatusRequest) returns (GetBeneficiaryScreeningStatusResponse);
+  rpc ListFlaggedBeneficiaries(ListFlaggedBeneficiariesRequest) returns (ListFlaggedBeneficiariesResponse);
+  rpc BlockBeneficiary(BlockBeneficiaryRequest) returns (BlockBeneficiaryResponse);
+  rpc UnblockBeneficiary(UnblockBeneficiaryRequest) returns (UnblockBeneficiaryResponse);
+}
+
+// Enums
+enum ScreeningStatus {
+  SCREENING_STATUS_UNSPECIFIED = 0;
+  SCREENING_STATUS_PENDING = 1;
+  SCREENING_STATUS_CLEARED = 2;
+  SCREENING_STATUS_FLAGGED = 3;
+  SCREENING_STATUS_BLOCKED = 4;
+}
+
+enum PayoutMethod {
+  PAYOUT_METHOD_UNSPECIFIED = 0;
+  PAYOUT_METHOD_BANK_DEPOSIT = 1;
+  PAYOUT_METHOD_CASH_PICKUP = 2;
+  PAYOUT_METHOD_MOBILE_WALLET = 3;
+  PAYOUT_METHOD_HOME_DELIVERY = 4;
+}
+
+enum AccountType {
+  ACCOUNT_TYPE_UNSPECIFIED = 0;
+  ACCOUNT_TYPE_SAVINGS = 1;
+  ACCOUNT_TYPE_CHECKING = 2;
+  ACCOUNT_TYPE_CURRENT = 3;
+}
+
+enum Relationship {
+  RELATIONSHIP_UNSPECIFIED = 0;
+  RELATIONSHIP_FAMILY = 1;
+  RELATIONSHIP_FRIEND = 2;
+  RELATIONSHIP_BUSINESS = 3;
+  RELATIONSHIP_SELF = 4;
+  RELATIONSHIP_OTHER = 5;
+}
+
+// Core Messages
+message Beneficiary {
+  int64 beneficiary_id = 1;
+  string external_id = 2;
+  int64 customer_id = 3;
+  string first_name = 4;
+  string middle_name = 5;
+  string last_name = 6;
+  Relationship relationship = 7;
+  string email = 8;
+  string phone_number = 9;
+  string country = 10;
+  string city = 11;
+  string address_line1 = 12;
+  string address_line2 = 13;
+  string state_province = 14;
+  string postal_code = 15;
+  PayoutMethod preferred_payout_method = 16;
+  ScreeningStatus screening_status = 17;
+  google.protobuf.Timestamp last_screened_at = 18;
+  bool is_active = 19;
+  bool is_favorite = 20;
+  google.protobuf.Timestamp created_at = 21;
+  google.protobuf.Timestamp updated_at = 22;
+}
+
+message BeneficiarySummary {
+  int64 beneficiary_id = 1;
+  string external_id = 2;
+  string first_name = 3;
+  string middle_name = 4;
+  string last_name = 5;
+  Relationship relationship = 6;
+  string country = 7;
+  string city = 8;
+  PayoutMethod preferred_payout_method = 9;
+  ScreeningStatus screening_status = 10;
+  bool is_active = 11;
+  bool is_favorite = 12;
+  google.protobuf.Timestamp created_at = 13;
+  int32 transfer_count = 14;
+}
+
+message BankAccount {
+  int64 bank_account_id = 1;
+  int64 beneficiary_id = 2;
+  string bank_name = 3;
+  string bank_code = 4;
+  string branch_code = 5;
+  string account_number = 6;
+  AccountType account_type = 7;
+  string currency = 8;
+  string iban = 9;
+  string routing_number = 10;
+  string clabe = 11;
+  string ifsc = 12;
+  string account_holder_name = 13;
+  bool is_verified = 14;
+  google.protobuf.Timestamp verified_at = 15;
+  bool is_active = 16;
+  bool is_primary = 17;
+  google.protobuf.Timestamp created_at = 18;
+}
+
+message MobileWallet {
+  int64 wallet_id = 1;
+  int64 beneficiary_id = 2;
+  string provider_code = 3;
+  string wallet_number = 4;
+  string wallet_holder_name = 5;
+  string currency = 6;
+  bool is_active = 7;
+  bool is_primary = 8;
+  google.protobuf.Timestamp created_at = 9;
+}
+
+message ScreeningResult {
+  int64 screening_id = 1;
+  string screening_type = 2;
+  string screening_provider = 3;
+  string result = 4;
+  double match_score = 5;
+  string match_details = 6;
+  string resolution_status = 7;
+  string resolved_by = 8;
+  google.protobuf.Timestamp resolved_at = 9;
+  google.protobuf.Timestamp screened_at = 10;
+}
+
+// Request/Response Messages
+message CreateBeneficiaryRequest {
+  int64 customer_id = 1;
+  string first_name = 2;
+  string last_name = 3;
+  string middle_name = 4;
+  Relationship relationship = 5;
+  string email = 6;
+  string phone_number = 7;
+  string country = 8;
+  string city = 9;
+  string address_line1 = 10;
+  string address_line2 = 11;
+  string state_province = 12;
+  string postal_code = 13;
+  PayoutMethod preferred_payout_method = 14;
+}
+
+message CreateBeneficiaryResponse {
+  bool success = 1;
+  string error_code = 2;
+  string error_message = 3;
+  int64 beneficiary_id = 4;
+  string external_id = 5;
+}
+
+message GetBeneficiaryByIdRequest {
+  int64 beneficiary_id = 1;
+}
+
+message GetBeneficiaryByExternalIdRequest {
+  string external_id = 1;
+}
+
+message GetBeneficiaryResponse {
+  Beneficiary beneficiary = 1;
+}
+
+message UpdateBeneficiaryRequest {
+  int64 beneficiary_id = 1;
+  int64 customer_id = 2;
+  google.protobuf.StringValue first_name = 3;
+  google.protobuf.StringValue last_name = 4;
+  google.protobuf.StringValue middle_name = 5;
+  Relationship relationship = 6;
+  google.protobuf.StringValue email = 7;
+  google.protobuf.StringValue phone_number = 8;
+  google.protobuf.StringValue city = 9;
+  google.protobuf.StringValue address_line1 = 10;
+  google.protobuf.StringValue address_line2 = 11;
+  google.protobuf.StringValue state_province = 12;
+  google.protobuf.StringValue postal_code = 13;
+}
+
+message UpdateBeneficiaryResponse {
+  bool success = 1;
+  string error_code = 2;
+  string error_message = 3;
+}
+
+message DeactivateBeneficiaryRequest {
+  int64 beneficiary_id = 1;
+  int64 customer_id = 2;
+}
+
+message DeactivateBeneficiaryResponse {
+  bool success = 1;
+  string error_code = 2;
+}
+
+message ReactivateBeneficiaryRequest {
+  int64 beneficiary_id = 1;
+  int64 customer_id = 2;
+}
+
+message ReactivateBeneficiaryResponse {
+  bool success = 1;
+  string error_code = 2;
+}
+
+message SetFavoriteBeneficiaryRequest {
+  int64 beneficiary_id = 1;
+  int64 customer_id = 2;
+  bool is_favorite = 3;
+}
+
+message SetFavoriteBeneficiaryResponse {
+  bool success = 1;
+  string error_code = 2;
+}
+
+message ListBeneficiariesByCustomerRequest {
+  int64 customer_id = 1;
+  bool include_inactive = 2;
+}
+
+message ListBeneficiariesResponse {
+  repeated BeneficiarySummary beneficiaries = 1;
+}
+
+message SearchBeneficiariesRequest {
+  string search_term = 1;
+  string country = 2;
+  ScreeningStatus screening_status = 3;
+  int32 page_number = 4;
+  int32 page_size = 5;
+}
+
+message SearchBeneficiariesResponse {
+  repeated BeneficiarySearchResult beneficiaries = 1;
+  int32 total_count = 2;
+}
+
+message BeneficiarySearchResult {
+  int64 beneficiary_id = 1;
+  string external_id = 2;
+  int64 customer_id = 3;
+  string first_name = 4;
+  string last_name = 5;
+  string country = 6;
+  ScreeningStatus screening_status = 7;
+  bool is_active = 8;
+  google.protobuf.Timestamp created_at = 9;
+  string customer_email = 10;
+  string customer_first_name = 11;
+  string customer_last_name = 12;
+}
+
+// Bank Account Messages
+message AddBeneficiaryBankAccountRequest {
+  int64 beneficiary_id = 1;
+  string bank_name = 2;
+  string bank_code = 3;
+  string branch_code = 4;
+  string account_number = 5;
+  AccountType account_type = 6;
+  string currency = 7;
+  string iban = 8;
+  string routing_number = 9;
+  string clabe = 10;
+  string ifsc = 11;
+  string account_holder_name = 12;
+  bool set_as_primary = 13;
+}
+
+message AddBeneficiaryBankAccountResponse {
+  bool success = 1;
+  string error_code = 2;
+  int64 bank_account_id = 3;
+}
+
+message UpdateBeneficiaryBankAccountRequest {
+  int64 bank_account_id = 1;
+  google.protobuf.StringValue bank_name = 2;
+  google.protobuf.StringValue bank_code = 3;
+  google.protobuf.StringValue branch_code = 4;
+  google.protobuf.StringValue account_number = 5;
+  google.protobuf.StringValue account_holder_name = 6;
+}
+
+message UpdateBeneficiaryBankAccountResponse {
+  bool success = 1;
+  string error_code = 2;
+}
+
+message RemoveBeneficiaryBankAccountRequest {
+  int64 bank_account_id = 1;
+}
+
+message RemoveBeneficiaryBankAccountResponse {
+  bool success = 1;
+  string error_code = 2;
+}
+
+message SetPrimaryBankAccountRequest {
+  int64 bank_account_id = 1;
+}
+
+message SetPrimaryBankAccountResponse {
+  bool success = 1;
+  string error_code = 2;
+}
+
+message GetBankAccountsByBeneficiaryRequest {
+  int64 beneficiary_id = 1;
+}
+
+message GetBankAccountsResponse {
+  repeated BankAccount bank_accounts = 1;
+}
+
+// Mobile Wallet Messages
+message AddBeneficiaryMobileWalletRequest {
+  int64 beneficiary_id = 1;
+  string provider_code = 2;
+  string wallet_number = 3;
+  string wallet_holder_name = 4;
+  string currency = 5;
+  bool set_as_primary = 6;
+}
+
+message AddBeneficiaryMobileWalletResponse {
+  bool success = 1;
+  string error_code = 2;
+  int64 wallet_id = 3;
+}
+
+message RemoveBeneficiaryMobileWalletRequest {
+  int64 wallet_id = 1;
+}
+
+message RemoveBeneficiaryMobileWalletResponse {
+  bool success = 1;
+  string error_code = 2;
+}
+
+message GetMobileWalletsByBeneficiaryRequest {
+  int64 beneficiary_id = 1;
+}
+
+message GetMobileWalletsResponse {
+  repeated MobileWallet mobile_wallets = 1;
+}
+
+// Screening Messages
+message ScreenBeneficiaryRequest {
+  int64 beneficiary_id = 1;
+  string screening_provider = 2;
+  string screened_by = 3;
+}
+
+message ScreenBeneficiaryResponse {
+  bool success = 1;
+  string error_code = 2;
+  string screening_result = 3;
+  double match_score = 4;
+}
+
+message GetBeneficiaryScreeningStatusRequest {
+  int64 beneficiary_id = 1;
+}
+
+message GetBeneficiaryScreeningStatusResponse {
+  int64 beneficiary_id = 1;
+  string first_name = 2;
+  string last_name = 3;
+  string country = 4;
+  ScreeningStatus screening_status = 5;
+  google.protobuf.Timestamp last_screened_at = 6;
+  repeated ScreeningResult screening_history = 7;
+}
+
+message ListFlaggedBeneficiariesRequest {
+  int32 page_number = 1;
+  int32 page_size = 2;
+}
+
+message ListFlaggedBeneficiariesResponse {
+  repeated FlaggedBeneficiary beneficiaries = 1;
+  int32 total_count = 2;
+}
+
+message FlaggedBeneficiary {
+  int64 beneficiary_id = 1;
+  string first_name = 2;
+  string last_name = 3;
+  string country = 4;
+  ScreeningStatus screening_status = 5;
+  google.protobuf.Timestamp last_screened_at = 6;
+  int64 customer_id = 7;
+  string customer_email = 8;
+  string customer_first_name = 9;
+  string customer_last_name = 10;
+  double match_score = 11;
+  string lists_matched = 12;
+}
+
+message BlockBeneficiaryRequest {
+  int64 beneficiary_id = 1;
+  string reason = 2;
+  string blocked_by = 3;
+}
+
+message BlockBeneficiaryResponse {
+  bool success = 1;
+}
+
+message UnblockBeneficiaryRequest {
+  int64 beneficiary_id = 1;
+  string reason = 2;
+  string unblocked_by = 3;
+}
+
+message UnblockBeneficiaryResponse {
+  bool success = 1;
+}

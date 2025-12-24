@@ -65,6 +65,80 @@ tgpiler --dml --backend=inline input.sql
 | `--grpc-package <path>` | (none) | Import path for generated gRPC package |
 | `--mock-store <var>` | `store` | Variable name for mock store |
 
+### gRPC Mapping Options
+
+These flags enable fine-grained control over how DML statements and EXEC calls are mapped to gRPC methods:
+
+| Flag | Format | Description |
+|------|--------|-------------|
+| `--table-service <map>` | `Table:Service,Table:Service` | Maps tables to owning services |
+| `--table-client <map>` | `Table:clientVar,Table:clientVar` | Maps tables to client variable names |
+| `--grpc-mappings <map>` | `proc:Service.Method,proc:Method` | Explicit procedure-to-method mappings |
+
+**Example: Multi-service architecture**
+
+```bash
+# Map tables to their owning services and clients
+tgpiler --dml --backend=grpc --grpc-package=pb \
+  --table-service="Products:CatalogService,Orders:OrderService,Users:UserService" \
+  --table-client="Products:catalogClient,Orders:orderClient,Users:userClient" \
+  order_processing.sql
+```
+
+This generates code where:
+- `SELECT ... FROM Products` → `catalogClient.GetProduct(...)`
+- `UPDATE Orders SET ...` → `orderClient.UpdateOrder(...)`
+- `INSERT INTO Users ...` → `userClient.CreateUser(...)`
+
+**Example: Explicit procedure mapping**
+
+```bash
+# Map specific procedures to gRPC methods
+tgpiler --dml --backend=grpc --grpc-package=orderpb \
+  --grpc-mappings="usp_ValidateOrder:OrderService.ValidateOrder,usp_CalculateTotal:OrderService.CalculateTotal" \
+  input.sql
+```
+
+When the transpiler encounters `EXEC usp_ValidateOrder @OrderId`, it generates:
+```go
+resp, err := orderServiceClient.ValidateOrder(ctx, &orderpb.ValidateOrderRequest{
+    OrderId: orderId,
+})
+```
+
+### Automatic Proto Package Inference
+
+When using `--table-service` without an explicit `--grpc-package`, tgpiler automatically infers the proto package from the service name:
+
+| Service Name | Inferred Package |
+|--------------|------------------|
+| `CatalogService` | `catalogpb` |
+| `OrderService` | `orderpb` |
+| `UserAccountService` | `useraccountpb` |
+| `PaymentAPI` | `paymentpb` |
+| `InventorySvc` | `inventorypb` |
+
+**Example:**
+
+```bash
+# No explicit --grpc-package needed - inferred from service name
+tgpiler --dml --backend=grpc \
+  --table-service="Products:CatalogService,Orders:OrderService" \
+  input.sql
+```
+
+For a query on the `Products` table, this generates:
+```go
+resp, err := catalogServiceClient.GetProduct(ctx, &catalogpb.GetProductRequest{
+    ProductId: productId,
+})
+```
+
+The inference follows this logic:
+1. Remove common suffixes: `Service`, `Svc`, `API`, `Api`
+2. Convert to lowercase
+3. Append `pb` suffix
+
 ### Proto Generation Commands
 
 Generate code from `.proto` files:
@@ -383,15 +457,58 @@ CREATE PROCEDURE usp_GetProductById @ProductId BIGINT
 
 ### 4. Verb-Entity Strategy
 
-Matches HTTP verb patterns:
+Matches HTTP verb patterns and business process verbs:
+
+#### CRUD Verbs
 
 | Proto Verb | SQL Verb Patterns |
 |------------|-------------------|
 | `Get`, `Read`, `Fetch` | SELECT single row |
 | `List`, `Search`, `Find` | SELECT multiple rows |
-| `Create`, `Add`, `Insert` | INSERT |
-| `Update`, `Modify`, `Edit` | UPDATE |
-| `Delete`, `Remove`, `Drop` | DELETE |
+| `Create`, `Add`, `Insert`, `Register` | INSERT |
+| `Update`, `Modify`, `Edit`, `Patch` | UPDATE |
+| `Delete`, `Remove`, `Drop`, `Purge` | DELETE |
+
+#### Business Process Verbs
+
+tgpiler recognises domain-specific verbs commonly found in enterprise applications:
+
+| Verb Category | Recognised Verbs | Typical Use Case |
+|---------------|------------------|------------------|
+| **Approval** | `Approve`, `Reject`, `Deny`, `Grant`, `Permit` | Workflow approvals |
+| **Certification** | `Certify`, `Attest`, `Endorse`, `Accredit`, `License` | Compliance, credentials |
+| **Review** | `Review`, `Assess`, `Evaluate`, `Inspect`, `Audit`, `Examine` | Quality control, audits |
+| **Escalation** | `Escalate`, `Delegate`, `Reassign`, `Refer`, `Transfer` | Workflow routing |
+| **Lifecycle** | `Suspend`, `Resume`, `Activate`, `Deactivate`, `Complete`, `Finalize` | State transitions |
+| **Cancellation** | `Cancel`, `Abort`, `Revoke`, `Void`, `Terminate` | Transaction rollback |
+| **Acknowledgment** | `Acknowledge`, `Sign`, `Countersign`, `Seal` | Document signing |
+| **Communication** | `Notify`, `Alert`, `Broadcast`, `Publish`, `Remind` | Notifications |
+| **Validation** | `Validate`, `Verify`, `Check`, `Confirm` | Data validation |
+| **Calculation** | `Calculate`, `Compute`, `Estimate`, `Forecast` | Business calculations |
+
+#### Verb Detection in DML
+
+When transpiling UPDATE statements, tgpiler analyses column names and values to infer the appropriate verb:
+
+```sql
+-- Input: UPDATE with ApprovalStatus column
+UPDATE Orders SET ApprovalStatus = 'Approved', ApprovedAt = GETDATE()
+WHERE OrderId = @OrderId
+```
+
+```go
+// Output: Detected "Approve" verb from column/value names
+resp, err := orderClient.ApproveOrder(ctx, &orderpb.ApproveOrderRequest{
+    ApprovalStatus: "Approved",
+    ApprovedAt:     time.Now(),
+    OrderId:        orderId,
+})
+```
+
+This works by scanning for verb patterns in:
+- Column names (e.g., `ApprovalStatus`, `CertificationDate`, `SuspendedUntil`)
+- Value literals (e.g., `'Approved'`, `'Rejected'`, `'Suspended'`)
+- Parameter names (e.g., `@CertifierId`, `@ApprovedBy`)
 
 ### Confidence Scoring
 
@@ -548,6 +665,102 @@ tgpiler --gen-server --proto-dir protos/ -p server -o all_servers.go
 | `bool` | `$n` (BOOLEAN) | `?` (TINYINT) | `@param` (BIT) |
 | `Timestamp` | `$n` (TIMESTAMP) | `?` (DATETIME) | `@param` (DATETIME2) |
 
+## Temp Table Handling
+
+When transpiling with `--backend=grpc`, temp tables (`#tableName`) present a semantic challenge: they're session-local scratch space, not domain entities. There's no `TmppixnetworkService` in your microservices architecture.
+
+### Fallback Backend
+
+tgpiler automatically routes temp table operations to a fallback backend:
+
+```bash
+# Temp tables use SQL, regular tables use gRPC
+tgpiler --dml --backend=grpc --grpc-package=orderpb input.sql
+
+# Explicit fallback to mock store
+tgpiler --dml --backend=grpc --grpc-package=orderpb --fallback-backend=mock input.sql
+```
+
+**Default behaviour**: When `--backend=grpc` or `--backend=mock` is specified without `--fallback-backend`, temp table operations automatically fall back to SQL. An informational message is shown:
+
+```
+info: Temp tables detected (#tmpPIXNetwork) with --grpc backend.
+      Using --fallback-backend=sql (default).
+      Use --fallback-backend to specify explicitly.
+```
+
+### Generated Code
+
+**Regular table (gRPC):**
+```go
+resp, err := r.db.GetTransferByClaimNumber(ctx, &orderpb.GetTransferByClaimNumberRequest{
+    ClaimNumber: claimNumber,
+})
+```
+
+**Temp table (SQL fallback):**
+```go
+result, err := r.db.ExecContext(ctx, 
+    "INSERT INTO #tmpPIXNetwork SELECT d.InstitutionRoleXrefId FROM Production.NetworkDetail AS d WHERE InstitutionRoleXrefNetworkId = $1",
+    institutionRoleXrefIdPixNetwork)
+```
+
+### EXISTS Expressions
+
+`EXISTS (SELECT ... FROM #tempTable ...)` also respects the fallback:
+
+```go
+// Temp table EXISTS → SQL
+exists := func() bool {
+    var count int
+    r.db.QueryRowContext(ctx, "SELECT 1 FROM #tmpPIXNetwork WHERE InstitutionRoleXrefPayerId = $1", payerId).Scan(&count)
+    return count > 0
+}()
+
+// Regular table EXISTS → gRPC
+exists := func() bool {
+    resp, err := r.db.GetCustomerByEmail(ctx, &customerpb.GetCustomerByEmailRequest{Email: email})
+    return err == nil && resp != nil
+}()
+```
+
+---
+
+## Naming Convention Improvements
+
+### ALL_CAPS Identifier Splitting
+
+T-SQL often uses ALL_CAPS table names. tgpiler splits these into PascalCase using a domain word dictionary:
+
+| Input | Output |
+|-------|--------|
+| `TRANSFEREVENTNOTE` | `TransferEventNote` |
+| `ORDERSTATUSHISTORY` | `OrderStatusHistory` |
+| `GLOBALATTRIBUTES` | `GlobalAttributes` |
+| `PAYMENTTYPE` | `PaymentType` |
+
+If word boundaries cannot be detected (e.g., organisation-specific terms), the identifier is lowercased and capitalised: `XYZABC` → `Xyzabc`.
+
+### Verb-Entity Collision Prevention
+
+When DML analysis detects a verb that matches the entity name, it falls back to the default verb:
+
+| Scenario | Without Fix | With Fix |
+|----------|-------------|----------|
+| UPDATE Transfer SET TransferStatusId = ... | `TransferTransfer` | `UpdateTransfer` |
+| UPDATE TransferAccounting SET ... | `TransferTransferAccounting` | `UpdateTransferAccounting` |
+
+### CamelCase Preservation
+
+Table names with existing CamelCase are preserved through singularize/pluralize:
+
+| Input | Singularize | Pluralize |
+|-------|-------------|-----------|
+| `OrderStatusHistory` | `OrderStatusHistory` | `OrderStatusHistories` |
+| `GlobalAttributes` | `GlobalAttributes` | `GlobalAttributes` (already plural) |
+
+---
+
 ## Limitations
 
 1. **Streaming RPCs** — Detected in proto but not fully generated
@@ -555,6 +768,7 @@ tgpiler --gen-server --proto-dir protos/ -p server -o all_servers.go
 3. **Dynamic SQL** — Cannot be statically analysed
 4. **Output cursors** — Not supported for gRPC mapping
 5. **XML/JSON returns** — May need custom mapping
+6. **ALL_CAPS without word boundaries** — Requires explicit `--grpc-mappings` override
 
 For unsupported patterns, the generator marks methods for manual implementation:
 

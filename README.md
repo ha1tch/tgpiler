@@ -86,6 +86,56 @@ cat input.sql | tgpiler -s
 tgpiler --dml -d ./sql -O ./go -p procedures
 ```
 
+## gRPC Backend
+
+tgpiler can transpile T-SQL stored procedures to gRPC client calls, enabling migration from database-centric architectures to horizontally-scalable microservices.
+
+### Backend Selection
+
+```bash
+# SQL backend (default) — generates database/sql calls
+tgpiler --dml --backend=sql input.sql
+
+# gRPC backend — generates gRPC client calls
+tgpiler --dml --backend=grpc --grpc-package=orderpb input.sql
+
+# Mock backend — generates mock store calls (for testing)
+tgpiler --dml --backend=mock input.sql
+```
+
+### The Four Actions
+
+For proto-based development, tgpiler provides four complementary actions:
+
+```bash
+# 1. Preview procedure-to-method mappings
+tgpiler --show-mappings --proto-dir ./protos --sql-dir ./procedures
+
+# 2. Generate repository implementations
+tgpiler --gen-impl --proto-dir ./protos --sql-dir ./procedures -o repo.go
+
+# 3. Generate gRPC server stubs
+tgpiler --gen-server --proto-dir ./protos -o server.go
+
+# 4. Generate mock server scaffolding
+tgpiler --gen-mock --proto-dir ./protos -o mocks.go
+```
+
+### Temp Table Handling
+
+When using `--backend=grpc`, temp tables automatically fall back to SQL:
+
+```bash
+# Temp tables use SQL, regular tables use gRPC
+tgpiler --dml --backend=grpc --grpc-package=orderpb input.sql
+# Shows: info: Temp tables detected. Using --fallback-backend=sql (default).
+
+# Explicit fallback
+tgpiler --dml --backend=grpc --grpc-package=orderpb --fallback-backend=sql input.sql
+```
+
+See [docs/GRPC.md](docs/GRPC.md) for complete gRPC documentation.
+
 ## Testing
 
 The project includes a comprehensive test suite with 80 T-SQL sample files.
@@ -855,6 +905,21 @@ The following T-SQL features are not yet supported:
 - Full-text search
 
 **Note:** CTEs (Common Table Expressions) and window functions (`ROW_NUMBER`, `RANK`, `DENSE_RANK`, `LEAD`, `LAG`, etc.) are fully supported in DML mode — queries are passed through to the database which handles them natively. Window functions have proper type inference: ranking functions return `int64`, percentage functions return `float64`, and navigation functions inherit their argument types.
+
+## Documentation
+
+| Document | Description |
+|----------|-------------|
+| [QUICKSTART_EN.md](docs/QUICKSTART_EN.md) | Get started in 5 minutes |
+| [QUICKSTART_ES.md](docs/QUICKSTART_ES.md) | Guía de inicio rápido (Español) |
+| [QUICKSTART_PT.md](docs/QUICKSTART_PT.md) | Guia de início rápido (Português) |
+| [CLI_REFERENCE.md](docs/CLI_REFERENCE.md) | Complete command-line reference |
+| [MANUAL.md](docs/MANUAL.md) | Comprehensive user manual |
+| [DML.md](docs/DML.md) | Database operations and SQL dialects |
+| [GRPC.md](docs/GRPC.md) | gRPC backend and proto generation |
+| [UUID_AND_DDL.md](docs/UUID_AND_DDL.md) | NEWID() and DDL handling |
+| [CHANGELOG.md](docs/CHANGELOG.md) | Recent changes and features |
+| [ROADMAP.md](docs/ROADMAP.md) | Future development plans |
 
 ## Author
 

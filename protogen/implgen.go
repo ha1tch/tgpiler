@@ -101,6 +101,21 @@ type implTemplateData struct {
 	RepoName    string
 	Imports     map[string]bool
 	Methods     []implMethodData
+	Dialect     string
+}
+
+// multiServiceImplData holds data for generating all services in one file
+type multiServiceImplData struct {
+	PackageName string
+	Imports     map[string]bool
+	Services    []implServiceData
+	Dialect     string
+}
+
+type implServiceData struct {
+	ServiceName string
+	RepoName    string
+	Methods     []implMethodData
 }
 
 type implMethodData struct {
@@ -163,12 +178,31 @@ var implFileTemplate = template.Must(template.New("impl").Funcs(template.FuncMap
 			return ""
 		}
 		var parts []string
+		prefix := "result"
+		if rm.NestedFieldName != "" {
+			prefix = "nested"
+		}
 		for _, fm := range rm.FieldMappings {
 			if fm.ProtoField != "" {
-				parts = append(parts, fmt.Sprintf("&result.%s", toGoFieldName(fm.ProtoField)))
+				parts = append(parts, fmt.Sprintf("&%s.%s", prefix, toGoFieldName(fm.ProtoField)))
 			}
 		}
 		return strings.Join(parts, ", ")
+	},
+	"hasNestedResult": func(rm *storage.ResultMapping) bool {
+		return rm != nil && rm.NestedFieldName != ""
+	},
+	"nestedTypeName": func(rm *storage.ResultMapping) string {
+		if rm == nil {
+			return ""
+		}
+		return rm.NestedTypeName
+	},
+	"nestedFieldName": func(rm *storage.ResultMapping) string {
+		if rm == nil {
+			return ""
+		}
+		return toGoFieldName(rm.NestedFieldName)
 	},
 	"hasResultMapping": func(rm *storage.ResultMapping) bool {
 		return rm != nil && len(rm.FieldMappings) > 0
@@ -216,7 +250,8 @@ func (r *{{$.RepoName}}SQL) {{.MethodName}}(ctx context.Context, req *{{.Request
 	query := "EXEC {{.ProcName}} {{genParams .ParamMappings}}"
 	row := r.db.QueryRowContext(ctx, query, {{genParamArgs .ParamMappings}})
 	
-	var result {{trimPrefix .ResponseType "Get"}}
+	{{- if hasNestedResult .ResultMapping}}
+	var nested {{nestedTypeName .ResultMapping}}
 	err := row.Scan({{genScanFields .ResultMapping}})
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -226,10 +261,20 @@ func (r *{{$.RepoName}}SQL) {{.MethodName}}(ctx context.Context, req *{{.Request
 	}
 	
 	return &{{.ResponseType}}{
-		{{- if hasPrefix .ResponseType "Get"}}
-		{{trimPrefix (trimPrefix .ResponseType "Get") "Response"}}: &result,
-		{{- end}}
+		{{nestedFieldName .ResultMapping}}: &nested,
 	}, nil
+	{{- else}}
+	var result {{.ResponseType}}
+	err := row.Scan({{genScanFields .ResultMapping}})
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("{{.MethodName}}: not found")
+		}
+		return nil, fmt.Errorf("{{.MethodName}}: %w", err)
+	}
+	
+	return &result, nil
+	{{- end}}
 	{{- else}}
 	// Execute stored procedure (no result mapping)
 	query := "EXEC {{.ProcName}} {{genParams .ParamMappings}}"
@@ -291,6 +336,22 @@ func toGoFieldName(name string) string {
 	return result
 }
 
+// getPlaceholder returns the dialect-appropriate placeholder for parameter n
+func getPlaceholder(dialect string, n int) string {
+	switch dialect {
+	case "postgres":
+		return fmt.Sprintf("$%d", n)
+	case "mysql", "sqlite":
+		return "?"
+	case "sqlserver":
+		return fmt.Sprintf("@p%d", n)
+	case "oracle":
+		return fmt.Sprintf(":p%d", n)
+	default:
+		return fmt.Sprintf("$%d", n) // default to postgres style
+	}
+}
+
 // GenerateAll generates implementation files for all services.
 func (g *ImplementationGenerator) GenerateAll(outputDir string, opts ServerGenOptions) error {
 	for svcName := range g.proto.AllServices {
@@ -306,3 +367,271 @@ func (g *ImplementationGenerator) GenerateAll(outputDir string, opts ServerGenOp
 	}
 	return nil
 }
+
+// GenerateAllServicesImpl generates all services in a single output with one package header.
+func (g *ImplementationGenerator) GenerateAllServicesImpl(opts ServerGenOptions, w io.Writer) error {
+	dialect := opts.Dialect
+	if dialect == "" {
+		dialect = "postgres"
+	}
+
+	data := multiServiceImplData{
+		PackageName: opts.PackageName,
+		Imports:     make(map[string]bool),
+		Dialect:     dialect,
+	}
+
+	// Standard imports
+	data.Imports["context"] = true
+	data.Imports["database/sql"] = true
+	data.Imports["fmt"] = true
+
+	// Collect all services
+	for svcName, svc := range g.proto.AllServices {
+		svcData := implServiceData{
+			ServiceName: svcName,
+			RepoName:    svcName + "Repository",
+		}
+
+		// Build method data for this service
+		for _, method := range svc.Methods {
+			key := svcName + "." + method.Name
+			mapping := g.mappings[key]
+
+			md := implMethodData{
+				MethodName:   method.Name,
+				RequestType:  method.RequestType,
+				ResponseType: method.ResponseType,
+			}
+
+			if mapping != nil && mapping.Procedure != nil {
+				md.HasMapping = true
+				md.ProcName = mapping.Procedure.Name
+				md.Confidence = mapping.Confidence
+				md.MatchReason = mapping.MatchReason
+				md.ParamMappings = mapping.ParamMappings
+				md.ResultMapping = mapping.ResultMapping
+
+				// Check if we need time import
+				for _, pm := range mapping.ParamMappings {
+					if pm.GoType == "time.Time" {
+						data.Imports["time"] = true
+					}
+				}
+				if mapping.ResultMapping != nil {
+					for _, fm := range mapping.ResultMapping.FieldMappings {
+						if fm.GoType == "time.Time" {
+							data.Imports["time"] = true
+						}
+					}
+				}
+			}
+
+			svcData.Methods = append(svcData.Methods, md)
+		}
+
+		data.Services = append(data.Services, svcData)
+	}
+
+	return multiServiceImplTemplate.Execute(w, data)
+}
+
+// multiServiceImplTemplate generates all services with a single package header
+var multiServiceImplTemplate = template.Must(template.New("multiImpl").Funcs(template.FuncMap{
+	"join":       strings.Join,
+	"lower":      strings.ToLower,
+	"hasPrefix":  strings.HasPrefix,
+	"trimPrefix": strings.TrimPrefix,
+	"percent":    func(f float64) string { return fmt.Sprintf("%.0f%%", f*100) },
+	"sortedImports": func(imports map[string]bool) []string {
+		var result []string
+		std := []string{"context", "database/sql", "fmt", "time"}
+		for _, s := range std {
+			if imports[s] {
+				result = append(result, s)
+			}
+		}
+		return result
+	},
+	// genQuery generates a dialect-appropriate stored procedure call
+	"genQuery": func(dialect, procName string, mappings []storage.ParamMapping) string {
+		var paramParts []string
+		paramIdx := 1
+		for _, pm := range mappings {
+			if pm.HasDefault && pm.ProtoField == "" {
+				continue // skip params with defaults that aren't mapped
+			}
+			placeholder := getPlaceholder(dialect, paramIdx)
+			paramParts = append(paramParts, placeholder)
+			paramIdx++
+		}
+		
+		callKeyword := "CALL"
+		if dialect == "sqlserver" {
+			callKeyword = "EXEC"
+		}
+		
+		if len(paramParts) == 0 {
+			return fmt.Sprintf("%s %s", callKeyword, procName)
+		}
+		return fmt.Sprintf("%s %s(%s)", callKeyword, procName, strings.Join(paramParts, ", "))
+	},
+	"genParamArgs": func(mappings []storage.ParamMapping) string {
+		var parts []string
+		for _, pm := range mappings {
+			if pm.ProtoField != "" {
+				parts = append(parts, fmt.Sprintf("req.%s", toGoFieldName(pm.ProtoField)))
+			} else if pm.HasDefault {
+				continue
+			} else {
+				parts = append(parts, "nil")
+			}
+		}
+		return strings.Join(parts, ", ")
+	},
+	"genScanFields": func(rm *storage.ResultMapping) string {
+		if rm == nil {
+			return ""
+		}
+		var parts []string
+		prefix := "result"
+		if rm.NestedFieldName != "" {
+			prefix = "nested"
+		}
+		for _, fm := range rm.FieldMappings {
+			if fm.ProtoField != "" {
+				parts = append(parts, fmt.Sprintf("&%s.%s", prefix, toGoFieldName(fm.ProtoField)))
+			}
+		}
+		return strings.Join(parts, ", ")
+	},
+	"hasResultMapping": func(rm *storage.ResultMapping) bool {
+		return rm != nil && len(rm.FieldMappings) > 0
+	},
+	"hasNestedResult": func(rm *storage.ResultMapping) bool {
+		return rm != nil && rm.NestedFieldName != ""
+	},
+	"nestedTypeName": func(rm *storage.ResultMapping) string {
+		if rm == nil {
+			return ""
+		}
+		return rm.NestedTypeName
+	},
+	"nestedFieldName": func(rm *storage.ResultMapping) string {
+		if rm == nil {
+			return ""
+		}
+		return toGoFieldName(rm.NestedFieldName)
+	},
+	"goFieldName": toGoFieldName,
+}).Parse(`// Code generated by tgpiler. DO NOT EDIT.
+// Source: proto definitions + stored procedures
+
+package {{.PackageName}}
+
+import (
+{{- range sortedImports .Imports}}
+	"{{.}}"
+{{- end}}
+)
+
+{{range .Services}}
+{{- $svc := . -}}
+// ============================================================================
+// {{.ServiceName}} Repository Implementation
+// ============================================================================
+
+// {{.RepoName}} defines the data access interface for {{.ServiceName}}.
+type {{.RepoName}} interface {
+{{- range .Methods}}
+	{{.MethodName}}(ctx context.Context, req *{{.RequestType}}) (*{{.ResponseType}}, error)
+{{- end}}
+}
+
+// {{.RepoName}}SQL implements {{.RepoName}} using stored procedures.
+type {{.RepoName}}SQL struct {
+	db *sql.DB
+}
+
+// New{{.RepoName}}SQL creates a new SQL repository.
+func New{{.RepoName}}SQL(db *sql.DB) *{{.RepoName}}SQL {
+	return &{{.RepoName}}SQL{db: db}
+}
+
+{{range .Methods}}
+// {{.MethodName}} implements the {{.MethodName}} operation.
+{{- if .HasMapping}}
+// Mapped to: {{.ProcName}} (confidence: {{percent .Confidence}}, {{.MatchReason}})
+func (r *{{$svc.RepoName}}SQL) {{.MethodName}}(ctx context.Context, req *{{.RequestType}}) (*{{.ResponseType}}, error) {
+	{{- if hasResultMapping .ResultMapping}}
+	// Execute stored procedure and scan results
+	query := "{{genQuery $.Dialect .ProcName .ParamMappings}}"
+	row := r.db.QueryRowContext(ctx, query, {{genParamArgs .ParamMappings}})
+	{{- if hasNestedResult .ResultMapping}}
+	var nested {{nestedTypeName .ResultMapping}}
+	err := row.Scan({{genScanFields .ResultMapping}})
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("{{.MethodName}}: not found")
+		}
+		return nil, fmt.Errorf("{{.MethodName}}: %w", err)
+	}
+	
+	return &{{.ResponseType}}{
+		{{nestedFieldName .ResultMapping}}: &nested,
+	}, nil
+	{{- else}}
+	var result {{.ResponseType}}
+	err := row.Scan({{genScanFields .ResultMapping}})
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("{{.MethodName}}: not found")
+		}
+		return nil, fmt.Errorf("{{.MethodName}}: %w", err)
+	}
+	
+	return &result, nil
+	{{- end}}
+	{{- else}}
+	// Execute stored procedure (no result mapping)
+	query := "{{genQuery $.Dialect .ProcName .ParamMappings}}"
+	_, err := r.db.ExecContext(ctx, query, {{genParamArgs .ParamMappings}})
+	if err != nil {
+		return nil, fmt.Errorf("{{.MethodName}}: %w", err)
+	}
+	
+	return &{{.ResponseType}}{}, nil
+	{{- end}}
+}
+{{- else}}
+// WARNING: No stored procedure mapping found
+func (r *{{$svc.RepoName}}SQL) {{.MethodName}}(ctx context.Context, req *{{.RequestType}}) (*{{.ResponseType}}, error) {
+	// TODO: Implement - no matching stored procedure found
+	// Consider creating a stored procedure or implementing inline SQL
+	return nil, fmt.Errorf("{{.MethodName}}: not implemented - no stored procedure mapping")
+}
+{{- end}}
+
+{{end}}
+// ============================================================================
+// {{.ServiceName}} Server
+// ============================================================================
+
+// {{.ServiceName}}Server implements the {{.ServiceName}} gRPC service.
+type {{.ServiceName}}Server struct {
+	repo {{.RepoName}}
+}
+
+// New{{.ServiceName}}Server creates a new server.
+func New{{.ServiceName}}Server(repo {{.RepoName}}) *{{.ServiceName}}Server {
+	return &{{.ServiceName}}Server{repo: repo}
+}
+
+{{range .Methods}}
+// {{.MethodName}} handles the {{.MethodName}} RPC.
+func (s *{{$svc.ServiceName}}Server) {{.MethodName}}(ctx context.Context, req *{{.RequestType}}) (*{{.ResponseType}}, error) {
+	return s.repo.{{.MethodName}}(ctx, req)
+}
+{{end}}
+{{end}}
+`))

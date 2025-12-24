@@ -10,9 +10,21 @@ import (
 	"github.com/ha1tch/tsqlparser/ast"
 )
 
+// goStatementPattern matches GO batch separator lines.
+// GO is a client tool directive (SSMS, sqlcmd), not T-SQL itself.
+var goStatementPattern = regexp.MustCompile(`(?im)^\s*GO\s*$`)
+
+// stripGoStatements removes GO batch separators from T-SQL source.
+// GO has no semantic meaning for transpilation - it's a client tool artifact.
+func stripGoStatements(source string) string {
+	return goStatementPattern.ReplaceAllString(source, "")
+}
+
 // Transpile converts T-SQL source code to Go source code.
 // This version only handles procedural code (no DML statements).
+// GO statements are stripped by default as they have no semantic meaning.
 func Transpile(source string, packageName string) (string, error) {
+	source = stripGoStatements(source)
 	program, errors := tsqlparser.Parse(source)
 	if len(errors) > 0 {
 		return "", fmt.Errorf("parse errors:\n%s", strings.Join(errors, "\n"))
@@ -27,10 +39,32 @@ func Transpile(source string, packageName string) (string, error) {
 // TranspileWithDML converts T-SQL source code to Go, including DML statements.
 // DML statements (SELECT, INSERT, UPDATE, DELETE, EXEC) are converted to
 // the appropriate backend calls based on the DMLConfig.
+// GO statements are stripped by default unless PreserveGo is set in config.
 func TranspileWithDML(source string, packageName string, dmlConfig DMLConfig) (string, error) {
+	result, err := TranspileWithDMLEx(source, packageName, dmlConfig)
+	if err != nil {
+		return "", err
+	}
+	return result.Code, nil
+}
+
+// TranspileResult contains the transpilation output and metadata
+type TranspileResult struct {
+	Code              string   // Generated Go code
+	DDLWarnings       []string // Warnings about skipped DDL statements
+	ExtractedDDL      []string // DDL statements collected for extraction
+	TempTablesUsed    []string // Temp tables encountered (for fallback backend info)
+	TempTableWarnings []string // Warnings about temp tables with non-SQL backends
+}
+
+// TranspileWithDMLEx is like TranspileWithDML but returns extended results
+func TranspileWithDMLEx(source string, packageName string, dmlConfig DMLConfig) (*TranspileResult, error) {
+	if !dmlConfig.PreserveGo {
+		source = stripGoStatements(source)
+	}
 	program, errors := tsqlparser.Parse(source)
 	if len(errors) > 0 {
-		return "", fmt.Errorf("parse errors:\n%s", strings.Join(errors, "\n"))
+		return nil, fmt.Errorf("parse errors:\n%s", strings.Join(errors, "\n"))
 	}
 
 	t := newTranspiler()
@@ -38,8 +72,36 @@ func TranspileWithDML(source string, packageName string, dmlConfig DMLConfig) (s
 	t.comments = buildCommentIndex(source)
 	t.dmlConfig = dmlConfig
 	t.dmlEnabled = true
-	return t.transpile(program)
+	t.annotateLevel = dmlConfig.AnnotateLevel
+	
+	code, err := t.transpile(program)
+	if err != nil {
+		return nil, err
+	}
+	
+	// Generate temp table warnings if needed
+	var tempTableWarnings []string
+	if len(t.tempTablesUsed) > 0 && (dmlConfig.Backend == BackendGRPC || dmlConfig.Backend == BackendMock) {
+		if !dmlConfig.FallbackExplicit {
+			tempTableWarnings = append(tempTableWarnings,
+				fmt.Sprintf("Temp tables detected (%s) with --%s backend. "+
+					"Using --fallback-backend=%s (default). "+
+					"Use --fallback-backend to specify explicitly.",
+					strings.Join(t.tempTablesUsed, ", "),
+					dmlConfig.Backend,
+					dmlConfig.FallbackBackend))
+		}
+	}
+	
+	return &TranspileResult{
+		Code:              code,
+		DDLWarnings:       t.ddlWarnings,
+		ExtractedDDL:      t.extractedDDL,
+		TempTablesUsed:    t.tempTablesUsed,
+		TempTableWarnings: tempTableWarnings,
+	}, nil
 }
+
 
 type transpiler struct {
 	imports       map[string]bool
@@ -60,10 +122,35 @@ type transpiler struct {
 	dmlConfig       DMLConfig
 	inTransaction   bool // Track if we're inside a transaction block
 	hasDMLStatements bool // Track if procedure has DML requiring error return
+	usesRowCount    bool // Track if procedure uses @@ROWCOUNT
+	
+	// Annotation level: none, minimal, standard, verbose
+	annotateLevel string
 	
 	// Cursor handling
 	cursors       map[string]*cursorInfo // name -> cursor info
 	activeCursor  string                 // currently open cursor (for FETCH detection)
+	
+	// User-defined function tracking
+	userFunctions map[string]*userFuncInfo // function name (lowercase) -> info
+	
+	// DDL handling
+	ddlWarnings  []string // Collect DDL skip warnings
+	extractedDDL []string // Collect DDL statements for extraction
+	
+	// Temp table tracking for fallback backend warnings
+	tempTablesUsed []string // Names of temp tables encountered
+	
+	// Track if any procedures/functions were transpiled
+	hasProcedures bool
+}
+
+// userFuncInfo tracks user-defined functions for call resolution
+type userFuncInfo struct {
+	name       string           // Original SQL function name
+	goName     string           // Generated Go function name
+	params     []*ast.ParameterDef
+	returnType string           // Go return type
 }
 
 // cursorInfo tracks declared cursors for conversion to rows iteration
@@ -77,11 +164,36 @@ type cursorInfo struct {
 
 func newTranspiler() *transpiler {
 	return &transpiler{
-		imports:   make(map[string]bool),
-		symbols:   newSymbolTable(),
-		dmlConfig: DefaultDMLConfig(),
-		cursors:   make(map[string]*cursorInfo),
+		imports:       make(map[string]bool),
+		symbols:       newSymbolTable(),
+		dmlConfig:     DefaultDMLConfig(),
+		cursors:       make(map[string]*cursorInfo),
+		userFunctions: make(map[string]*userFuncInfo),
+		annotateLevel: "none",
 	}
+}
+
+// Annotation level helpers
+// Levels: none < minimal < standard < verbose
+
+// emitTODOs returns true if TODO markers should be emitted (minimal+)
+func (t *transpiler) emitTODOs() bool {
+	return t.annotateLevel == "minimal" || t.annotateLevel == "standard" || t.annotateLevel == "verbose"
+}
+
+// emitOriginal returns true if original SQL comments should be emitted (standard+)
+func (t *transpiler) emitOriginal() bool {
+	return t.annotateLevel == "standard" || t.annotateLevel == "verbose"
+}
+
+// emitTypeAnnotations returns true if type annotations should be emitted (verbose only)
+func (t *transpiler) emitTypeAnnotations() bool {
+	return t.annotateLevel == "verbose"
+}
+
+// emitSections returns true if section markers should be emitted (verbose only)
+func (t *transpiler) emitSections() bool {
+	return t.annotateLevel == "verbose"
 }
 
 // emitComments returns Go comment lines for the given signature.
@@ -119,6 +231,18 @@ func (t *transpiler) transpile(program *ast.Program) (string, error) {
 		if body != "" {
 			bodies = append(bodies, body)
 		}
+	}
+
+	// Check for DDL-only files (no procedures/functions)
+	if !t.hasProcedures && len(bodies) > 0 {
+		// File contains statements but no procedures - likely a DDL/schema file
+		hint := "This file appears to contain only DDL statements (CREATE TABLE, etc.) without any stored procedures.\n" +
+			"      tgpiler transpiles stored procedures to Go functions.\n\n" +
+			"      For DDL/schema files, consider:\n" +
+			"        - Keep them as SQL migration scripts\n" +
+			"        - Use --extract-ddl=FILE to collect DDL from mixed files\n" +
+			"        - Use a migration tool like golang-migrate, goose, or atlas"
+		return "", fmt.Errorf("no stored procedures found in input\n\n      Hint: %s", hint)
 	}
 
 	// Build final output with imports
@@ -206,6 +330,8 @@ func (t *transpiler) transpileStatement(stmt ast.Statement) (string, error) {
 	switch s := stmt.(type) {
 	case *ast.CreateProcedureStatement:
 		return t.transpileCreateProcedure(s)
+	case *ast.CreateFunctionStatement:
+		return t.transpileCreateFunction(s)
 	case *ast.DeclareStatement:
 		return t.transpileDeclare(s)
 	case *ast.SetStatement:
@@ -329,8 +455,271 @@ func (t *transpiler) transpileStatement(stmt ast.Statement) (string, error) {
 		return "", fmt.Errorf("WITH/CTE statements require DML mode (use TranspileWithDML)")
 	
 	default:
-		return "", fmt.Errorf("unsupported statement type: %T", stmt)
+		// Check if this is a DDL statement that should be skipped
+		if t.dmlEnabled && t.dmlConfig.SkipDDL && !t.dmlConfig.StrictDDL {
+			if skipped, comment := t.trySkipDDL(stmt); skipped {
+				return comment, nil
+			}
+		}
+		return "", unsupportedStatementError(stmt)
 	}
+}
+
+// unsupportedStatementError returns a helpful error message for unsupported statements.
+func unsupportedStatementError(stmt ast.Statement) error {
+	typeName := fmt.Sprintf("%T", stmt)
+	
+	// Provide specific hints based on type name
+	switch {
+	case strings.Contains(typeName, "GoStatement"):
+		return fmt.Errorf("unsupported statement type: %s\n"+
+			"      Hint: GO is a batch separator with no semantic meaning.\n"+
+			"      GO statements are stripped by default. If you see this error,\n"+
+			"      use --preserve-go=false or check your tgpiler version.", typeName)
+	
+	case strings.Contains(typeName, "CreateFunction"):
+		return fmt.Errorf("unsupported statement type: %s\n"+
+			"      Hint: Table-valued functions are not yet supported.\n"+
+			"      Scalar functions with a BEGIN/END body are supported.", typeName)
+	
+	case strings.Contains(typeName, "CreateView"):
+		return fmt.Errorf("unsupported statement type: %s\n"+
+			"      Hint: CREATE VIEW is a DDL statement, not procedural code.\n"+
+			"      Views should remain in your database; tgpiler transpiles procedures.", typeName)
+	
+	case strings.Contains(typeName, "CreateTable"):
+		return fmt.Errorf("unsupported statement type: %s\n"+
+			"      Hint: CREATE TABLE is a DDL statement.\n"+
+			"      For temp tables inside procedures, use --dml mode.\n"+
+			"      For permanent tables, keep them in your database schema.", typeName)
+	
+	case strings.Contains(typeName, "CreateIndex"):
+		return fmt.Errorf("unsupported statement type: %s\n"+
+			"      Hint: CREATE INDEX is a DDL statement.\n"+
+			"      Indexes should remain in your database schema.", typeName)
+	
+	case strings.Contains(typeName, "Alter"):
+		return fmt.Errorf("unsupported statement type: %s\n"+
+			"      Hint: ALTER statements are DDL and not transpiled.\n"+
+			"      These should remain as database migrations.", typeName)
+	
+	case strings.Contains(typeName, "Drop"):
+		return fmt.Errorf("unsupported statement type: %s\n"+
+			"      Hint: DROP statements are DDL and not transpiled.\n"+
+			"      These should remain as database migrations.", typeName)
+	
+	case strings.Contains(typeName, "Use"):
+		return fmt.Errorf("unsupported statement type: %s\n"+
+			"      Hint: USE <database> is a client directive.\n"+
+			"      Database selection is handled by your connection string.", typeName)
+	
+	case strings.Contains(typeName, "CreateSequence"):
+		return fmt.Errorf("unsupported statement type: %s\n"+
+			"      Hint: CREATE SEQUENCE is a DDL statement.\n"+
+			"      Sequences should remain in your database schema.\n"+
+			"      Use result.LastInsertId() or uuid.New() in Go.", typeName)
+	
+	default:
+		return fmt.Errorf("unsupported statement type: %s\n"+
+			"      Hint: This statement type is not yet implemented.\n"+
+			"      Please file an issue at github.com/ha1tch/tgpiler if you need it.", typeName)
+	}
+}
+
+// trySkipDDL checks if a statement is a DDL statement that should be skipped.
+// Returns (true, comment) if skipped, (false, "") if not a skippable DDL.
+func (t *transpiler) trySkipDDL(stmt ast.Statement) (bool, string) {
+	typeName := fmt.Sprintf("%T", stmt)
+	
+	var ddlType, ddlName string
+	
+	switch {
+	case strings.Contains(typeName, "CreateSequence"):
+		ddlType = "CREATE SEQUENCE"
+		// Try to extract sequence name
+		if s := stmt.String(); s != "" {
+			ddlName = extractDDLName(s, "SEQUENCE")
+		}
+	case strings.Contains(typeName, "CreateView"):
+		ddlType = "CREATE VIEW"
+		if s := stmt.String(); s != "" {
+			ddlName = extractDDLName(s, "VIEW")
+		}
+	case strings.Contains(typeName, "CreateIndex"):
+		ddlType = "CREATE INDEX"
+		if s := stmt.String(); s != "" {
+			ddlName = extractDDLName(s, "INDEX")
+		}
+	case strings.Contains(typeName, "AlterTable"):
+		ddlType = "ALTER TABLE"
+		if s := stmt.String(); s != "" {
+			ddlName = extractDDLName(s, "TABLE")
+		}
+	case strings.Contains(typeName, "AlterIndex"):
+		ddlType = "ALTER INDEX"
+	case strings.Contains(typeName, "AlterView"):
+		ddlType = "ALTER VIEW"
+	case strings.Contains(typeName, "DropIndex"):
+		ddlType = "DROP INDEX"
+	case strings.Contains(typeName, "DropView"):
+		ddlType = "DROP VIEW"
+	case strings.Contains(typeName, "Use"):
+		ddlType = "USE"
+	default:
+		return false, ""
+	}
+	
+	// Record warning
+	warning := fmt.Sprintf("Skipped %s", ddlType)
+	if ddlName != "" {
+		warning = fmt.Sprintf("Skipped %s %s", ddlType, ddlName)
+	}
+	t.ddlWarnings = append(t.ddlWarnings, warning)
+	
+	// Collect DDL for extraction if configured
+	if t.dmlConfig.ExtractDDL != "" {
+		t.extractedDDL = append(t.extractedDDL, stmt.String())
+	}
+	
+	// Return comment
+	comment := fmt.Sprintf("// %s (DDL - keep in database schema)\n", warning)
+	return true, comment
+}
+
+// extractDDLName tries to extract the object name from a DDL statement string.
+func extractDDLName(sql, keyword string) string {
+	upper := strings.ToUpper(sql)
+	idx := strings.Index(upper, keyword)
+	if idx < 0 {
+		return ""
+	}
+	rest := strings.TrimSpace(sql[idx+len(keyword):])
+	// Take the first word (the name)
+	fields := strings.Fields(rest)
+	if len(fields) > 0 {
+		return fields[0]
+	}
+	return ""
+}
+
+// isIfAroundDDL checks if an IF statement wraps DDL statements (CREATE, ALTER, DROP).
+// This is common for patterns like: IF NOT EXISTS (...) CREATE SEQUENCE ...
+func (t *transpiler) isIfAroundDDL(ifStmt *ast.IfStatement) bool {
+	// Check consequence
+	if ifStmt.Consequence != nil && t.statementContainsDDL(ifStmt.Consequence) {
+		return true
+	}
+	// Check alternative
+	if ifStmt.Alternative != nil && t.statementContainsDDL(ifStmt.Alternative) {
+		return true
+	}
+	return false
+}
+
+// statementContainsDDL checks if a statement is or contains DDL.
+func (t *transpiler) statementContainsDDL(stmt ast.Statement) bool {
+	if stmt == nil {
+		return false
+	}
+	
+	// Check the statement type name for DDL patterns
+	typeName := fmt.Sprintf("%T", stmt)
+	ddlPatterns := []string{
+		"CreateSequence", "CreateView", "CreateIndex", "CreateTable",
+		"AlterTable", "AlterIndex", "AlterView",
+		"DropIndex", "DropView", "DropTable", "DropSequence",
+	}
+	for _, pattern := range ddlPatterns {
+		if strings.Contains(typeName, pattern) {
+			return true
+		}
+	}
+	
+	// For BEGIN/END blocks, check all contained statements
+	if block, ok := stmt.(*ast.BeginEndBlock); ok {
+		for _, s := range block.Statements {
+			if t.statementContainsDDL(s) {
+				return true
+			}
+		}
+	}
+	
+	return false
+}
+
+// skipIfAroundDDL returns a comment for a skipped top-level IF around DDL.
+func (t *transpiler) skipIfAroundDDL(ifStmt *ast.IfStatement) string {
+	// Try to describe what's being skipped
+	ddlDesc := t.describeDDLInStatement(ifStmt.Consequence)
+	if ddlDesc == "" && ifStmt.Alternative != nil {
+		ddlDesc = t.describeDDLInStatement(ifStmt.Alternative)
+	}
+	if ddlDesc == "" {
+		ddlDesc = "DDL statement"
+	}
+	
+	// Record warning
+	warning := fmt.Sprintf("Skipped conditional %s (top-level IF around DDL)", ddlDesc)
+	t.ddlWarnings = append(t.ddlWarnings, warning)
+	
+	// Collect DDL for extraction if configured
+	if t.dmlConfig.ExtractDDL != "" {
+		t.extractedDDL = append(t.extractedDDL, ifStmt.String())
+	}
+	
+	return fmt.Sprintf("// %s\n// Hint: Keep this in your database migration scripts\n// Original: %s",
+		warning, summarizeStatement(ifStmt.String(), 80))
+}
+
+// describeDDLInStatement returns a description of DDL found in a statement.
+func (t *transpiler) describeDDLInStatement(stmt ast.Statement) string {
+	if stmt == nil {
+		return ""
+	}
+	
+	typeName := fmt.Sprintf("%T", stmt)
+	
+	switch {
+	case strings.Contains(typeName, "CreateSequence"):
+		name := extractDDLName(stmt.String(), "SEQUENCE")
+		if name != "" {
+			return "CREATE SEQUENCE " + name
+		}
+		return "CREATE SEQUENCE"
+	case strings.Contains(typeName, "CreateView"):
+		return "CREATE VIEW"
+	case strings.Contains(typeName, "CreateIndex"):
+		return "CREATE INDEX"
+	case strings.Contains(typeName, "CreateTable"):
+		return "CREATE TABLE"
+	case strings.Contains(typeName, "AlterTable"):
+		return "ALTER TABLE"
+	case strings.Contains(typeName, "DropTable"):
+		return "DROP TABLE"
+	case strings.Contains(typeName, "DropSequence"):
+		return "DROP SEQUENCE"
+	}
+	
+	// For blocks, check contents
+	if block, ok := stmt.(*ast.BeginEndBlock); ok {
+		for _, s := range block.Statements {
+			if desc := t.describeDDLInStatement(s); desc != "" {
+				return desc
+			}
+		}
+	}
+	
+	return ""
+}
+
+// summarizeStatement returns a truncated version of a statement for comments.
+func summarizeStatement(s string, maxLen int) string {
+	// Normalize whitespace
+	s = strings.Join(strings.Fields(s), " ")
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen-3] + "..."
 }
 
 func (t *transpiler) transpileCreateProcedure(proc *ast.CreateProcedureStatement) (string, error) {
@@ -350,7 +739,32 @@ func (t *transpiler) transpileCreateProcedure(proc *ast.CreateProcedureStatement
 	// Get procedure name for comment lookup and ERROR_PROCEDURE()
 	procName := proc.Name.Parts[len(proc.Name.Parts)-1].Value
 	t.currentProcName = procName // Store for ERROR_PROCEDURE() in CATCH blocks
+	t.hasProcedures = true       // Mark that we found a procedure
 	sig := "PROC:" + strings.ToLower(procName)
+
+	// Emit section header for verbose mode
+	if t.emitSections() {
+		out.WriteString("// ============================================================\n")
+		out.WriteString(fmt.Sprintf("// PROCEDURE: %s\n", procName))
+		if len(proc.Parameters) > 0 {
+			var inputNames, outputNames []string
+			for _, p := range proc.Parameters {
+				name := strings.TrimPrefix(p.Name, "@")
+				if p.Output {
+					outputNames = append(outputNames, name)
+				} else {
+					inputNames = append(inputNames, name)
+				}
+			}
+			if len(inputNames) > 0 {
+				out.WriteString(fmt.Sprintf("// Inputs: %s\n", strings.Join(inputNames, ", ")))
+			}
+			if len(outputNames) > 0 {
+				out.WriteString(fmt.Sprintf("// Outputs: %s\n", strings.Join(outputNames, ", ")))
+			}
+		}
+		out.WriteString("// ============================================================\n")
+	}
 
 	// Emit leading comments for the procedure
 	if comments := t.comments.lookup(sig); len(comments) > 0 {
@@ -382,8 +796,21 @@ func (t *transpiler) transpileCreateProcedure(proc *ast.CreateProcedureStatement
 
 	// Function signature
 	funcName := goExportedIdentifier(procName)
-	out.WriteString(fmt.Sprintf("func %s(", funcName))
-	out.WriteString(strings.Join(inputParams, ", "))
+	
+	// Add receiver if configured (DML mode with receiver)
+	if t.dmlEnabled && t.dmlConfig.Receiver != "" && t.dmlConfig.ReceiverType != "" {
+		out.WriteString(fmt.Sprintf("func (%s %s) %s(", t.dmlConfig.Receiver, t.dmlConfig.ReceiverType, funcName))
+		// Always add ctx as first parameter in DML mode with receiver
+		out.WriteString("ctx context.Context")
+		if len(inputParams) > 0 {
+			out.WriteString(", ")
+			out.WriteString(strings.Join(inputParams, ", "))
+		}
+		t.imports["context"] = true
+	} else {
+		out.WriteString(fmt.Sprintf("func %s(", funcName))
+		out.WriteString(strings.Join(inputParams, ", "))
+	}
 	out.WriteString(")")
 
 	// Return type(s)
@@ -418,6 +845,13 @@ func (t *transpiler) transpileCreateProcedure(proc *ast.CreateProcedureStatement
 	t.outputParams = outputParams
 	t.hasReturnCode = hasReturn
 
+	// Pre-scan for @@ROWCOUNT usage
+	t.usesRowCount = t.blockUsesRowCount(proc.Body)
+	if t.usesRowCount {
+		out.WriteString(t.indentStr())
+		out.WriteString("var rowsAffected int32\n")
+	}
+
 	// Body
 	t.inProcBody = true
 	if proc.Body != nil {
@@ -435,6 +869,18 @@ func (t *transpiler) transpileCreateProcedure(proc *ast.CreateProcedureStatement
 	}
 	t.inProcBody = false
 
+	// Emit blank assignments for genuinely unused local variables
+	unusedVars := t.symbols.getUnusedVars()
+	if len(unusedVars) > 0 {
+		out.WriteString("\n")
+		out.WriteString(t.indentStr())
+		out.WriteString("// Suppress unused variable warnings\n")
+		for _, varName := range unusedVars {
+			out.WriteString(t.indentStr())
+			out.WriteString(fmt.Sprintf("_ = %s\n", varName))
+		}
+	}
+
 	// Final return if we have output params or return code, 
 	// but only if the block doesn't already end with a return
 	if (len(outputParams) > 0 || hasReturn || needsErrorReturn) && !t.blockEndsWithReturn(proc.Body) {
@@ -449,6 +895,103 @@ func (t *transpiler) transpileCreateProcedure(proc *ast.CreateProcedureStatement
 	// Clear procedure-specific state
 	t.outputParams = nil
 	t.hasReturnCode = false
+	t.currentProcName = "" // Reset so top-level statements are detected
+
+	return out.String(), nil
+}
+
+// transpileCreateFunction converts a T-SQL function to a Go function.
+func (t *transpiler) transpileCreateFunction(fn *ast.CreateFunctionStatement) (string, error) {
+	var out strings.Builder
+
+	// Reset symbol table for new function scope
+	t.symbols = newSymbolTable()
+
+	// Get function name
+	funcName := fn.Name.Parts[len(fn.Name.Parts)-1].Value
+	goFuncName := goIdentifier(funcName)
+	t.hasProcedures = true // Mark that we found a function (counts as a procedure)
+
+	// Only support scalar functions with a body for now
+	if fn.ReturnsTable || fn.TableDef != nil {
+		return "", fmt.Errorf("table-valued functions not yet supported: %s", funcName)
+	}
+	if fn.Body == nil {
+		// Inline TVF (RETURNS TABLE AS RETURN SELECT...) 
+		return "", fmt.Errorf("inline table-valued functions not yet supported: %s", funcName)
+	}
+
+	// Determine return type
+	returnType := "interface{}"
+	if fn.ReturnType != nil {
+		var err error
+		returnType, err = t.mapDataType(fn.ReturnType)
+		if err != nil {
+			return "", fmt.Errorf("function %s return type: %w", funcName, err)
+		}
+	}
+
+	// Register function for call resolution
+	t.userFunctions[strings.ToLower(funcName)] = &userFuncInfo{
+		name:       funcName,
+		goName:     goFuncName,
+		params:     fn.Parameters,
+		returnType: returnType,
+	}
+
+	// Build function signature
+	out.WriteString(fmt.Sprintf("func %s(", goFuncName))
+
+	// Parameters
+	var params []string
+	for _, p := range fn.Parameters {
+		goType, err := t.mapDataType(p.DataType)
+		if err != nil {
+			return "", fmt.Errorf("parameter %s: %w", p.Name, err)
+		}
+		paramName := goIdentifier(strings.TrimPrefix(p.Name, "@"))
+		t.symbols.define(paramName, typeInfoFromDataType(p.DataType))
+		params = append(params, fmt.Sprintf("%s %s", paramName, goType))
+	}
+	out.WriteString(strings.Join(params, ", "))
+	out.WriteString(") ")
+
+	// Return type
+	out.WriteString(returnType)
+	out.WriteString(" {\n")
+
+	// Transpile body
+	t.indent = 1
+	t.inProcBody = true
+	
+	for _, stmt := range fn.Body.Statements {
+		body, err := t.transpileStatement(stmt)
+		if err != nil {
+			return "", err
+		}
+		if body != "" {
+			out.WriteString(t.indentStr())
+			out.WriteString(body)
+			out.WriteString("\n")
+		}
+	}
+	
+	t.inProcBody = false
+
+	// Emit blank assignments for genuinely unused local variables
+	unusedVars := t.symbols.getUnusedVars()
+	if len(unusedVars) > 0 {
+		out.WriteString("\n")
+		out.WriteString(t.indentStr())
+		out.WriteString("// Suppress unused variable warnings\n")
+		for _, varName := range unusedVars {
+			out.WriteString(t.indentStr())
+			out.WriteString(fmt.Sprintf("_ = %s\n", varName))
+		}
+	}
+
+	t.indent = 0
+	out.WriteString("}")
 
 	return out.String(), nil
 }
@@ -492,6 +1035,96 @@ func (t *transpiler) statementHasDML(stmt ast.Statement) bool {
 			return true
 		}
 		if s.CatchBlock != nil && t.blockHasDML(s.CatchBlock) {
+			return true
+		}
+		return false
+	default:
+		return false
+	}
+}
+
+// blockUsesRowCount checks if a block contains @@ROWCOUNT references
+func (t *transpiler) blockUsesRowCount(block *ast.BeginEndBlock) bool {
+	if block == nil {
+		return false
+	}
+	for _, stmt := range block.Statements {
+		if t.statementUsesRowCount(stmt) {
+			return true
+		}
+	}
+	return false
+}
+
+// statementUsesRowCount checks if a statement uses @@ROWCOUNT
+func (t *transpiler) statementUsesRowCount(stmt ast.Statement) bool {
+	switch s := stmt.(type) {
+	case *ast.SetStatement:
+		return t.expressionUsesRowCount(s.Variable) || t.expressionUsesRowCount(s.Value)
+	case *ast.IfStatement:
+		if t.expressionUsesRowCount(s.Condition) {
+			return true
+		}
+		if t.statementUsesRowCount(s.Consequence) {
+			return true
+		}
+		if s.Alternative != nil && t.statementUsesRowCount(s.Alternative) {
+			return true
+		}
+		return false
+	case *ast.WhileStatement:
+		if t.expressionUsesRowCount(s.Condition) {
+			return true
+		}
+		return t.statementUsesRowCount(s.Body)
+	case *ast.BeginEndBlock:
+		return t.blockUsesRowCount(s)
+	case *ast.TryCatchStatement:
+		if s.TryBlock != nil && t.blockUsesRowCount(s.TryBlock) {
+			return true
+		}
+		if s.CatchBlock != nil && t.blockUsesRowCount(s.CatchBlock) {
+			return true
+		}
+		return false
+	case *ast.DeclareStatement:
+		for _, v := range s.Variables {
+			if v.Value != nil && t.expressionUsesRowCount(v.Value) {
+				return true
+			}
+		}
+		return false
+	default:
+		return false
+	}
+}
+
+// expressionUsesRowCount checks if an expression contains @@ROWCOUNT
+func (t *transpiler) expressionUsesRowCount(expr ast.Expression) bool {
+	if expr == nil {
+		return false
+	}
+	switch e := expr.(type) {
+	case *ast.Variable:
+		return strings.ToUpper(e.Name) == "@@ROWCOUNT"
+	case *ast.InfixExpression:
+		return t.expressionUsesRowCount(e.Left) || t.expressionUsesRowCount(e.Right)
+	case *ast.PrefixExpression:
+		return t.expressionUsesRowCount(e.Right)
+	case *ast.FunctionCall:
+		for _, arg := range e.Arguments {
+			if t.expressionUsesRowCount(arg) {
+				return true
+			}
+		}
+		return false
+	case *ast.CaseExpression:
+		for _, when := range e.WhenClauses {
+			if t.expressionUsesRowCount(when.Condition) || t.expressionUsesRowCount(when.Result) {
+				return true
+			}
+		}
+		if e.ElseClause != nil && t.expressionUsesRowCount(e.ElseClause) {
 			return true
 		}
 		return false
@@ -634,6 +1267,8 @@ func (t *transpiler) transpileDeclare(decl *ast.DeclareStatement) (string, error
 
 		// Record variable type in symbol table
 		t.symbols.define(varName, typeInfoFromDataType(v.DataType))
+		// Mark as declared for unused variable tracking
+		t.symbols.markDeclared(varName)
 
 		// Look up comments for first variable in declaration
 		var prefix string
@@ -644,6 +1279,12 @@ func (t *transpiler) transpileDeclare(decl *ast.DeclareStatement) (string, error
 					prefix += "// " + c + "\n" + t.indentStr()
 				}
 			}
+		}
+
+		// Type annotation for verbose mode
+		var typeComment string
+		if t.emitTypeAnnotations() && v.DataType != nil {
+			typeComment = fmt.Sprintf(" // T-SQL: %s", strings.ToUpper(v.DataType.String()))
 		}
 
 		if v.Value != nil {
@@ -667,14 +1308,10 @@ func (t *transpiler) transpileDeclare(decl *ast.DeclareStatement) (string, error
 			if ti != nil && ti.isBool && !isNull {
 				valExpr = t.ensureBool(v.Value, valExpr)
 			}
-			parts = append(parts, fmt.Sprintf("%svar %s %s = %s", prefix, varName, goType, valExpr))
+			parts = append(parts, fmt.Sprintf("%svar %s %s = %s%s", prefix, varName, goType, valExpr, typeComment))
 		} else {
-			parts = append(parts, fmt.Sprintf("%svar %s %s", prefix, varName, goType))
+			parts = append(parts, fmt.Sprintf("%svar %s %s%s", prefix, varName, goType, typeComment))
 		}
-
-		// Add blank assignment to prevent "declared and not used" errors
-		// This is a common Go idiom for variables that may not be used in all code paths
-		parts = append(parts, fmt.Sprintf("_ = %s", varName))
 	}
 
 	return strings.Join(parts, "\n"+t.indentStr()), nil
@@ -739,6 +1376,12 @@ func (t *transpiler) transpileSet(set *ast.SetStatement) (string, error) {
 }
 
 func (t *transpiler) transpileIf(ifStmt *ast.IfStatement) (string, error) {
+	// Check for top-level IF around DDL (common pattern: IF NOT EXISTS ... CREATE ...)
+	// At top level (not inside a procedure), IF statements containing DDL should be skipped
+	if t.currentProcName == "" && t.isIfAroundDDL(ifStmt) {
+		return t.skipIfAroundDDL(ifStmt), nil
+	}
+	
 	var out strings.Builder
 
 	cond, err := t.transpileExpression(ifStmt.Condition)
@@ -904,6 +1547,12 @@ func (t *transpiler) transpileBlock(block *ast.BeginEndBlock) (string, error) {
 
 func (t *transpiler) transpileTryCatch(tc *ast.TryCatchStatement) (string, error) {
 	var out strings.Builder
+
+	// Add TODO marker if requested
+	if t.emitTODOs() {
+		out.WriteString("// TODO(tgpiler): TRY/CATCH converted to defer/recover IIFE - verify error semantics\n")
+		out.WriteString(t.indentStr())
+	}
 
 	// Use an IIFE with defer/recover to simulate TRY/CATCH
 	out.WriteString("func() {\n")
@@ -1072,6 +1721,12 @@ func (t *transpiler) transpileReturn(ret *ast.ReturnStatement) (string, error) {
 	// Inside a TRY block (anonymous function), just return to exit the IIFE
 	// The actual return values are set via named return parameters
 	if t.inTryBlock {
+		return "return", nil
+	}
+	
+	// Inside a CATCH block (defer function), just return to exit the defer
+	// Cannot return values from a defer - values are set via named return params
+	if t.inCatchBlock {
 		return "return", nil
 	}
 
@@ -1430,6 +2085,27 @@ func (t *transpiler) transpileExistsExpression(exists *ast.ExistsExpression) (st
 		return "", fmt.Errorf("EXISTS expression has no subquery")
 	}
 	
+	// Extract table name to check if it's a temp table
+	tableName := ""
+	if exists.Subquery.From != nil && len(exists.Subquery.From.Tables) > 0 {
+		if tn, ok := exists.Subquery.From.Tables[0].(*ast.TableName); ok && tn.Name != nil && len(tn.Name.Parts) > 0 {
+			tableName = tn.Name.Parts[len(tn.Name.Parts)-1].Value
+		}
+	}
+	
+	// Track temp table usage
+	if isTempTable(tableName) {
+		t.recordTempTableUsed(tableName)
+	}
+	
+	// For gRPC backend, try to convert to a gRPC call (but not for temp tables)
+	if t.dmlEnabled && t.dmlConfig.Backend == BackendGRPC && !isTempTable(tableName) {
+		if result, ok := t.tryExistsAsGRPC(exists); ok {
+			return result, nil
+		}
+		// Fall through to SQL if gRPC conversion fails
+	}
+	
 	// Get the subquery SQL and substitute variables
 	sql := exists.Subquery.String()
 	
@@ -1451,6 +2127,140 @@ func (t *transpiler) transpileExistsExpression(exists *ast.ExistsExpression) (st
 		"\t\terr := %s.QueryRowContext(ctx, \"SELECT 1 WHERE EXISTS(%s)\"%s).Scan(&exists)\n"+
 		"\t\treturn err == nil && exists == 1\n"+
 		"\t}()", t.dmlConfig.StoreVar, substitutedSQL, argsStr), nil
+}
+
+// recordTempTableUsed adds a temp table to the tracking list (deduped).
+func (t *transpiler) recordTempTableUsed(name string) {
+	for _, existing := range t.tempTablesUsed {
+		if existing == name {
+			return
+		}
+	}
+	t.tempTablesUsed = append(t.tempTablesUsed, name)
+}
+
+// tryExistsAsGRPC attempts to convert EXISTS to a gRPC call.
+// Returns the code and true if successful, empty and false otherwise.
+func (t *transpiler) tryExistsAsGRPC(exists *ast.ExistsExpression) (string, bool) {
+	subquery := exists.Subquery
+	if subquery == nil {
+		return "", false
+	}
+	
+	// Extract table name from subquery
+	tableName := ""
+	if subquery.From != nil && len(subquery.From.Tables) > 0 {
+		if tn, ok := subquery.From.Tables[0].(*ast.TableName); ok && tn.Name != nil && len(tn.Name.Parts) > 0 {
+			tableName = tn.Name.Parts[len(tn.Name.Parts)-1].Value
+		}
+	}
+	if tableName == "" {
+		return "", false
+	}
+	
+	// Extract WHERE fields
+	whereFields := t.extractExistsWhereFields(subquery.Where)
+	if len(whereFields) == 0 {
+		return "", false
+	}
+	
+	// Build method name: Get{Table}By{Column} (singularize table name like inferGRPCMethod does)
+	entityName := toPascalCase(singularize(tableName))
+	methodName := "Get" + entityName + "By" + toPascalCase(whereFields[0].column)
+	
+	// Get client variable - same logic as getGRPCClientForTable
+	clientVar := t.dmlConfig.StoreVar
+	if t.dmlConfig.GRPCClientVar != "" && t.dmlConfig.GRPCClientVar != "client" {
+		clientVar = t.dmlConfig.GRPCClientVar
+	}
+	if clientVar == "" {
+		clientVar = "client"
+	}
+	
+	// Get proto package
+	protoPackage := t.dmlConfig.ProtoPackage
+	
+	// Build request fields
+	var reqFields []string
+	for _, wf := range whereFields {
+		reqFields = append(reqFields, fmt.Sprintf("\t\t\t%s: %s,", goExportedIdentifier(wf.column), wf.variable))
+	}
+	
+	// Generate the gRPC existence check
+	var out strings.Builder
+	out.WriteString("func() bool {\n")
+	if protoPackage != "" {
+		out.WriteString(fmt.Sprintf("\t\tresp, err := %s.%s(ctx, &%s.%sRequest{\n", clientVar, methodName, protoPackage, methodName))
+	} else {
+		out.WriteString(fmt.Sprintf("\t\tresp, err := %s.%s(ctx, &%sRequest{\n", clientVar, methodName, methodName))
+	}
+	for _, rf := range reqFields {
+		out.WriteString(rf + "\n")
+	}
+	out.WriteString("\t\t})\n")
+	out.WriteString("\t\treturn err == nil && resp != nil\n")
+	out.WriteString("\t}()")
+	
+	return out.String(), true
+}
+
+// extractExistsWhereFields extracts column=variable pairs from a WHERE expression
+func (t *transpiler) extractExistsWhereFields(expr ast.Expression) []struct{ column, variable string } {
+	var fields []struct{ column, variable string }
+	if expr == nil {
+		return fields
+	}
+	
+	switch e := expr.(type) {
+	case *ast.InfixExpression:
+		op := strings.ToUpper(e.Operator)
+		if op == "AND" || op == "OR" {
+			fields = append(fields, t.extractExistsWhereFields(e.Left)...)
+			fields = append(fields, t.extractExistsWhereFields(e.Right)...)
+			return fields
+		}
+		
+		// Extract column name from left side
+		var colName string
+		if id, ok := e.Left.(*ast.Identifier); ok {
+			colName = id.Value
+		} else if qid, ok := e.Left.(*ast.QualifiedIdentifier); ok && len(qid.Parts) > 0 {
+			colName = qid.Parts[len(qid.Parts)-1].Value
+		}
+		
+		if colName == "" {
+			return fields
+		}
+		
+		// Extract value from right side - could be variable or literal
+		var value string
+		switch v := e.Right.(type) {
+		case *ast.Variable:
+			value = goIdentifier(strings.TrimPrefix(v.Name, "@"))
+		case *ast.StringLiteral:
+			value = fmt.Sprintf("%q", v.Value)
+		case *ast.IntegerLiteral:
+			value = fmt.Sprintf("%d", v.Value)
+		case *ast.FloatLiteral:
+			value = fmt.Sprintf("%v", v.Value)
+		case *ast.NullLiteral:
+			value = "nil"
+		case *ast.Identifier:
+			// Could be TRUE/FALSE
+			upper := strings.ToUpper(v.Value)
+			if upper == "TRUE" {
+				value = "true"
+			} else if upper == "FALSE" {
+				value = "false"
+			}
+		}
+		
+		if value != "" {
+			fields = append(fields, struct{ column, variable string }{colName, value})
+		}
+	}
+	
+	return fields
 }
 
 // substituteVariablesForExists replaces @variables with placeholders and returns args
@@ -1534,6 +2344,23 @@ func stripTableHints(sql string) string {
 	}
 	
 	return result
+}
+
+// truncateSQL truncates a SQL string for display in comments
+func truncateSQL(sql string, maxLen int) string {
+	// Normalize whitespace
+	sql = strings.ReplaceAll(sql, "\n", " ")
+	sql = strings.ReplaceAll(sql, "\r", "")
+	sql = strings.ReplaceAll(sql, "\t", " ")
+	for strings.Contains(sql, "  ") {
+		sql = strings.ReplaceAll(sql, "  ", " ")
+	}
+	sql = strings.TrimSpace(sql)
+	
+	if len(sql) <= maxLen {
+		return sql
+	}
+	return sql[:maxLen-3] + "..."
 }
 
 // replaceIgnoreCase performs case-insensitive string replacement

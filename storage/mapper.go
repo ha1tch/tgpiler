@@ -35,9 +35,11 @@ type ParamMapping struct {
 
 // ResultMapping maps procedure results to proto response message.
 type ResultMapping struct {
-	ResponseType   string // Proto response message name
-	ResultSetIndex int    // Which result set (0-indexed)
-	FieldMappings  []FieldMapping
+	ResponseType    string // Proto response message name
+	ResultSetIndex  int    // Which result set (0-indexed)
+	NestedFieldName string // If response wraps a nested message, the field name (e.g., "customer")
+	NestedTypeName  string // If response wraps a nested message, the type name (e.g., "Customer")
+	FieldMappings   []FieldMapping
 }
 
 // FieldMapping maps a result column to a response field.
@@ -368,19 +370,44 @@ func (m *ProtoToSQLMapper) mapResults(method *ProtoMethodInfo, proc *Procedure) 
 		return nil
 	}
 
+	// Use the last result set - typically the success path in T-SQL procedures
+	// Error paths usually RETURN early, so the final SELECT is the success case
+	resultSetIndex := len(proc.ResultSets) - 1
+	resultSet := proc.ResultSets[resultSetIndex]
+
 	rm := &ResultMapping{
 		ResponseType:   method.ResponseType,
-		ResultSetIndex: 0, // Use first result set
+		ResultSetIndex: resultSetIndex,
 	}
 
-	resultSet := proc.ResultSets[0]
-
 	// Build lookup of proto fields
+	// First check if response has a single nested message field (common pattern)
+	// e.g., GetCustomerResponse { Customer customer = 1; }
 	protoFields := make(map[string]*ProtoFieldInfo)
-	for i := range respMsg.Fields {
-		field := &respMsg.Fields[i]
-		protoFields[strings.ToLower(field.Name)] = field
-		protoFields[strings.ReplaceAll(strings.ToLower(field.Name), "_", "")] = field
+	nestedMsgName := ""
+	
+	if len(respMsg.Fields) == 1 && !isScalarType(respMsg.Fields[0].ProtoType) {
+		// Single nested message field - look up that message's fields
+		nestedType := respMsg.Fields[0].ProtoType
+		nestedMsgName = respMsg.Fields[0].Name
+		if nestedMsg, ok := m.proto.AllMessages[nestedType]; ok {
+			for i := range nestedMsg.Fields {
+				field := &nestedMsg.Fields[i]
+				protoFields[strings.ToLower(field.Name)] = field
+				protoFields[strings.ReplaceAll(strings.ToLower(field.Name), "_", "")] = field
+			}
+			rm.NestedFieldName = nestedMsgName
+			rm.NestedTypeName = nestedType
+		}
+	}
+	
+	// If no nested message found, use direct fields
+	if len(protoFields) == 0 {
+		for i := range respMsg.Fields {
+			field := &respMsg.Fields[i]
+			protoFields[strings.ToLower(field.Name)] = field
+			protoFields[strings.ReplaceAll(strings.ToLower(field.Name), "_", "")] = field
+		}
 	}
 
 	for i, col := range resultSet.Columns {
@@ -409,6 +436,17 @@ func (m *ProtoToSQLMapper) mapResults(method *ProtoMethodInfo, proc *Procedure) 
 	}
 
 	return rm
+}
+
+// isScalarType returns true if the type is a protobuf scalar type
+func isScalarType(t string) bool {
+	switch t {
+	case "double", "float", "int32", "int64", "uint32", "uint64",
+		"sint32", "sint64", "fixed32", "fixed64", "sfixed32", "sfixed64",
+		"bool", "string", "bytes":
+		return true
+	}
+	return false
 }
 
 func protoTypeToGo(protoType string) string {

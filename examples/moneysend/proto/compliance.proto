@@ -1,0 +1,489 @@
+syntax = "proto3";
+
+package moneysend.compliance.v1;
+
+option go_package = "github.com/ha1tch/moneysend/proto/compliance/v1;compliancev1";
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/wrappers.proto";
+
+// ComplianceService handles AML screening, risk assessment, and regulatory reporting
+service ComplianceService {
+  // Transfer Compliance
+  rpc ScreenTransfer(ScreenTransferRequest) returns (ScreenTransferResponse);
+  rpc ReviewTransfer(ReviewTransferRequest) returns (ReviewTransferResponse);
+  rpc ApproveTransfer(ApproveTransferRequest) returns (ApproveTransferResponse);
+  rpc BlockTransfer(BlockTransferRequest) returns (BlockTransferResponse);
+  rpc ListFlaggedTransfers(ListFlaggedTransfersRequest) returns (ListFlaggedTransfersResponse);
+  rpc GetTransferComplianceDetails(GetTransferComplianceDetailsRequest) returns (GetTransferComplianceDetailsResponse);
+  
+  // Customer Risk Assessment
+  rpc AssessCustomerRisk(AssessCustomerRiskRequest) returns (AssessCustomerRiskResponse);
+  rpc GetCustomerRiskAssessments(GetCustomerRiskAssessmentsRequest) returns (GetCustomerRiskAssessmentsResponse);
+  rpc FreezeCustomerAccount(FreezeCustomerAccountRequest) returns (FreezeCustomerAccountResponse);
+  rpc UnfreezeCustomerAccount(UnfreezeCustomerAccountRequest) returns (UnfreezeCustomerAccountResponse);
+  
+  // Screening
+  rpc RunComplianceScreening(RunComplianceScreeningRequest) returns (RunComplianceScreeningResponse);
+  rpc ResolveScreeningMatch(ResolveScreeningMatchRequest) returns (ResolveScreeningMatchResponse);
+  rpc GetPendingScreenings(GetPendingScreeningsRequest) returns (GetPendingScreeningsResponse);
+  rpc GetScreeningHistory(GetScreeningHistoryRequest) returns (GetScreeningHistoryResponse);
+  
+  // Suspicious Activity Reports
+  rpc CreateSAR(CreateSARRequest) returns (CreateSARResponse);
+  rpc UpdateSAR(UpdateSARRequest) returns (UpdateSARResponse);
+  rpc FileSAR(FileSARRequest) returns (FileSARResponse);
+  rpc GetSARById(GetSARByIdRequest) returns (GetSARResponse);
+  rpc ListSARs(ListSARsRequest) returns (ListSARsResponse);
+  
+  // KYC Document Review
+  rpc GetPendingKYCReviews(GetPendingKYCReviewsRequest) returns (GetPendingKYCReviewsResponse);
+  rpc ApproveDocument(ApproveDocumentRequest) returns (ApproveDocumentResponse);
+  rpc RejectDocument(RejectDocumentRequest) returns (RejectDocumentResponse);
+  rpc RequestDocumentResubmission(RequestDocumentResubmissionRequest) returns (RequestDocumentResubmissionResponse);
+  rpc ListExpiringDocuments(ListExpiringDocumentsRequest) returns (ListExpiringDocumentsResponse);
+}
+
+// Enums
+enum ScreeningResult {
+  SCREENING_RESULT_UNSPECIFIED = 0;
+  SCREENING_RESULT_CLEAR = 1;
+  SCREENING_RESULT_POTENTIAL_MATCH = 2;
+  SCREENING_RESULT_MATCH = 3;
+  SCREENING_RESULT_ERROR = 4;
+}
+
+enum ResolutionStatus {
+  RESOLUTION_STATUS_UNSPECIFIED = 0;
+  RESOLUTION_STATUS_PENDING_REVIEW = 1;
+  RESOLUTION_STATUS_TRUE_POSITIVE = 2;
+  RESOLUTION_STATUS_FALSE_POSITIVE = 3;
+  RESOLUTION_STATUS_ESCALATED = 4;
+}
+
+enum SARStatus {
+  SAR_STATUS_UNSPECIFIED = 0;
+  SAR_STATUS_DRAFT = 1;
+  SAR_STATUS_PENDING_REVIEW = 2;
+  SAR_STATUS_FILED = 3;
+  SAR_STATUS_ARCHIVED = 4;
+}
+
+enum SuspicionLevel {
+  SUSPICION_LEVEL_UNSPECIFIED = 0;
+  SUSPICION_LEVEL_LOW = 1;
+  SUSPICION_LEVEL_MEDIUM = 2;
+  SUSPICION_LEVEL_HIGH = 3;
+  SUSPICION_LEVEL_CRITICAL = 4;
+}
+
+enum RiskLevel {
+  RISK_LEVEL_UNSPECIFIED = 0;
+  RISK_LEVEL_LOW = 1;
+  RISK_LEVEL_MEDIUM = 2;
+  RISK_LEVEL_HIGH = 3;
+  RISK_LEVEL_PROHIBITED = 4;
+}
+
+enum ComplianceStatus {
+  COMPLIANCE_STATUS_UNSPECIFIED = 0;
+  COMPLIANCE_STATUS_PENDING = 1;
+  COMPLIANCE_STATUS_CLEARED = 2;
+  COMPLIANCE_STATUS_FLAGGED = 3;
+  COMPLIANCE_STATUS_BLOCKED = 4;
+}
+
+// Core Messages
+message ComplianceScreening {
+  int64 screening_id = 1;
+  string entity_type = 2;
+  int64 entity_id = 3;
+  int64 transfer_id = 4;
+  string screening_type = 5;
+  string screening_provider = 6;
+  string provider_reference = 7;
+  ScreeningResult result = 8;
+  double match_score = 9;
+  string match_details = 10;
+  ResolutionStatus resolution_status = 11;
+  string resolved_by = 12;
+  google.protobuf.Timestamp resolved_at = 13;
+  string resolution_notes = 14;
+  string lists_matched = 15;
+  google.protobuf.Timestamp screened_at = 16;
+}
+
+message SuspiciousActivityReport {
+  int64 sar_id = 1;
+  string sar_number = 2;
+  int64 customer_id = 3;
+  int64 beneficiary_id = 4;
+  string transfer_ids = 5;
+  string activity_type = 6;
+  string activity_description = 7;
+  SuspicionLevel suspicion_level = 8;
+  double total_amount_involved = 9;
+  string currency = 10;
+  SARStatus status = 11;
+  string filed_with = 12;
+  string filing_reference = 13;
+  google.protobuf.Timestamp filed_at = 14;
+  string filed_by = 15;
+  string created_by = 16;
+  google.protobuf.Timestamp created_at = 17;
+  google.protobuf.Timestamp updated_at = 18;
+}
+
+message RiskAssessment {
+  int64 assessment_id = 1;
+  int64 customer_id = 2;
+  string assessment_type = 3;
+  string trigger_reason = 4;
+  double country_risk_score = 5;
+  double transaction_risk_score = 6;
+  double behavior_risk_score = 7;
+  double document_risk_score = 8;
+  double overall_risk_score = 9;
+  RiskLevel risk_level = 10;
+  RiskLevel previous_risk_level = 11;
+  bool risk_level_changed = 12;
+  string recommended_actions = 13;
+  bool requires_approval = 14;
+  string approved_by = 15;
+  google.protobuf.Timestamp approved_at = 16;
+  string assessed_by = 17;
+  google.protobuf.Timestamp assessed_at = 18;
+}
+
+message FlaggedTransfer {
+  int64 transfer_id = 1;
+  string transfer_number = 2;
+  double send_amount = 3;
+  string send_currency = 4;
+  double receive_amount = 5;
+  string receive_currency = 6;
+  ComplianceStatus compliance_status = 7;
+  double risk_score = 8;
+  google.protobuf.Timestamp created_at = 9;
+  string customer_email = 10;
+  string customer_first_name = 11;
+  string customer_last_name = 12;
+  RiskLevel customer_risk_level = 13;
+  string beneficiary_first_name = 14;
+  string beneficiary_last_name = 15;
+  string beneficiary_country = 16;
+}
+
+message PendingKYCDocument {
+  int64 document_id = 1;
+  int64 customer_id = 2;
+  string document_type = 3;
+  string document_number = 4;
+  string issuing_country = 5;
+  google.protobuf.Timestamp submitted_at = 6;
+  string first_name = 7;
+  string last_name = 8;
+  string email = 9;
+  string country_of_residence = 10;
+  RiskLevel risk_level = 11;
+  int32 hours_pending = 12;
+}
+
+message ExpiringDocument {
+  int64 document_id = 1;
+  int64 customer_id = 2;
+  string document_type = 3;
+  google.protobuf.Timestamp expiry_date = 4;
+  int32 days_until_expiry = 5;
+  string first_name = 6;
+  string last_name = 7;
+  string email = 8;
+}
+
+// Request/Response Messages
+
+// Transfer Compliance
+message ScreenTransferRequest {
+  int64 transfer_id = 1;
+  string screening_type = 2;
+  string screened_by = 3;
+}
+
+message ScreenTransferResponse {
+  bool success = 1;
+  string error_code = 2;
+  ScreeningResult result = 3;
+  double risk_score = 4;
+  ComplianceStatus compliance_status = 5;
+}
+
+message ReviewTransferRequest {
+  int64 transfer_id = 1;
+  string notes = 2;
+  string reviewed_by = 3;
+}
+
+message ReviewTransferResponse {
+  bool success = 1;
+  string error_code = 2;
+}
+
+message ApproveTransferRequest {
+  int64 transfer_id = 1;
+  string notes = 2;
+  string approved_by = 3;
+}
+
+message ApproveTransferResponse {
+  bool success = 1;
+  string error_code = 2;
+  string error_message = 3;
+}
+
+message BlockTransferRequest {
+  int64 transfer_id = 1;
+  string reason = 2;
+  string blocked_by = 3;
+}
+
+message BlockTransferResponse {
+  bool success = 1;
+  string error_code = 2;
+}
+
+message ListFlaggedTransfersRequest {
+  int32 page_number = 1;
+  int32 page_size = 2;
+}
+
+message ListFlaggedTransfersResponse {
+  repeated FlaggedTransfer transfers = 1;
+  int32 total_count = 2;
+}
+
+message GetTransferComplianceDetailsRequest {
+  int64 transfer_id = 1;
+}
+
+message GetTransferComplianceDetailsResponse {
+  int64 transfer_id = 1;
+  string transfer_number = 2;
+  ComplianceStatus compliance_status = 3;
+  double risk_score = 4;
+  google.protobuf.Timestamp reviewed_at = 5;
+  string reviewed_by = 6;
+  repeated ComplianceScreening screenings = 7;
+}
+
+// Customer Risk Assessment
+message AssessCustomerRiskRequest {
+  int64 customer_id = 1;
+  string assessment_type = 2;
+  string trigger_reason = 3;
+  string assessed_by = 4;
+}
+
+message AssessCustomerRiskResponse {
+  bool success = 1;
+  string error_code = 2;
+  int64 assessment_id = 3;
+  double overall_risk_score = 4;
+  RiskLevel risk_level = 5;
+  bool requires_approval = 6;
+}
+
+message GetCustomerRiskAssessmentsRequest {
+  int64 customer_id = 1;
+  int32 limit = 2;
+}
+
+message GetCustomerRiskAssessmentsResponse {
+  repeated RiskAssessment assessments = 1;
+}
+
+message FreezeCustomerAccountRequest {
+  int64 customer_id = 1;
+  string reason = 2;
+  string frozen_by = 3;
+}
+
+message FreezeCustomerAccountResponse {
+  bool success = 1;
+  string error_code = 2;
+}
+
+message UnfreezeCustomerAccountRequest {
+  int64 customer_id = 1;
+  string reason = 2;
+  string unfrozen_by = 3;
+}
+
+message UnfreezeCustomerAccountResponse {
+  bool success = 1;
+  string error_code = 2;
+}
+
+// Screening
+message RunComplianceScreeningRequest {
+  string entity_type = 1;
+  int64 entity_id = 2;
+  string screening_type = 3;
+  string screening_provider = 4;
+}
+
+message RunComplianceScreeningResponse {
+  bool success = 1;
+  string error_code = 2;
+  int64 screening_id = 3;
+  ScreeningResult result = 4;
+  double match_score = 5;
+}
+
+message ResolveScreeningMatchRequest {
+  int64 screening_id = 1;
+  ResolutionStatus resolution = 2;
+  string notes = 3;
+  string resolved_by = 4;
+}
+
+message ResolveScreeningMatchResponse {
+  bool success = 1;
+  string error_code = 2;
+}
+
+message GetPendingScreeningsRequest {
+  int32 page_number = 1;
+  int32 page_size = 2;
+}
+
+message GetPendingScreeningsResponse {
+  repeated ComplianceScreening screenings = 1;
+  int32 total_count = 2;
+}
+
+message GetScreeningHistoryRequest {
+  string entity_type = 1;
+  int64 entity_id = 2;
+}
+
+message GetScreeningHistoryResponse {
+  repeated ComplianceScreening screenings = 1;
+}
+
+// SARs
+message CreateSARRequest {
+  int64 customer_id = 1;
+  int64 beneficiary_id = 2;
+  repeated int64 transfer_ids = 3;
+  string activity_type = 4;
+  string activity_description = 5;
+  SuspicionLevel suspicion_level = 6;
+  double total_amount_involved = 7;
+  string currency = 8;
+  string created_by = 9;
+}
+
+message CreateSARResponse {
+  bool success = 1;
+  string error_code = 2;
+  int64 sar_id = 3;
+  string sar_number = 4;
+}
+
+message UpdateSARRequest {
+  int64 sar_id = 1;
+  google.protobuf.StringValue activity_type = 2;
+  google.protobuf.StringValue activity_description = 3;
+  SuspicionLevel suspicion_level = 4;
+  google.protobuf.DoubleValue total_amount_involved = 5;
+  string updated_by = 6;
+}
+
+message UpdateSARResponse {
+  bool success = 1;
+  string error_code = 2;
+}
+
+message FileSARRequest {
+  int64 sar_id = 1;
+  string filed_with = 2;
+  string filed_by = 3;
+}
+
+message FileSARResponse {
+  bool success = 1;
+  string error_code = 2;
+  string error_message = 3;
+  string filing_reference = 4;
+}
+
+message GetSARByIdRequest {
+  int64 sar_id = 1;
+}
+
+message GetSARResponse {
+  SuspiciousActivityReport sar = 1;
+}
+
+message ListSARsRequest {
+  SARStatus status = 1;
+  int32 page_number = 2;
+  int32 page_size = 3;
+}
+
+message ListSARsResponse {
+  repeated SuspiciousActivityReport sars = 1;
+  int32 total_count = 2;
+}
+
+// KYC Document Review
+message GetPendingKYCReviewsRequest {
+  int32 page_number = 1;
+  int32 page_size = 2;
+}
+
+message GetPendingKYCReviewsResponse {
+  repeated PendingKYCDocument documents = 1;
+  int32 total_count = 2;
+}
+
+message ApproveDocumentRequest {
+  int64 document_id = 1;
+  string approved_by = 2;
+  string notes = 3;
+}
+
+message ApproveDocumentResponse {
+  bool success = 1;
+  string error_code = 2;
+}
+
+message RejectDocumentRequest {
+  int64 document_id = 1;
+  string rejected_by = 2;
+  string rejection_reason = 3;
+}
+
+message RejectDocumentResponse {
+  bool success = 1;
+  string error_code = 2;
+}
+
+message RequestDocumentResubmissionRequest {
+  int64 customer_id = 1;
+  string document_type = 2;
+  string reason = 3;
+  string requested_by = 4;
+}
+
+message RequestDocumentResubmissionResponse {
+  bool success = 1;
+}
+
+message ListExpiringDocumentsRequest {
+  int32 days_until_expiry = 1;
+}
+
+message ListExpiringDocumentsResponse {
+  repeated ExpiringDocument documents = 1;
+}

@@ -44,7 +44,6 @@ func (r *OrderServiceRepositorySQL) CreateOrder(ctx context.Context, req *Create
 	// Execute stored procedure and scan results
 	query := "EXEC usp_CreateOrder @UserId, @ShippingAddressLine1, @ShippingCity, @ShippingState, @ShippingPostalCode, @ShippingCountry, @BillingAddressLine1, @BillingCity, @BillingState, @BillingPostalCode, @BillingCountry, @DiscountCode, @Notes, @PaymentMethodId"
 	row := r.db.QueryRowContext(ctx, query, req.UserID, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, req.DiscountCode, req.Notes, req.PaymentMethodID)
-	
 	var result CreateOrderResponse
 	err := row.Scan()
 	if err != nil {
@@ -54,8 +53,7 @@ func (r *OrderServiceRepositorySQL) CreateOrder(ctx context.Context, req *Create
 		return nil, fmt.Errorf("CreateOrder: %w", err)
 	}
 	
-	return &CreateOrderResponse{
-	}, nil
+	return &result, nil
 }
 
 
@@ -65,9 +63,8 @@ func (r *OrderServiceRepositorySQL) GetOrder(ctx context.Context, req *GetOrderR
 	// Execute stored procedure and scan results
 	query := "EXEC usp_GetOrderById @OrderId"
 	row := r.db.QueryRowContext(ctx, query, req.ID)
-	
-	var result OrderResponse
-	err := row.Scan()
+	var nested Order
+	err := row.Scan(&nested.ID)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, fmt.Errorf("GetOrder: not found")
@@ -76,7 +73,7 @@ func (r *OrderServiceRepositorySQL) GetOrder(ctx context.Context, req *GetOrderR
 	}
 	
 	return &GetOrderResponse{
-		OrderResponse: &result,
+		Order: &nested,
 	}, nil
 }
 
@@ -101,7 +98,6 @@ func (r *OrderServiceRepositorySQL) ListOrders(ctx context.Context, req *ListOrd
 	// Execute stored procedure and scan results
 	query := "EXEC usp_ListOrders @UserId, @Status, @FromDate, @ToDate"
 	row := r.db.QueryRowContext(ctx, query, req.UserID, req.Status, req.FromDate, req.ToDate)
-	
 	var result ListOrdersResponse
 	err := row.Scan()
 	if err != nil {
@@ -111,8 +107,7 @@ func (r *OrderServiceRepositorySQL) ListOrders(ctx context.Context, req *ListOrd
 		return nil, fmt.Errorf("ListOrders: %w", err)
 	}
 	
-	return &ListOrdersResponse{
-	}, nil
+	return &result, nil
 }
 
 
@@ -122,8 +117,7 @@ func (r *OrderServiceRepositorySQL) UpdateOrderStatus(ctx context.Context, req *
 	// Execute stored procedure and scan results
 	query := "EXEC usp_UpdateOrderStatus @OrderId, @Status, @TrackingNumber, @Carrier, @Notes"
 	row := r.db.QueryRowContext(ctx, query, req.ID, req.Status, req.TrackingNumber, req.Carrier, req.Notes)
-	
-	var result UpdateOrderStatusResponse
+	var nested Order
 	err := row.Scan()
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -133,6 +127,7 @@ func (r *OrderServiceRepositorySQL) UpdateOrderStatus(ctx context.Context, req *
 	}
 	
 	return &UpdateOrderStatusResponse{
+		Order: &nested,
 	}, nil
 }
 
@@ -143,9 +138,8 @@ func (r *OrderServiceRepositorySQL) CancelOrder(ctx context.Context, req *Cancel
 	// Execute stored procedure and scan results
 	query := "EXEC usp_CancelOrder @OrderId, @Reason"
 	row := r.db.QueryRowContext(ctx, query, req.ID, req.Reason)
-	
 	var result CancelOrderResponse
-	err := row.Scan()
+	err := row.Scan(&result.RefundInitiated)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, fmt.Errorf("CancelOrder: not found")
@@ -153,8 +147,7 @@ func (r *OrderServiceRepositorySQL) CancelOrder(ctx context.Context, req *Cancel
 		return nil, fmt.Errorf("CancelOrder: %w", err)
 	}
 	
-	return &CancelOrderResponse{
-	}, nil
+	return &result, nil
 }
 
 
@@ -175,28 +168,38 @@ func (r *OrderServiceRepositorySQL) ProcessPayment(ctx context.Context, req *Pro
 // RefundOrder implements the RefundOrder operation.
 // Mapped to: usp_RefundOrder (confidence: 75%, exact match: usp_RefundOrder)
 func (r *OrderServiceRepositorySQL) RefundOrder(ctx context.Context, req *RefundOrderRequest) (*RefundOrderResponse, error) {
-	// Execute stored procedure (no result mapping)
+	// Execute stored procedure and scan results
 	query := "EXEC usp_RefundOrder @OrderId, @AmountUnits, @Reason, @RefundedBy"
-	_, err := r.db.ExecContext(ctx, query, req.OrderID, nil, req.Reason, nil)
+	row := r.db.QueryRowContext(ctx, query, req.OrderID, nil, req.Reason, nil)
+	var result RefundOrderResponse
+	err := row.Scan(&result.Success, &result.RefundID)
 	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("RefundOrder: not found")
+		}
 		return nil, fmt.Errorf("RefundOrder: %w", err)
 	}
 	
-	return &RefundOrderResponse{}, nil
+	return &result, nil
 }
 
 
 // ValidateDiscountCode implements the ValidateDiscountCode operation.
 // Mapped to: usp_ValidateDiscountCode (confidence: 83%, exact match: usp_ValidateDiscountCode)
 func (r *OrderServiceRepositorySQL) ValidateDiscountCode(ctx context.Context, req *ValidateDiscountCodeRequest) (*ValidateDiscountCodeResponse, error) {
-	// Execute stored procedure (no result mapping)
+	// Execute stored procedure and scan results
 	query := "EXEC usp_ValidateDiscountCode @Code, @UserId, @CartSubtotalUnits"
-	_, err := r.db.ExecContext(ctx, query, req.Code, req.UserID, nil)
+	row := r.db.QueryRowContext(ctx, query, req.Code, req.UserID, nil)
+	var result ValidateDiscountCodeResponse
+	err := row.Scan(&result.IsValid, &result.ErrorMessage, &result.DiscountType)
 	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("ValidateDiscountCode: not found")
+		}
 		return nil, fmt.Errorf("ValidateDiscountCode: %w", err)
 	}
 	
-	return &ValidateDiscountCodeResponse{}, nil
+	return &result, nil
 }
 
 

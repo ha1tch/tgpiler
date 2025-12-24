@@ -1,0 +1,237 @@
+syntax = "proto3";
+
+package moneysend.notification.v1;
+
+option go_package = "github.com/ha1tch/moneysend/proto/notification/v1;notificationv1";
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/wrappers.proto";
+
+// NotificationService handles customer communications across channels
+service NotificationService {
+  // Send Notifications
+  rpc CreateNotificationFromTemplate(CreateNotificationFromTemplateRequest) returns (CreateNotificationFromTemplateResponse);
+  rpc SendTransferInitiatedNotification(SendTransferNotificationRequest) returns (SendNotificationResponse);
+  rpc SendTransferCompletedNotification(SendTransferNotificationRequest) returns (SendNotificationResponse);
+  rpc SendTransferFailedNotification(SendTransferFailedNotificationRequest) returns (SendNotificationResponse);
+  rpc SendKYCReminderNotification(SendCustomerNotificationRequest) returns (SendNotificationResponse);
+  rpc SendDocumentApprovedNotification(SendDocumentNotificationRequest) returns (SendNotificationResponse);
+  rpc SendDocumentRejectedNotification(SendDocumentRejectedNotificationRequest) returns (SendNotificationResponse);
+  
+  // Notification Processing
+  rpc GetPendingNotifications(GetPendingNotificationsRequest) returns (GetPendingNotificationsResponse);
+  rpc MarkNotificationSent(MarkNotificationSentRequest) returns (MarkNotificationResponse);
+  rpc MarkNotificationDelivered(MarkNotificationDeliveredRequest) returns (MarkNotificationResponse);
+  rpc MarkNotificationFailed(MarkNotificationFailedRequest) returns (MarkNotificationResponse);
+  rpc RetryFailedNotifications(RetryFailedNotificationsRequest) returns (RetryFailedNotificationsResponse);
+  
+  // Notification History
+  rpc GetNotificationsByCustomer(GetNotificationsByCustomerRequest) returns (GetNotificationsResponse);
+  rpc GetNotificationStats(GetNotificationStatsRequest) returns (GetNotificationStatsResponse);
+  
+  // Template Management
+  rpc CreateNotificationTemplate(CreateNotificationTemplateRequest) returns (CreateNotificationTemplateResponse);
+  rpc UpdateNotificationTemplate(UpdateNotificationTemplateRequest) returns (UpdateNotificationTemplateResponse);
+  rpc ListNotificationTemplates(ListNotificationTemplatesRequest) returns (ListNotificationTemplatesResponse);
+}
+
+// Enums
+enum NotificationChannel {
+  NOTIFICATION_CHANNEL_UNSPECIFIED = 0;
+  NOTIFICATION_CHANNEL_EMAIL = 1;
+  NOTIFICATION_CHANNEL_SMS = 2;
+  NOTIFICATION_CHANNEL_PUSH = 3;
+}
+
+enum NotificationStatus {
+  NOTIFICATION_STATUS_UNSPECIFIED = 0;
+  NOTIFICATION_STATUS_PENDING = 1;
+  NOTIFICATION_STATUS_SENT = 2;
+  NOTIFICATION_STATUS_DELIVERED = 3;
+  NOTIFICATION_STATUS_FAILED = 4;
+  NOTIFICATION_STATUS_BOUNCED = 5;
+}
+
+// Core Messages
+message Notification {
+  int64 notification_id = 1;
+  int64 customer_id = 2;
+  string recipient_email = 3;
+  string recipient_phone = 4;
+  string related_entity_type = 5;
+  int64 related_entity_id = 6;
+  int32 template_id = 7;
+  NotificationChannel channel = 8;
+  string subject = 9;
+  string body = 10;
+  NotificationStatus status = 11;
+  google.protobuf.Timestamp sent_at = 12;
+  google.protobuf.Timestamp delivered_at = 13;
+  string failure_reason = 14;
+  string provider_name = 15;
+  string provider_message_id = 16;
+  google.protobuf.Timestamp created_at = 17;
+}
+
+message NotificationTemplate {
+  int32 template_id = 1;
+  string template_code = 2;
+  string template_name = 3;
+  NotificationChannel channel = 4;
+  string subject = 5;
+  string body_template = 6;
+  string language = 7;
+  bool is_active = 8;
+}
+
+message NotificationStatsByChannel {
+  NotificationChannel channel = 1;
+  NotificationStatus status = 2;
+  int32 notification_count = 3;
+}
+
+message DeliveryRate {
+  NotificationChannel channel = 1;
+  int32 total_sent = 2;
+  int32 delivered = 3;
+  int32 failed = 4;
+  double delivery_rate = 5;
+}
+
+// Request/Response Messages
+message CreateNotificationFromTemplateRequest {
+  string template_code = 1;
+  int64 customer_id = 2;
+  string related_entity_type = 3;
+  int64 related_entity_id = 4;
+  map<string, string> parameters = 5;
+}
+
+message CreateNotificationFromTemplateResponse {
+  bool success = 1;
+  string error_code = 2;
+  int64 notification_id = 3;
+}
+
+message SendTransferNotificationRequest {
+  int64 transfer_id = 1;
+}
+
+message SendTransferFailedNotificationRequest {
+  int64 transfer_id = 1;
+  string failure_reason = 2;
+}
+
+message SendCustomerNotificationRequest {
+  int64 customer_id = 1;
+}
+
+message SendDocumentNotificationRequest {
+  int64 customer_id = 1;
+  int64 document_id = 2;
+}
+
+message SendDocumentRejectedNotificationRequest {
+  int64 customer_id = 1;
+  int64 document_id = 2;
+  string reason = 3;
+}
+
+message SendNotificationResponse {
+  bool success = 1;
+  string error_code = 2;
+}
+
+message GetPendingNotificationsRequest {
+  NotificationChannel channel = 1;
+  int32 limit = 2;
+}
+
+message GetPendingNotificationsResponse {
+  repeated Notification notifications = 1;
+}
+
+message MarkNotificationSentRequest {
+  int64 notification_id = 1;
+  string provider_name = 2;
+  string provider_message_id = 3;
+}
+
+message MarkNotificationDeliveredRequest {
+  int64 notification_id = 1;
+}
+
+message MarkNotificationFailedRequest {
+  int64 notification_id = 1;
+  string failure_reason = 2;
+}
+
+message MarkNotificationResponse {
+  bool success = 1;
+}
+
+message RetryFailedNotificationsRequest {
+  int32 max_retries = 1;
+}
+
+message RetryFailedNotificationsResponse {
+  int32 retried_count = 1;
+}
+
+message GetNotificationsByCustomerRequest {
+  int64 customer_id = 1;
+  NotificationStatus status = 2;
+  int32 page_number = 3;
+  int32 page_size = 4;
+}
+
+message GetNotificationsResponse {
+  repeated Notification notifications = 1;
+  int32 total_count = 2;
+}
+
+message GetNotificationStatsRequest {
+  google.protobuf.Timestamp start_date = 1;
+  google.protobuf.Timestamp end_date = 2;
+}
+
+message GetNotificationStatsResponse {
+  repeated NotificationStatsByChannel by_channel_status = 1;
+  repeated DeliveryRate delivery_rates = 2;
+}
+
+message CreateNotificationTemplateRequest {
+  string template_code = 1;
+  string template_name = 2;
+  NotificationChannel channel = 3;
+  string subject = 4;
+  string body_template = 5;
+  string language = 6;
+}
+
+message CreateNotificationTemplateResponse {
+  bool success = 1;
+  string error_code = 2;
+  int32 template_id = 3;
+}
+
+message UpdateNotificationTemplateRequest {
+  int32 template_id = 1;
+  google.protobuf.StringValue template_name = 2;
+  google.protobuf.StringValue subject = 3;
+  google.protobuf.StringValue body_template = 4;
+  google.protobuf.BoolValue is_active = 5;
+}
+
+message UpdateNotificationTemplateResponse {
+  bool success = 1;
+}
+
+message ListNotificationTemplatesRequest {
+  NotificationChannel channel = 1;
+  string language = 2;
+}
+
+message ListNotificationTemplatesResponse {
+  repeated NotificationTemplate templates = 1;
+}

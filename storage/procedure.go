@@ -208,18 +208,36 @@ func (e *ProcedureExtractor) extractParameters(sql string) []ProcParameter {
 func (e *ProcedureExtractor) extractResultSets(sql string) []ResultSet {
 	var results []ResultSet
 
-	// Find SELECT statements (simplified - looks for SELECT ... FROM)
-	// This is a basic implementation; real parsing would use the AST
-	reSelect := regexp.MustCompile(`(?is)SELECT\s+(.*?)\s+FROM\s+(\w+)`)
-	matches := reSelect.FindAllStringSubmatch(sql, -1)
+	// Pattern 1: SELECT ... FROM table (with FROM clause)
+	// Skip EXISTS/NOT EXISTS subqueries
+	reSelectFrom := regexp.MustCompile(`(?is)SELECT\s+(.*?)\s+FROM\s+(\w+)`)
+	
+	// Find all EXISTS positions to skip
+	reExists := regexp.MustCompile(`(?is)EXISTS\s*\(\s*SELECT`)
+	existsMatches := reExists.FindAllStringIndex(sql, -1)
+	isInExists := func(pos int) bool {
+		for _, em := range existsMatches {
+			// Check if pos is within 200 chars after EXISTS (
+			if pos > em[0] && pos < em[1]+200 {
+				return true
+			}
+		}
+		return false
+	}
 
-	for _, match := range matches {
-		if len(match) < 3 {
+	matches := reSelectFrom.FindAllStringSubmatchIndex(sql, -1)
+	for _, matchIdx := range matches {
+		if len(matchIdx) < 6 {
+			continue
+		}
+		
+		// Skip if this SELECT is inside an EXISTS clause
+		if isInExists(matchIdx[0]) {
 			continue
 		}
 
-		columnList := match[1]
-		fromTable := match[2]
+		columnList := sql[matchIdx[2]:matchIdx[3]]
+		fromTable := sql[matchIdx[4]:matchIdx[5]]
 
 		// Skip if it's a subquery marker or variable assignment
 		if strings.Contains(strings.ToUpper(columnList), "INTO") {
@@ -228,9 +246,44 @@ func (e *ProcedureExtractor) extractResultSets(sql string) []ResultSet {
 		if strings.HasPrefix(strings.TrimSpace(columnList), "@") {
 			continue
 		}
+		// Skip simple "1" columns (typically from EXISTS checks)
+		if strings.TrimSpace(columnList) == "1" {
+			continue
+		}
 
 		rs := ResultSet{
 			FromTable: fromTable,
+			Columns:   e.parseColumnList(columnList),
+		}
+
+		if len(rs.Columns) > 0 {
+			results = append(results, rs)
+		}
+	}
+
+	// Pattern 2: SELECT without FROM (e.g., SELECT 1 AS Success, @Id AS Id)
+	// These are typically the return values we care about
+	reSelectNoFrom := regexp.MustCompile(`(?is)SELECT\s+(\d+\s+AS\s+\w+[^;]*?)\s*;`)
+	matchesNoFrom := reSelectNoFrom.FindAllStringSubmatch(sql, -1)
+
+	for _, match := range matchesNoFrom {
+		if len(match) < 2 {
+			continue
+		}
+
+		columnList := strings.TrimSpace(match[1])
+
+		// Skip if this has a FROM clause (already handled above)
+		if strings.Contains(strings.ToUpper(columnList), " FROM ") {
+			continue
+		}
+		// Skip if it's INTO (variable assignment)
+		if strings.Contains(strings.ToUpper(columnList), "INTO") {
+			continue
+		}
+
+		rs := ResultSet{
+			FromTable: "", // No FROM clause
 			Columns:   e.parseColumnList(columnList),
 		}
 

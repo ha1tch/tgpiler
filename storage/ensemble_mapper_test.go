@@ -445,3 +445,97 @@ func TestEnsembleMapper_ChangePassword(t *testing.T) {
 		t.Errorf("Expected usp_ChangePassword, got %s", mapping.Procedure.Name)
 	}
 }
+
+func TestEnsembleMapper_BusinessProcessVerbs(t *testing.T) {
+	// Test that business process verbs (approve, reject, certify, etc.) are matched correctly
+	proto := &ProtoParseResult{
+		AllServices: map[string]*ProtoServiceInfo{
+			"WorkflowService": {
+				Name: "WorkflowService",
+				Methods: []ProtoMethodInfo{
+					{Name: "ApproveRequest", RequestType: "ApproveRequestRequest", ResponseType: "ApproveRequestResponse"},
+					{Name: "RejectRequest", RequestType: "RejectRequestRequest", ResponseType: "RejectRequestResponse"},
+					{Name: "CertifyDocument", RequestType: "CertifyDocumentRequest", ResponseType: "CertifyDocumentResponse"},
+					{Name: "EscalateTicket", RequestType: "EscalateTicketRequest", ResponseType: "EscalateTicketResponse"},
+					{Name: "SuspendAccount", RequestType: "SuspendAccountRequest", ResponseType: "SuspendAccountResponse"},
+				},
+			},
+		},
+		AllMessages: map[string]*ProtoMessageInfo{
+			"ApproveRequestRequest":    {Name: "ApproveRequestRequest", Fields: []ProtoFieldInfo{{Name: "request_id", ProtoType: "int64", Number: 1}}},
+			"ApproveRequestResponse":   {Name: "ApproveRequestResponse"},
+			"RejectRequestRequest":     {Name: "RejectRequestRequest", Fields: []ProtoFieldInfo{{Name: "request_id", ProtoType: "int64", Number: 1}}},
+			"RejectRequestResponse":    {Name: "RejectRequestResponse"},
+			"CertifyDocumentRequest":   {Name: "CertifyDocumentRequest", Fields: []ProtoFieldInfo{{Name: "document_id", ProtoType: "int64", Number: 1}}},
+			"CertifyDocumentResponse":  {Name: "CertifyDocumentResponse"},
+			"EscalateTicketRequest":    {Name: "EscalateTicketRequest", Fields: []ProtoFieldInfo{{Name: "ticket_id", ProtoType: "int64", Number: 1}}},
+			"EscalateTicketResponse":   {Name: "EscalateTicketResponse"},
+			"SuspendAccountRequest":    {Name: "SuspendAccountRequest", Fields: []ProtoFieldInfo{{Name: "account_id", ProtoType: "int64", Number: 1}}},
+			"SuspendAccountResponse":   {Name: "SuspendAccountResponse"},
+		},
+		AllMethods: make(map[string]*ProtoMethodInfo),
+	}
+
+	procs := []*Procedure{
+		{
+			Name:       "usp_ApproveRequest",
+			Parameters: []ProcParameter{{Name: "RequestId", SQLType: "BIGINT", GoType: "int64"}},
+			Operations: []Operation{{Type: OpUpdate, Table: "Requests"}},
+		},
+		{
+			Name:       "usp_RejectRequest",
+			Parameters: []ProcParameter{{Name: "RequestId", SQLType: "BIGINT", GoType: "int64"}},
+			Operations: []Operation{{Type: OpUpdate, Table: "Requests"}},
+		},
+		{
+			Name:       "usp_CertifyDocument",
+			Parameters: []ProcParameter{{Name: "DocumentId", SQLType: "BIGINT", GoType: "int64"}},
+			Operations: []Operation{{Type: OpUpdate, Table: "Documents"}},
+		},
+		{
+			Name:       "usp_EscalateTicket",
+			Parameters: []ProcParameter{{Name: "TicketId", SQLType: "BIGINT", GoType: "int64"}},
+			Operations: []Operation{{Type: OpUpdate, Table: "Tickets"}},
+		},
+		{
+			Name:       "usp_SuspendAccount",
+			Parameters: []ProcParameter{{Name: "AccountId", SQLType: "BIGINT", GoType: "int64"}},
+			Operations: []Operation{{Type: OpUpdate, Table: "Accounts"}},
+		},
+	}
+
+	mapper := NewEnsembleMapper(proto, procs)
+	results := mapper.MapAll()
+
+	// Check each business process verb is matched correctly
+	testCases := []struct {
+		method   string
+		expected string
+	}{
+		{"ApproveRequest", "usp_ApproveRequest"},
+		{"RejectRequest", "usp_RejectRequest"},
+		{"CertifyDocument", "usp_CertifyDocument"},
+		{"EscalateTicket", "usp_EscalateTicket"},
+		{"SuspendAccount", "usp_SuspendAccount"},
+	}
+
+	for _, tc := range testCases {
+		key := "WorkflowService." + tc.method
+		mapping, ok := results[key]
+		if !ok {
+			t.Errorf("No mapping found for %s", tc.method)
+			continue
+		}
+
+		if mapping.Procedure == nil {
+			t.Errorf("%s: no procedure matched", tc.method)
+			continue
+		}
+
+		if mapping.Procedure.Name != tc.expected {
+			t.Errorf("%s: expected %s, got %s", tc.method, tc.expected, mapping.Procedure.Name)
+		}
+
+		t.Logf("%s -> %s (%.0f%% confidence)", tc.method, mapping.Procedure.Name, mapping.Confidence*100)
+	}
+}

@@ -1,0 +1,413 @@
+syntax = "proto3";
+
+package moneysend.customer.v1;
+
+option go_package = "github.com/ha1tch/moneysend/proto/customer/v1;customerv1";
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/wrappers.proto";
+
+// CustomerService handles customer registration, authentication, and profile management
+service CustomerService {
+  // Registration & Authentication
+  rpc RegisterCustomer(RegisterCustomerRequest) returns (RegisterCustomerResponse);
+  rpc AuthenticateCustomer(AuthenticateCustomerRequest) returns (AuthenticateCustomerResponse);
+  rpc ChangePassword(ChangePasswordRequest) returns (ChangePasswordResponse);
+  rpc RequestPasswordReset(RequestPasswordResetRequest) returns (RequestPasswordResetResponse);
+  
+  // Profile Management
+  rpc GetCustomerById(GetCustomerByIdRequest) returns (GetCustomerResponse);
+  rpc GetCustomerByExternalId(GetCustomerByExternalIdRequest) returns (GetCustomerResponse);
+  rpc GetCustomerByEmail(GetCustomerByEmailRequest) returns (GetCustomerResponse);
+  rpc UpdateCustomerProfile(UpdateCustomerProfileRequest) returns (UpdateCustomerProfileResponse);
+  rpc UpdateCustomerAddress(UpdateCustomerAddressRequest) returns (UpdateCustomerAddressResponse);
+  rpc VerifyCustomerPhone(VerifyCustomerPhoneRequest) returns (VerifyCustomerPhoneResponse);
+  
+  // Account Status
+  rpc SuspendCustomer(SuspendCustomerRequest) returns (SuspendCustomerResponse);
+  rpc ReactivateCustomer(ReactivateCustomerRequest) returns (ReactivateCustomerResponse);
+  rpc CloseCustomerAccount(CloseCustomerAccountRequest) returns (CloseCustomerAccountResponse);
+  rpc LockCustomerAccount(LockCustomerAccountRequest) returns (LockCustomerAccountResponse);
+  rpc UnlockCustomerAccount(UnlockCustomerAccountRequest) returns (UnlockCustomerAccountResponse);
+  
+  // Verification & Limits
+  rpc UpgradeCustomerTier(UpgradeCustomerTierRequest) returns (UpgradeCustomerTierResponse);
+  rpc UpdateCustomerLimits(UpdateCustomerLimitsRequest) returns (UpdateCustomerLimitsResponse);
+  rpc GetCustomerRiskProfile(GetCustomerRiskProfileRequest) returns (GetCustomerRiskProfileResponse);
+  rpc GetCustomerVerificationHistory(GetCustomerVerificationHistoryRequest) returns (GetCustomerVerificationHistoryResponse);
+  
+  // Search & List
+  rpc SearchCustomers(SearchCustomersRequest) returns (SearchCustomersResponse);
+  rpc ListCustomersByKYCStatus(ListCustomersByKYCStatusRequest) returns (ListCustomersResponse);
+  rpc ListHighRiskCustomers(ListHighRiskCustomersRequest) returns (ListCustomersResponse);
+}
+
+// Enums
+enum CustomerStatus {
+  CUSTOMER_STATUS_UNSPECIFIED = 0;
+  CUSTOMER_STATUS_ACTIVE = 1;
+  CUSTOMER_STATUS_SUSPENDED = 2;
+  CUSTOMER_STATUS_CLOSED = 3;
+  CUSTOMER_STATUS_FROZEN = 4;
+}
+
+enum KYCStatus {
+  KYC_STATUS_UNSPECIFIED = 0;
+  KYC_STATUS_PENDING = 1;
+  KYC_STATUS_VERIFIED = 2;
+  KYC_STATUS_REJECTED = 3;
+  KYC_STATUS_EXPIRED = 4;
+}
+
+enum RiskLevel {
+  RISK_LEVEL_UNSPECIFIED = 0;
+  RISK_LEVEL_LOW = 1;
+  RISK_LEVEL_MEDIUM = 2;
+  RISK_LEVEL_HIGH = 3;
+  RISK_LEVEL_PROHIBITED = 4;
+}
+
+// Core Messages
+message Customer {
+  int64 customer_id = 1;
+  string external_id = 2;
+  string email = 3;
+  string phone_number = 4;
+  bool phone_verified = 5;
+  string first_name = 6;
+  string middle_name = 7;
+  string last_name = 8;
+  string date_of_birth = 9;
+  string nationality = 10;
+  string country_of_residence = 11;
+  Address address = 12;
+  int32 verification_tier = 13;
+  KYCStatus kyc_status = 14;
+  google.protobuf.Timestamp kyc_verified_at = 15;
+  google.protobuf.Timestamp kyc_expires_at = 16;
+  double risk_score = 17;
+  RiskLevel risk_level = 18;
+  CustomerLimits limits = 19;
+  CustomerStatus status = 20;
+  string preferred_language = 21;
+  string preferred_currency = 22;
+  google.protobuf.Timestamp created_at = 23;
+  google.protobuf.Timestamp last_login_at = 24;
+}
+
+message CustomerSummary {
+  int64 customer_id = 1;
+  string external_id = 2;
+  string email = 3;
+  string first_name = 4;
+  string last_name = 5;
+  string country_of_residence = 6;
+  int32 verification_tier = 7;
+  KYCStatus kyc_status = 8;
+  RiskLevel risk_level = 9;
+  CustomerStatus status = 10;
+  google.protobuf.Timestamp created_at = 11;
+}
+
+message Address {
+  string address_line1 = 1;
+  string address_line2 = 2;
+  string city = 3;
+  string state_province = 4;
+  string postal_code = 5;
+  string country = 6;
+}
+
+message CustomerLimits {
+  double daily_limit_usd = 1;
+  double monthly_limit_usd = 2;
+  double yearly_limit_usd = 3;
+  double single_tx_limit_usd = 4;
+}
+
+message VerificationHistoryEntry {
+  int64 history_id = 1;
+  string action_type = 2;
+  string previous_value = 3;
+  string new_value = 4;
+  string reason = 5;
+  string performed_by = 6;
+  google.protobuf.Timestamp performed_at = 7;
+}
+
+message RiskAssessment {
+  int64 assessment_id = 1;
+  string assessment_type = 2;
+  double overall_risk_score = 3;
+  RiskLevel risk_level = 4;
+  RiskLevel previous_risk_level = 5;
+  bool risk_level_changed = 6;
+  google.protobuf.Timestamp assessed_at = 7;
+}
+
+// Request/Response Messages
+message RegisterCustomerRequest {
+  string email = 1;
+  string password_hash = 2;
+  string first_name = 3;
+  string last_name = 4;
+  string phone_number = 5;
+  string country_of_residence = 6;
+  string preferred_language = 7;
+  string preferred_currency = 8;
+  bool marketing_consent = 9;
+  string source_channel = 10;
+  string source_ip = 11;
+}
+
+message RegisterCustomerResponse {
+  bool success = 1;
+  string error_code = 2;
+  string error_message = 3;
+  int64 customer_id = 4;
+  string external_id = 5;
+  string email = 6;
+  KYCStatus kyc_status = 7;
+  int32 verification_tier = 8;
+}
+
+message AuthenticateCustomerRequest {
+  string email = 1;
+  string password_hash = 2;
+  string ip_address = 3;
+  string device_info = 4;
+}
+
+message AuthenticateCustomerResponse {
+  bool success = 1;
+  string error_code = 2;
+  string error_message = 3;
+  Customer customer = 4;
+  google.protobuf.Timestamp locked_until = 5;
+}
+
+message GetCustomerByIdRequest {
+  int64 customer_id = 1;
+}
+
+message GetCustomerByExternalIdRequest {
+  string external_id = 1;
+}
+
+message GetCustomerByEmailRequest {
+  string email = 1;
+}
+
+message GetCustomerResponse {
+  Customer customer = 1;
+}
+
+message UpdateCustomerProfileRequest {
+  int64 customer_id = 1;
+  google.protobuf.StringValue first_name = 2;
+  google.protobuf.StringValue middle_name = 3;
+  google.protobuf.StringValue last_name = 4;
+  google.protobuf.StringValue date_of_birth = 5;
+  google.protobuf.StringValue nationality = 6;
+  google.protobuf.StringValue phone_number = 7;
+}
+
+message UpdateCustomerProfileResponse {
+  bool success = 1;
+  string error_code = 2;
+  Customer customer = 3;
+}
+
+message UpdateCustomerAddressRequest {
+  int64 customer_id = 1;
+  string address_line1 = 2;
+  string address_line2 = 3;
+  string city = 4;
+  string state_province = 5;
+  string postal_code = 6;
+  string country = 7;
+}
+
+message UpdateCustomerAddressResponse {
+  bool success = 1;
+  string error_code = 2;
+}
+
+message VerifyCustomerPhoneRequest {
+  int64 customer_id = 1;
+  string phone_number = 2;
+}
+
+message VerifyCustomerPhoneResponse {
+  bool success = 1;
+  string error_code = 2;
+}
+
+message SuspendCustomerRequest {
+  int64 customer_id = 1;
+  string suspension_reason = 2;
+  string suspended_by = 3;
+}
+
+message SuspendCustomerResponse {
+  bool success = 1;
+  string error_code = 2;
+}
+
+message ReactivateCustomerRequest {
+  int64 customer_id = 1;
+  string reactivated_by = 2;
+  string notes = 3;
+}
+
+message ReactivateCustomerResponse {
+  bool success = 1;
+  string error_code = 2;
+  string error_message = 3;
+}
+
+message CloseCustomerAccountRequest {
+  int64 customer_id = 1;
+  string closure_reason = 2;
+  string closed_by = 3;
+}
+
+message CloseCustomerAccountResponse {
+  bool success = 1;
+  string error_code = 2;
+  string error_message = 3;
+}
+
+message LockCustomerAccountRequest {
+  int64 customer_id = 1;
+  int32 lock_duration_minutes = 2;
+  string reason = 3;
+}
+
+message LockCustomerAccountResponse {
+  bool success = 1;
+}
+
+message UnlockCustomerAccountRequest {
+  int64 customer_id = 1;
+  string unlocked_by = 2;
+}
+
+message UnlockCustomerAccountResponse {
+  bool success = 1;
+}
+
+message UpgradeCustomerTierRequest {
+  int64 customer_id = 1;
+  int32 new_tier = 2;
+  string upgraded_by = 3;
+  string reason = 4;
+}
+
+message UpgradeCustomerTierResponse {
+  bool success = 1;
+  string error_code = 2;
+  string error_message = 3;
+  int32 new_tier = 4;
+  double daily_limit = 5;
+  double monthly_limit = 6;
+}
+
+message UpdateCustomerLimitsRequest {
+  int64 customer_id = 1;
+  google.protobuf.DoubleValue daily_limit_usd = 2;
+  google.protobuf.DoubleValue monthly_limit_usd = 3;
+  google.protobuf.DoubleValue yearly_limit_usd = 4;
+  google.protobuf.DoubleValue single_tx_limit_usd = 5;
+  string updated_by = 6;
+  string reason = 7;
+}
+
+message UpdateCustomerLimitsResponse {
+  bool success = 1;
+  string error_code = 2;
+}
+
+message GetCustomerRiskProfileRequest {
+  int64 customer_id = 1;
+}
+
+message GetCustomerRiskProfileResponse {
+  int64 customer_id = 1;
+  double risk_score = 2;
+  RiskLevel risk_level = 3;
+  int32 verification_tier = 4;
+  KYCStatus kyc_status = 5;
+  string country_of_residence = 6;
+  RiskLevel country_risk_level = 7;
+  repeated RiskAssessment recent_assessments = 8;
+  TransferStatistics transfer_statistics = 9;
+}
+
+message TransferStatistics {
+  int32 total_transfers = 1;
+  int32 completed_transfers = 2;
+  int32 flagged_transfers = 3;
+  double total_send_volume = 4;
+  double avg_transfer_amount = 5;
+}
+
+message GetCustomerVerificationHistoryRequest {
+  int64 customer_id = 1;
+}
+
+message GetCustomerVerificationHistoryResponse {
+  repeated VerificationHistoryEntry entries = 1;
+}
+
+message SearchCustomersRequest {
+  string search_term = 1;
+  CustomerStatus status = 2;
+  string country = 3;
+  RiskLevel risk_level = 4;
+  int32 page_number = 5;
+  int32 page_size = 6;
+}
+
+message SearchCustomersResponse {
+  repeated CustomerSummary customers = 1;
+  int32 total_count = 2;
+}
+
+message ListCustomersByKYCStatusRequest {
+  KYCStatus kyc_status = 1;
+  int32 page_number = 2;
+  int32 page_size = 3;
+}
+
+message ListHighRiskCustomersRequest {
+  RiskLevel risk_level = 1;
+  int32 page_number = 2;
+  int32 page_size = 3;
+}
+
+message ListCustomersResponse {
+  repeated CustomerSummary customers = 1;
+  int32 total_count = 2;
+}
+
+message ChangePasswordRequest {
+  int64 customer_id = 1;
+  string old_password_hash = 2;
+  string new_password_hash = 3;
+}
+
+message ChangePasswordResponse {
+  bool success = 1;
+  string error_code = 2;
+  string error_message = 3;
+}
+
+message RequestPasswordResetRequest {
+  string email = 1;
+}
+
+message RequestPasswordResetResponse {
+  bool success = 1;
+  string message = 2;
+}

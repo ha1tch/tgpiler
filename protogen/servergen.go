@@ -24,6 +24,7 @@ type ServerGenOptions struct {
 	UseContext      bool   // Include context.Context in method signatures
 	GenerateMocks   bool   // Also generate mock implementations
 	OutputDir       string // Output directory
+	Dialect         string // SQL dialect (postgres, mysql, sqlserver, sqlite)
 }
 
 // DefaultServerGenOptions returns sensible defaults.
@@ -33,6 +34,7 @@ func DefaultServerGenOptions() ServerGenOptions {
 		IncludeComments: true,
 		UseContext:      true,
 		GenerateMocks:   false,
+		Dialect:         "postgres",
 	}
 }
 

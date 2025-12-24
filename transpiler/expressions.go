@@ -24,7 +24,25 @@ func (t *transpiler) transpileExpression(expr ast.Expression) (string, error) {
 		return strings.Join(parts, "."), nil
 
 	case *ast.Variable:
-		return goIdentifier(e.Name), nil
+		// Handle special system variables
+		upperName := strings.ToUpper(e.Name)
+		switch upperName {
+		case "@@IDENTITY":
+			return t.transpileIdentityFunction()
+		case "@@ROWCOUNT":
+			// rowsAffected is declared at function start if @@ROWCOUNT is used
+			return "rowsAffected", nil
+		case "@@ERROR":
+			// In Go, errors are returned explicitly
+			return "0 /* @@ERROR: check err != nil instead */", nil
+		case "@@TRANCOUNT":
+			// Transaction count - not directly available in Go
+			return "0 /* @@TRANCOUNT: track transaction state in Go */", nil
+		}
+		// Mark variable as used (read)
+		varName := goIdentifier(e.Name)
+		t.symbols.markUsed(varName)
+		return varName, nil
 
 	case *ast.IntegerLiteral:
 		return fmt.Sprintf("%d", e.Value), nil
@@ -103,8 +121,57 @@ func (t *transpiler) transpileExpression(expr ast.Expression) (string, error) {
 	case *ast.MethodCallExpression:
 		return t.transpileMethodCallExpression(e)
 
+	case *ast.NextValueForExpression:
+		seqName := ""
+		if e.SequenceName != nil {
+			for _, part := range e.SequenceName.Parts {
+				if seqName != "" {
+					seqName += "."
+				}
+				seqName += part.Value
+			}
+		}
+		return t.transpileNextValueFor(seqName)
+
 	default:
-		return "", fmt.Errorf("unsupported expression type: %T", expr)
+		return "", unsupportedExpressionError(expr)
+	}
+}
+
+// unsupportedExpressionError returns a helpful error message for unsupported expressions.
+func unsupportedExpressionError(expr ast.Expression) error {
+	typeName := fmt.Sprintf("%T", expr)
+	
+	// Provide specific hints based on type name
+	switch {
+	case strings.Contains(typeName, "NextValueFor"):
+		return fmt.Errorf("unsupported expression type: %s\n"+
+			"      Hint: NEXT VALUE FOR sequences are not yet supported.\n"+
+			"      Workaround: Replace with a placeholder and implement sequence\n"+
+			"      logic in Go using result.LastInsertId() or uuid.New().", typeName)
+	
+	case strings.Contains(typeName, "Over"):
+		return fmt.Errorf("unsupported expression type: %s\n"+
+			"      Hint: Window functions (OVER clause) are not yet supported.\n"+
+			"      Workaround: Compute aggregations in Go after fetching results,\n"+
+			"      or keep window function queries in the database.", typeName)
+	
+	case strings.Contains(typeName, "Pivot") || strings.Contains(typeName, "Unpivot"):
+		return fmt.Errorf("unsupported expression type: %s\n"+
+			"      Hint: PIVOT/UNPIVOT are not yet supported.\n"+
+			"      Workaround: Transform the data in Go after fetching,\n"+
+			"      or use a view in the database.", typeName)
+	
+	case strings.Contains(typeName, "XML"):
+		return fmt.Errorf("unsupported expression type: %s\n"+
+			"      Hint: XML expressions are partially supported.\n"+
+			"      Use --dml mode for FOR XML queries.\n"+
+			"      Complex XML operations may need manual conversion.", typeName)
+	
+	default:
+		return fmt.Errorf("unsupported expression type: %s\n"+
+			"      Hint: This expression type is not yet implemented.\n"+
+			"      Please file an issue at github.com/ha1tch/tgpiler if you need it.", typeName)
 	}
 }
 
@@ -698,6 +765,11 @@ func (t *transpiler) transpileFunctionCall(fc *ast.FunctionCall) (string, error)
 		args = append(args, a)
 	}
 
+	// Check for user-defined functions first
+	if udf, ok := t.userFunctions[strings.ToLower(funcName)]; ok {
+		return fmt.Sprintf("%s(%s)", udf.goName, strings.Join(args, ", ")), nil
+	}
+
 	// Map common T-SQL functions to Go equivalents
 	switch funcName {
 	case "LEN":
@@ -970,8 +1042,7 @@ func (t *transpiler) transpileFunctionCall(fc *ast.FunctionCall) (string, error)
 		}
 
 	case "NEWID":
-		// Would need a UUID library
-		return "", fmt.Errorf("NEWID() requires uuid library (not yet implemented)")
+		return t.transpileNewid()
 
 	case "IIF":
 		// IIF(condition, true_value, false_value)
@@ -1004,6 +1075,35 @@ func (t *transpiler) transpileFunctionCall(fc *ast.FunctionCall) (string, error)
 		// Use runtime.Caller to get approximate line info
 		t.imports["runtime"] = true
 		return "func() int { _, _, line, _ := runtime.Caller(0); return line }()", nil
+
+	// Identity/Sequence functions
+	case "SCOPE_IDENTITY", "@@IDENTITY":
+		return t.transpileIdentityFunction()
+
+	case "IDENT_CURRENT":
+		// IDENT_CURRENT('tablename') - not directly translatable
+		// Generate a placeholder
+		if len(args) == 1 {
+			return fmt.Sprintf("0 /* TODO: IDENT_CURRENT(%s) - implement table-specific identity retrieval */", args[0]), nil
+		}
+
+	case "OBJECT_ID":
+		// OBJECT_ID('name') checks if database object exists
+		// For temp tables: OBJECT_ID('tempdb..#tableName') checks temp table existence
+		if len(args) == 1 {
+			objName := strings.Trim(args[0], "\"")
+			// Check for temp table pattern
+			if strings.Contains(objName, "#") {
+				// Extract temp table name
+				parts := strings.Split(objName, "#")
+				if len(parts) >= 2 {
+					tableName := "#" + parts[len(parts)-1]
+					return fmt.Sprintf("tempTables.Exists(%q) /* OBJECT_ID check for temp table */", tableName), nil
+				}
+			}
+			// For other objects, generate a comment
+			return fmt.Sprintf("nil /* TODO: OBJECT_ID(%s) - check if object exists in database */", args[0]), nil
+		}
 	}
 
 	// Default: output as-is (unknown function) - use exported name as it's likely a procedure
@@ -1473,7 +1573,29 @@ func (t *transpiler) transpileInExpression(e *ast.InExpression) (string, error) 
 }
 
 // transpileMethodCallExpression handles XML method calls like @xml.value('/xpath', 'type')
+// and also user-defined function calls like dbo.fn_GenerateTransferNumber()
 func (t *transpiler) transpileMethodCallExpression(e *ast.MethodCallExpression) (string, error) {
+	// Check if this is a user-defined function call (e.g., dbo.fn_MyFunction())
+	// The "Object" would be a schema name like "dbo" and "MethodName" is the function name
+	if id, ok := e.Object.(*ast.Identifier); ok {
+		schemaName := strings.ToLower(id.Value)
+		if schemaName == "dbo" || schemaName == "schema" {
+			// Check if this is a user-defined function
+			funcNameLower := strings.ToLower(e.MethodName)
+			if udf, ok := t.userFunctions[funcNameLower]; ok {
+				var args []string
+				for _, arg := range e.Arguments {
+					a, err := t.transpileExpression(arg)
+					if err != nil {
+						return "", err
+					}
+					args = append(args, a)
+				}
+				return fmt.Sprintf("%s(%s)", udf.goName, strings.Join(args, ", ")), nil
+			}
+		}
+	}
+
 	// Get the object (variable) being called on
 	obj, err := t.transpileExpression(e.Object)
 	if err != nil {
@@ -1568,5 +1690,124 @@ func (t *transpiler) transpileMethodCallExpression(e *ast.MethodCallExpression) 
 
 	default:
 		return "", fmt.Errorf("unsupported method: %s", e.MethodName)
+	}
+}
+
+// transpileIdentityFunction handles SCOPE_IDENTITY() and @@IDENTITY
+func (t *transpiler) transpileIdentityFunction() (string, error) {
+	if !t.dmlEnabled {
+		// Non-DML mode: generate a placeholder function call
+		return "ScopeIdentity() /* TODO: implement or use DML mode */", nil
+	}
+
+	switch t.dmlConfig.SequenceMode {
+	case "uuid":
+		// UUID mode doesn't use identity - this is likely an error in the source
+		return "0 /* WARNING: SCOPE_IDENTITY() called but using UUID mode */", nil
+	case "stub":
+		return "0 /* TODO: implement SCOPE_IDENTITY() - capture LastInsertId() after INSERT */", nil
+	case "db", "":
+		// In database mode, SCOPE_IDENTITY() should use the result from the previous INSERT.
+		// The developer needs to capture result.LastInsertId() after their INSERT.
+		// We generate a variable reference that they need to set up.
+		return "lastInsertId /* set this from result.LastInsertId() after INSERT */", nil
+	default:
+		return "lastInsertId /* set this from result.LastInsertId() after INSERT */", nil
+	}
+}
+
+// transpileNextValueFor handles NEXT VALUE FOR <sequence> expressions
+func (t *transpiler) transpileNextValueFor(seqName string) (string, error) {
+	if !t.dmlEnabled {
+		return "", fmt.Errorf("NEXT VALUE FOR requires DML mode")
+	}
+
+	switch t.dmlConfig.SequenceMode {
+	case "uuid":
+		t.imports["github.com/google/uuid"] = true
+		return "uuid.New().String()", nil
+	case "stub":
+		return fmt.Sprintf("0 /* TODO: implement NEXT VALUE FOR %s */", seqName), nil
+	case "db", "":
+		// Database-specific sequence handling
+		// Generate an inline query to fetch the next sequence value
+		switch t.dmlConfig.SQLDialect {
+		case "postgres":
+			// Postgres: SELECT nextval('sequence_name')
+			seqLower := strings.ToLower(seqName)
+			return fmt.Sprintf("func() int64 { var id int64; %s.QueryRowContext(ctx, \"SELECT nextval('%s')\").Scan(&id); return id }()",
+				t.dmlConfig.StoreVar, seqLower), nil
+		case "mysql":
+			// MySQL doesn't have sequences - use AUTO_INCREMENT
+			return fmt.Sprintf("0 /* MySQL: no sequences - use AUTO_INCREMENT and LastInsertId() after INSERT */"), nil
+		case "sqlserver":
+			// SQL Server: keep the expression for passthrough mode
+			return fmt.Sprintf("func() int64 { var id int64; %s.QueryRowContext(ctx, \"SELECT NEXT VALUE FOR %s\").Scan(&id); return id }()",
+				t.dmlConfig.StoreVar, seqName), nil
+		default:
+			return fmt.Sprintf("0 /* TODO: NEXT VALUE FOR %s - implement for dialect %s */", seqName, t.dmlConfig.SQLDialect), nil
+		}
+	default:
+		return fmt.Sprintf("0 /* TODO: NEXT VALUE FOR %s */", seqName), nil
+	}
+}
+
+// transpileNewid handles NEWID() based on the configured mode
+func (t *transpiler) transpileNewid() (string, error) {
+	if !t.dmlEnabled {
+		return "", fmt.Errorf("NEWID() requires DML mode (--dml)")
+	}
+
+	mode := t.dmlConfig.NewidMode
+	if mode == "" {
+		mode = "app" // Default to app-side UUID
+	}
+
+	switch mode {
+	case "app":
+		// Generate UUID application-side using google/uuid
+		t.imports["github.com/google/uuid"] = true
+		return "uuid.New().String()", nil
+
+	case "db":
+		// Use database-specific UUID function
+		switch t.dmlConfig.SQLDialect {
+		case "postgres":
+			return fmt.Sprintf("func() string { var id string; %s.QueryRowContext(ctx, \"SELECT gen_random_uuid()::text\").Scan(&id); return id }()",
+				t.dmlConfig.StoreVar), nil
+		case "mysql":
+			return fmt.Sprintf("func() string { var id string; %s.QueryRowContext(ctx, \"SELECT UUID()\").Scan(&id); return id }()",
+				t.dmlConfig.StoreVar), nil
+		case "sqlite":
+			// SQLite lacks native UUID - fall back to app-side
+			t.imports["github.com/google/uuid"] = true
+			return "uuid.New().String() /* SQLite: no native UUID, using app-side */", nil
+		case "sqlserver":
+			return fmt.Sprintf("func() string { var id string; %s.QueryRowContext(ctx, \"SELECT NEWID()\").Scan(&id); return id }()",
+				t.dmlConfig.StoreVar), nil
+		default:
+			// Unknown dialect - fall back to app-side
+			t.imports["github.com/google/uuid"] = true
+			return "uuid.New().String()", nil
+		}
+
+	case "grpc":
+		// Call gRPC ID service
+		if t.dmlConfig.IDServiceVar == "" {
+			return "", fmt.Errorf("NEWID() with --newid=grpc requires --id-service=<client>")
+		}
+		return fmt.Sprintf("%s.GenerateUUID(ctx)", t.dmlConfig.IDServiceVar), nil
+
+	case "mock":
+		// Generate predictable sequential UUIDs for testing
+		t.imports["github.com/ha1tch/tgpiler/tsqlruntime"] = true
+		return "tsqlruntime.NextMockUUID()", nil
+
+	case "stub":
+		// Generate TODO placeholder
+		return "\"\" /* TODO: implement NEWID() */", nil
+
+	default:
+		return "", fmt.Errorf("unknown --newid mode: %s (valid: app, db, grpc, mock, stub)", mode)
 	}
 }

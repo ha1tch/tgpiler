@@ -1,0 +1,417 @@
+syntax = "proto3";
+
+package moneysend.partner.v1;
+
+option go_package = "github.com/ha1tch/moneysend/proto/partner/v1;partnerv1";
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/wrappers.proto";
+
+// PartnerService handles payout partner management and settlements
+service PartnerService {
+  // Partner Management
+  rpc CreatePartner(CreatePartnerRequest) returns (CreatePartnerResponse);
+  rpc GetPartnerById(GetPartnerByIdRequest) returns (GetPartnerResponse);
+  rpc GetPartnerByCode(GetPartnerByCodeRequest) returns (GetPartnerResponse);
+  rpc UpdatePartner(UpdatePartnerRequest) returns (UpdatePartnerResponse);
+  rpc SuspendPartner(SuspendPartnerRequest) returns (SuspendPartnerResponse);
+  rpc ReactivatePartner(ReactivatePartnerRequest) returns (ReactivatePartnerResponse);
+  rpc ListPartners(ListPartnersRequest) returns (ListPartnersResponse);
+  rpc ListPartnersByCountry(ListPartnersByCountryRequest) returns (ListPartnersResponse);
+  
+  // Partner Balance
+  rpc GetPartnerBalance(GetPartnerBalanceRequest) returns (GetPartnerBalanceResponse);
+  rpc UpdatePartnerBalance(UpdatePartnerBalanceRequest) returns (UpdatePartnerBalanceResponse);
+  rpc GetPartnerBalanceHistory(GetPartnerBalanceHistoryRequest) returns (GetPartnerBalanceHistoryResponse);
+  
+  // Corridor-Partner Mapping
+  rpc AssignPartnerToCorridor(AssignPartnerToCorridorRequest) returns (AssignPartnerToCorridorResponse);
+  rpc RemovePartnerFromCorridor(RemovePartnerFromCorridorRequest) returns (RemovePartnerFromCorridorResponse);
+  rpc GetCorridorPartners(GetCorridorPartnersRequest) returns (GetCorridorPartnersResponse);
+  rpc GetPartnerForTransfer(GetPartnerForTransferRequest) returns (GetPartnerForTransferResponse);
+  
+  // Settlements
+  rpc CreateSettlement(CreateSettlementRequest) returns (CreateSettlementResponse);
+  rpc GetSettlementById(GetSettlementByIdRequest) returns (GetSettlementResponse);
+  rpc ListSettlementsByPartner(ListSettlementsByPartnerRequest) returns (ListSettlementsResponse);
+  rpc ListPendingSettlements(ListPendingSettlementsRequest) returns (ListSettlementsResponse);
+  rpc MarkSettlementPaid(MarkSettlementPaidRequest) returns (MarkSettlementPaidResponse);
+  rpc ReconcileSettlement(ReconcileSettlementRequest) returns (ReconcileSettlementResponse);
+  rpc GenerateSettlementReport(GenerateSettlementReportRequest) returns (GenerateSettlementReportResponse);
+}
+
+// Enums
+enum PartnerType {
+  PARTNER_TYPE_UNSPECIFIED = 0;
+  PARTNER_TYPE_BANK = 1;
+  PARTNER_TYPE_CASH_NETWORK = 2;
+  PARTNER_TYPE_MOBILE_WALLET = 3;
+  PARTNER_TYPE_CORRESPONDENT = 4;
+}
+
+enum IntegrationType {
+  INTEGRATION_TYPE_UNSPECIFIED = 0;
+  INTEGRATION_TYPE_API = 1;
+  INTEGRATION_TYPE_SFTP = 2;
+  INTEGRATION_TYPE_MANUAL = 3;
+}
+
+enum PartnerStatus {
+  PARTNER_STATUS_UNSPECIFIED = 0;
+  PARTNER_STATUS_ACTIVE = 1;
+  PARTNER_STATUS_SUSPENDED = 2;
+  PARTNER_STATUS_TERMINATED = 3;
+}
+
+enum SettlementStatus {
+  SETTLEMENT_STATUS_UNSPECIFIED = 0;
+  SETTLEMENT_STATUS_PENDING = 1;
+  SETTLEMENT_STATUS_INVOICED = 2;
+  SETTLEMENT_STATUS_PAID = 3;
+  SETTLEMENT_STATUS_RECONCILED = 4;
+  SETTLEMENT_STATUS_DISPUTED = 5;
+}
+
+enum SettlementDirection {
+  SETTLEMENT_DIRECTION_UNSPECIFIED = 0;
+  SETTLEMENT_DIRECTION_PAYABLE = 1;
+  SETTLEMENT_DIRECTION_RECEIVABLE = 2;
+}
+
+enum SettlementFrequency {
+  SETTLEMENT_FREQUENCY_UNSPECIFIED = 0;
+  SETTLEMENT_FREQUENCY_REALTIME = 1;
+  SETTLEMENT_FREQUENCY_DAILY = 2;
+  SETTLEMENT_FREQUENCY_WEEKLY = 3;
+}
+
+// Core Messages
+message Partner {
+  int32 partner_id = 1;
+  string partner_code = 2;
+  string partner_name = 3;
+  PartnerType partner_type = 4;
+  repeated string countries = 5;
+  repeated string currencies = 6;
+  repeated string payout_methods = 7;
+  IntegrationType integration_type = 8;
+  string api_endpoint = 9;
+  string api_version = 10;
+  string settlement_currency = 11;
+  SettlementFrequency settlement_frequency = 12;
+  double credit_limit = 13;
+  double current_balance = 14;
+  string partner_fee_type = 15;
+  double partner_fee = 16;
+  PartnerStatus status = 17;
+  string primary_contact_name = 18;
+  string primary_contact_email = 19;
+  string primary_contact_phone = 20;
+  google.protobuf.Timestamp created_at = 21;
+  google.protobuf.Timestamp updated_at = 22;
+}
+
+message PartnerSummary {
+  int32 partner_id = 1;
+  string partner_code = 2;
+  string partner_name = 3;
+  PartnerType partner_type = 4;
+  PartnerStatus status = 5;
+  double current_balance = 6;
+  double credit_limit = 7;
+}
+
+message Settlement {
+  int64 settlement_id = 1;
+  int32 partner_id = 2;
+  string partner_code = 3;
+  string partner_name = 4;
+  google.protobuf.Timestamp period_start = 5;
+  google.protobuf.Timestamp period_end = 6;
+  int32 total_transactions = 7;
+  double total_amount = 8;
+  string currency = 9;
+  double partner_fees = 10;
+  double net_settlement = 11;
+  SettlementDirection direction = 12;
+  SettlementStatus status = 13;
+  string payment_reference = 14;
+  google.protobuf.Timestamp paid_at = 15;
+  google.protobuf.Timestamp created_at = 16;
+  google.protobuf.Timestamp updated_at = 17;
+}
+
+message CorridorPartner {
+  int32 corridor_id = 1;
+  int32 partner_id = 2;
+  string partner_code = 3;
+  string partner_name = 4;
+  string payout_method = 5;
+  int32 priority = 6;
+  bool is_active = 7;
+}
+
+message BalanceHistoryEntry {
+  int64 entry_id = 1;
+  double previous_balance = 2;
+  double change_amount = 3;
+  double new_balance = 4;
+  string change_type = 5;
+  string reference = 6;
+  google.protobuf.Timestamp created_at = 7;
+}
+
+// Request/Response Messages
+
+// Partner Management
+message CreatePartnerRequest {
+  string partner_code = 1;
+  string partner_name = 2;
+  PartnerType partner_type = 3;
+  repeated string countries = 4;
+  repeated string currencies = 5;
+  repeated string payout_methods = 6;
+  IntegrationType integration_type = 7;
+  string api_endpoint = 8;
+  string settlement_currency = 9;
+  SettlementFrequency settlement_frequency = 10;
+  double credit_limit = 11;
+  string primary_contact_name = 12;
+  string primary_contact_email = 13;
+  string primary_contact_phone = 14;
+  string created_by = 15;
+}
+
+message CreatePartnerResponse {
+  bool success = 1;
+  string error_code = 2;
+  int32 partner_id = 3;
+}
+
+message GetPartnerByIdRequest {
+  int32 partner_id = 1;
+}
+
+message GetPartnerByCodeRequest {
+  string partner_code = 1;
+}
+
+message GetPartnerResponse {
+  Partner partner = 1;
+}
+
+message UpdatePartnerRequest {
+  int32 partner_id = 1;
+  google.protobuf.StringValue partner_name = 2;
+  google.protobuf.StringValue api_endpoint = 3;
+  google.protobuf.DoubleValue credit_limit = 4;
+  google.protobuf.StringValue primary_contact_name = 5;
+  google.protobuf.StringValue primary_contact_email = 6;
+  google.protobuf.StringValue primary_contact_phone = 7;
+  string updated_by = 8;
+}
+
+message UpdatePartnerResponse {
+  bool success = 1;
+  string error_code = 2;
+}
+
+message SuspendPartnerRequest {
+  int32 partner_id = 1;
+  string reason = 2;
+  string suspended_by = 3;
+}
+
+message SuspendPartnerResponse {
+  bool success = 1;
+  string error_code = 2;
+}
+
+message ReactivatePartnerRequest {
+  int32 partner_id = 1;
+  string reactivated_by = 2;
+}
+
+message ReactivatePartnerResponse {
+  bool success = 1;
+  string error_code = 2;
+}
+
+message ListPartnersRequest {
+  PartnerType partner_type = 1;
+  PartnerStatus status = 2;
+}
+
+message ListPartnersByCountryRequest {
+  string country = 1;
+}
+
+message ListPartnersResponse {
+  repeated PartnerSummary partners = 1;
+}
+
+// Partner Balance
+message GetPartnerBalanceRequest {
+  int32 partner_id = 1;
+}
+
+message GetPartnerBalanceResponse {
+  int32 partner_id = 1;
+  string partner_code = 2;
+  double current_balance = 3;
+  double credit_limit = 4;
+  double available_credit = 5;
+  string currency = 6;
+}
+
+message UpdatePartnerBalanceRequest {
+  int32 partner_id = 1;
+  double amount = 2;
+  string change_type = 3;
+  string reference = 4;
+  string updated_by = 5;
+}
+
+message UpdatePartnerBalanceResponse {
+  bool success = 1;
+  string error_code = 2;
+  double new_balance = 3;
+}
+
+message GetPartnerBalanceHistoryRequest {
+  int32 partner_id = 1;
+  google.protobuf.Timestamp start_date = 2;
+  google.protobuf.Timestamp end_date = 3;
+  int32 page_number = 4;
+  int32 page_size = 5;
+}
+
+message GetPartnerBalanceHistoryResponse {
+  repeated BalanceHistoryEntry entries = 1;
+  int32 total_count = 2;
+}
+
+// Corridor-Partner Mapping
+message AssignPartnerToCorridorRequest {
+  int32 corridor_id = 1;
+  int32 partner_id = 2;
+  string payout_method = 3;
+  int32 priority = 4;
+  string assigned_by = 5;
+}
+
+message AssignPartnerToCorridorResponse {
+  bool success = 1;
+  string error_code = 2;
+}
+
+message RemovePartnerFromCorridorRequest {
+  int32 corridor_id = 1;
+  int32 partner_id = 2;
+  string payout_method = 3;
+  string removed_by = 4;
+}
+
+message RemovePartnerFromCorridorResponse {
+  bool success = 1;
+  string error_code = 2;
+}
+
+message GetCorridorPartnersRequest {
+  int32 corridor_id = 1;
+}
+
+message GetCorridorPartnersResponse {
+  repeated CorridorPartner partners = 1;
+}
+
+message GetPartnerForTransferRequest {
+  int32 corridor_id = 1;
+  string payout_method = 2;
+}
+
+message GetPartnerForTransferResponse {
+  int32 partner_id = 1;
+  string partner_code = 2;
+  string partner_name = 3;
+}
+
+// Settlements
+message CreateSettlementRequest {
+  int32 partner_id = 1;
+  google.protobuf.Timestamp period_start = 2;
+  google.protobuf.Timestamp period_end = 3;
+  string created_by = 4;
+}
+
+message CreateSettlementResponse {
+  bool success = 1;
+  string error_code = 2;
+  int64 settlement_id = 3;
+  double net_settlement = 4;
+  int32 transaction_count = 5;
+}
+
+message GetSettlementByIdRequest {
+  int64 settlement_id = 1;
+}
+
+message GetSettlementResponse {
+  Settlement settlement = 1;
+}
+
+message ListSettlementsByPartnerRequest {
+  int32 partner_id = 1;
+  SettlementStatus status = 2;
+  int32 page_number = 3;
+  int32 page_size = 4;
+}
+
+message ListPendingSettlementsRequest {
+  int32 page_number = 1;
+  int32 page_size = 2;
+}
+
+message ListSettlementsResponse {
+  repeated Settlement settlements = 1;
+  int32 total_count = 2;
+}
+
+message MarkSettlementPaidRequest {
+  int64 settlement_id = 1;
+  string payment_reference = 2;
+  string marked_by = 3;
+}
+
+message MarkSettlementPaidResponse {
+  bool success = 1;
+  string error_code = 2;
+}
+
+message ReconcileSettlementRequest {
+  int64 settlement_id = 1;
+  string notes = 2;
+  string reconciled_by = 3;
+}
+
+message ReconcileSettlementResponse {
+  bool success = 1;
+  string error_code = 2;
+}
+
+message GenerateSettlementReportRequest {
+  int32 partner_id = 1;
+  google.protobuf.Timestamp start_date = 2;
+  google.protobuf.Timestamp end_date = 3;
+}
+
+message GenerateSettlementReportResponse {
+  int32 partner_id = 1;
+  string partner_name = 2;
+  google.protobuf.Timestamp period_start = 3;
+  google.protobuf.Timestamp period_end = 4;
+  int32 total_settlements = 5;
+  double total_volume = 6;
+  double total_fees = 7;
+  double net_position = 8;
+}

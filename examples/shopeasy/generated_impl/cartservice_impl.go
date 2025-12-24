@@ -40,9 +40,8 @@ func (r *CartServiceRepositorySQL) GetCart(ctx context.Context, req *GetCartRequ
 	// Execute stored procedure and scan results
 	query := "EXEC usp_GetCart @UserId"
 	row := r.db.QueryRowContext(ctx, query, req.UserID)
-	
-	var result CartResponse
-	err := row.Scan()
+	var nested Cart
+	err := row.Scan(&nested.ID)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, fmt.Errorf("GetCart: not found")
@@ -51,7 +50,7 @@ func (r *CartServiceRepositorySQL) GetCart(ctx context.Context, req *GetCartRequ
 	}
 	
 	return &GetCartResponse{
-		CartResponse: &result,
+		Cart: &nested,
 	}, nil
 }
 
@@ -59,21 +58,14 @@ func (r *CartServiceRepositorySQL) GetCart(ctx context.Context, req *GetCartRequ
 // AddToCart implements the AddToCart operation.
 // Mapped to: usp_AddToCart (confidence: 100%, exact match: usp_AddToCart)
 func (r *CartServiceRepositorySQL) AddToCart(ctx context.Context, req *AddToCartRequest) (*AddToCartResponse, error) {
-	// Execute stored procedure and scan results
+	// Execute stored procedure (no result mapping)
 	query := "EXEC usp_AddToCart @UserId, @ProductId, @Quantity"
-	row := r.db.QueryRowContext(ctx, query, req.UserID, req.ProductID, req.Quantity)
-	
-	var result AddToCartResponse
-	err := row.Scan()
+	_, err := r.db.ExecContext(ctx, query, req.UserID, req.ProductID, req.Quantity)
 	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, fmt.Errorf("AddToCart: not found")
-		}
 		return nil, fmt.Errorf("AddToCart: %w", err)
 	}
 	
-	return &AddToCartResponse{
-	}, nil
+	return &AddToCartResponse{}, nil
 }
 
 
@@ -108,28 +100,38 @@ func (r *CartServiceRepositorySQL) RemoveFromCart(ctx context.Context, req *Remo
 // ClearCart implements the ClearCart operation.
 // Mapped to: usp_ClearCart (confidence: 100%, exact match: usp_ClearCart)
 func (r *CartServiceRepositorySQL) ClearCart(ctx context.Context, req *ClearCartRequest) (*ClearCartResponse, error) {
-	// Execute stored procedure (no result mapping)
+	// Execute stored procedure and scan results
 	query := "EXEC usp_ClearCart @UserId"
-	_, err := r.db.ExecContext(ctx, query, req.UserID)
+	row := r.db.QueryRowContext(ctx, query, req.UserID)
+	var result ClearCartResponse
+	err := row.Scan(&result.Success)
 	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("ClearCart: not found")
+		}
 		return nil, fmt.Errorf("ClearCart: %w", err)
 	}
 	
-	return &ClearCartResponse{}, nil
+	return &result, nil
 }
 
 
 // ValidateCart implements the ValidateCart operation.
 // Mapped to: usp_ValidateCart (confidence: 100%, exact match: usp_ValidateCart)
 func (r *CartServiceRepositorySQL) ValidateCart(ctx context.Context, req *ValidateCartRequest) (*ValidateCartResponse, error) {
-	// Execute stored procedure (no result mapping)
+	// Execute stored procedure and scan results
 	query := "EXEC usp_ValidateCart @UserId"
-	_, err := r.db.ExecContext(ctx, query, req.UserID)
+	row := r.db.QueryRowContext(ctx, query, req.UserID)
+	var result ValidateCartResponse
+	err := row.Scan(&result.IsValid)
 	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("ValidateCart: not found")
+		}
 		return nil, fmt.Errorf("ValidateCart: %w", err)
 	}
 	
-	return &ValidateCartResponse{}, nil
+	return &result, nil
 }
 
 

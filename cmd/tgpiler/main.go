@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -15,6 +16,47 @@ import (
 )
 
 const version = "0.1.0"
+
+// annotateFlag is a custom flag that supports both --annotate and --annotate=level
+// Levels: none, minimal, standard, verbose
+type annotateFlag struct {
+	level string
+}
+
+func (f *annotateFlag) String() string {
+	if f.level == "" {
+		return "none"
+	}
+	return f.level
+}
+
+func (f *annotateFlag) Set(s string) error {
+	// --annotate without value, or --annotate=true
+	if s == "" || s == "true" {
+		f.level = "standard"
+		return nil
+	}
+	// Validate level
+	switch s {
+	case "none", "minimal", "standard", "verbose":
+		f.level = s
+		return nil
+	default:
+		return fmt.Errorf("invalid annotate level %q: must be none, minimal, standard, or verbose", s)
+	}
+}
+
+func (f *annotateFlag) IsBoolFlag() bool {
+	// This allows --annotate without =value
+	return true
+}
+
+func (f *annotateFlag) Level() string {
+	if f.level == "" {
+		return "none"
+	}
+	return f.level
+}
 
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
@@ -40,6 +82,15 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		dmlMode        = fs.Bool("dml", false, "Enable DML mode (SELECT, INSERT, temp tables, etc.)")
 		sqlDialect     = fs.String("dialect", "postgres", "SQL dialect (postgres, mysql, sqlite, sqlserver)")
 		storeVar       = fs.String("store", "r.db", "Store variable name for DML operations")
+		receiver       = fs.String("receiver", "r", "Receiver variable name for generated methods (empty for standalone functions)")
+		receiverType   = fs.String("receiver-type", "*Repository", "Receiver type for generated methods")
+		preserveGo     = fs.Bool("preserve-go", false, "Don't strip GO batch separators (default: strip them)")
+		sequenceMode   = fs.String("sequence-mode", "db", "Sequence handling: db, uuid, stub (default: db)")
+		newidMode      = fs.String("newid", "app", "NEWID() handling: app, db, grpc, mock, stub (default: app)")
+		idServiceVar   = fs.String("id-service", "", "gRPC client variable for --newid=grpc")
+		skipDDL        = fs.Bool("skip-ddl", true, "Skip DDL statements with warning (default: true)")
+		strictDDL      = fs.Bool("strict-ddl", false, "Fail on any DDL statement")
+		extractDDL     = fs.String("extract-ddl", "", "Extract skipped DDL to separate file")
 		useSPLogger    = fs.Bool("splogger", false, "Use SPLogger for CATCH block error logging")
 		spLoggerVar    = fs.String("logger", "spLogger", "SPLogger variable name")
 		spLoggerType   = fs.String("logger-type", "slog", "SPLogger type: slog, db, file, multi, nop")
@@ -48,10 +99,15 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		spLoggerFormat = fs.String("logger-format", "json", "Format for file logger: json, text")
 		genLoggerInit  = fs.Bool("logger-init", false, "Generate SPLogger initialization code")
 		// Backend options
-		backend       = fs.String("backend", "sql", "Backend type: sql, grpc, mock, inline")
-		grpcClient    = fs.String("grpc-client", "client", "gRPC client variable name")
+		backend         = fs.String("backend", "sql", "Backend type: sql, grpc, mock, inline")
+		fallbackBackend = fs.String("fallback-backend", "", "Fallback backend for temp tables: sql, mock (default: sql)")
+		grpcClient      = fs.String("grpc-client", "client", "gRPC client variable name")
 		grpcPackage   = fs.String("grpc-package", "", "Import path for generated gRPC package")
 		mockStore     = fs.String("mock-store", "store", "Mock store variable name")
+		// gRPC mapping options
+		tableService  = fs.String("table-service", "", "Table-to-service mappings (format: Table:Service,Table:Service)")
+		tableClient   = fs.String("table-client", "", "Table-to-client mappings (format: Table:client,Table:client)")
+		grpcMappings  = fs.String("grpc-mappings", "", "Procedure-to-method mappings (format: proc:Service.Method,proc:Service.Method)")
 		// Proto/gRPC generation options
 		protoFile     = fs.String("proto", "", "Proto file for gRPC operations")
 		protoDir      = fs.String("proto-dir", "", "Directory of proto files")
@@ -61,11 +117,17 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		genImpl       = fs.Bool("gen-impl", false, "Generate repository implementations with procedure mappings")
 		genMock       = fs.Bool("gen-mock", false, "Generate mock server code")
 		showMappings  = fs.Bool("show-mappings", false, "Display procedure-to-method mappings")
+		outputFormat  = fs.String("output-format", "text", "Output format for --show-mappings (text, json, markdown, html)")
+		warnThreshold = fs.Int("warn-threshold", 50, "Confidence threshold (%) for low-confidence warnings (0-100)")
 		showHelp       = fs.Bool("h", false, "Show help")
 		helpL          = fs.Bool("help", false, "Show help")
 		showVer        = fs.Bool("v", false, "Show version")
 		versionL       = fs.Bool("version", false, "Show version")
 	)
+	
+	// Custom flag for --annotate / --annotate=level
+	var annotate annotateFlag
+	fs.Var(&annotate, "annotate", "Add code annotations (levels: none, minimal, standard, verbose; default if flag present: standard)")
 
 	fs.Usage = func() {
 		printUsage(stderr)
@@ -147,17 +209,30 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		dmlMode:        *dmlMode,
 		sqlDialect:     *sqlDialect,
 		storeVar:       *storeVar,
-		useSPLogger:    *useSPLogger,
-		spLoggerVar:    *spLoggerVar,
-		spLoggerType:   *spLoggerType,
-		spLoggerTable:  *spLoggerTable,
-		spLoggerFile:   *spLoggerFile,
-		spLoggerFormat: *spLoggerFormat,
-		genLoggerInit:  *genLoggerInit,
-		backend:        *backend,
-		grpcClient:     *grpcClient,
+		receiver:       *receiver,
+		receiverType:   *receiverType,
+		preserveGo:     *preserveGo,
+		sequenceMode:   *sequenceMode,
+		newidMode:      *newidMode,
+		idServiceVar:   *idServiceVar,
+		skipDDL:        *skipDDL,
+		strictDDL:      *strictDDL,
+		extractDDL:      *extractDDL,
+		useSPLogger:     *useSPLogger,
+		spLoggerVar:     *spLoggerVar,
+		spLoggerType:    *spLoggerType,
+		spLoggerTable:   *spLoggerTable,
+		spLoggerFile:    *spLoggerFile,
+		spLoggerFormat:  *spLoggerFormat,
+		genLoggerInit:   *genLoggerInit,
+		backend:         *backend,
+		fallbackBackend: *fallbackBackend,
+		grpcClient:      *grpcClient,
 		grpcPackage:    *grpcPackage,
 		mockStore:      *mockStore,
+		tableService:   *tableService,
+		tableClient:    *tableClient,
+		grpcMappings:   *grpcMappings,
 		protoFile:      *protoFile,
 		protoDir:       *protoDir,
 		sqlDir:         *sqlDir,
@@ -166,6 +241,9 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		genImpl:        *genImpl,
 		genMock:        *genMock,
 		showMappings:   *showMappings,
+		outputFormat:   *outputFormat,
+		warnThreshold:  *warnThreshold,
+		annotateLevel:  annotate.Level(),
 		stdin:          stdin,
 		stdout:         stdout,
 		stderr:         stderr,
@@ -174,6 +252,20 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if err := execute(cfg); err != nil {
 		fmt.Fprintf(stderr, "error: %v\n", err)
 		return 1
+	}
+
+	// Write extracted DDL to file if configured
+	if cfg.extractDDL != "" && len(cfg.collectedDDL) > 0 {
+		ddlContent := "-- DDL statements extracted by tgpiler\n"
+		ddlContent += "-- These should be kept in your database schema/migrations\n\n"
+		for _, ddl := range cfg.collectedDDL {
+			ddlContent += ddl + ";\nGO\n\n"
+		}
+		if err := os.WriteFile(cfg.extractDDL, []byte(ddlContent), 0644); err != nil {
+			fmt.Fprintf(stderr, "error writing DDL file: %v\n", err)
+			return 1
+		}
+		fmt.Fprintf(stderr, "Extracted %d DDL statements to %s\n", len(cfg.collectedDDL), cfg.extractDDL)
 	}
 
 	return 0
@@ -190,6 +282,16 @@ type config struct {
 	dmlMode        bool
 	sqlDialect     string
 	storeVar       string
+	receiver       string
+	receiverType   string
+	preserveGo     bool
+	sequenceMode   string
+	newidMode      string
+	idServiceVar   string
+	skipDDL        bool
+	strictDDL      bool
+	extractDDL     string
+	collectedDDL   []string // Accumulated DDL statements for extraction
 	useSPLogger    bool
 	spLoggerVar    string
 	spLoggerType   string
@@ -198,19 +300,26 @@ type config struct {
 	spLoggerFormat string
 	genLoggerInit  bool
 	// Backend options
-	backend     string
-	grpcClient  string
-	grpcPackage string
-	mockStore   string
+	backend         string
+	fallbackBackend string
+	grpcClient      string
+	grpcPackage  string
+	mockStore    string
+	tableService string
+	tableClient  string
+	grpcMappings string
 	// Proto/gRPC generation
 	protoFile    string
 	protoDir     string
 	sqlDir       string
-	serviceName  string
-	genServer    bool
-	genImpl      bool
-	genMock      bool
-	showMappings bool
+	serviceName   string
+	genServer     bool
+	genImpl       bool
+	genMock       bool
+	showMappings  bool
+	outputFormat  string
+	warnThreshold int
+	annotateLevel string
 	// IO
 	stdin  io.Reader
 	stdout io.Writer
@@ -244,6 +353,40 @@ func validateFlags(inputFile, inputDir string, readStdin bool, output, outDir st
 	}
 
 	return nil
+}
+
+// parseMapping parses a comma-separated mapping string into a map.
+// Format: "key:value,key:value" or "key=value,key=value"
+// Returns nil if input is empty.
+func parseMapping(s string) map[string]string {
+	if s == "" {
+		return nil
+	}
+	result := make(map[string]string)
+	for _, pair := range strings.Split(s, ",") {
+		pair = strings.TrimSpace(pair)
+		if pair == "" {
+			continue
+		}
+		// Support both : and = as separators
+		var key, value string
+		if idx := strings.Index(pair, ":"); idx > 0 {
+			key = strings.TrimSpace(pair[:idx])
+			value = strings.TrimSpace(pair[idx+1:])
+		} else if idx := strings.Index(pair, "="); idx > 0 {
+			key = strings.TrimSpace(pair[:idx])
+			value = strings.TrimSpace(pair[idx+1:])
+		} else {
+			continue // Invalid format, skip
+		}
+		if key != "" && value != "" {
+			result[key] = value
+		}
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
 }
 
 func execute(cfg *config) error {
@@ -311,22 +454,72 @@ func doTranspile(cfg *config, source string) (string, error) {
 			return "", fmt.Errorf("unknown backend: %s (valid: sql, grpc, mock, inline)", cfg.backend)
 		}
 
-		dmlConfig := transpiler.DMLConfig{
-			Backend:        backendType,
-			SQLDialect:     cfg.sqlDialect,
-			StoreVar:       cfg.storeVar,
-			GRPCClientVar:  cfg.grpcClient,
-			ProtoPackage:   cfg.grpcPackage,
-			MockStoreVar:   cfg.mockStore,
-			UseSPLogger:    cfg.useSPLogger,
-			SPLoggerVar:    cfg.spLoggerVar,
-			SPLoggerType:   cfg.spLoggerType,
-			SPLoggerTable:  cfg.spLoggerTable,
-			SPLoggerFile:   cfg.spLoggerFile,
-			SPLoggerFormat: cfg.spLoggerFormat,
-			GenLoggerInit:  cfg.genLoggerInit,
+		// Map fallback backend string to BackendType
+		var fallbackBackendType transpiler.BackendType
+		fallbackExplicit := cfg.fallbackBackend != ""
+		switch cfg.fallbackBackend {
+		case "sql", "":
+			fallbackBackendType = transpiler.BackendSQL
+		case "mock":
+			fallbackBackendType = transpiler.BackendMock
+		default:
+			return "", fmt.Errorf("unknown fallback-backend: %s (valid: sql, mock)", cfg.fallbackBackend)
 		}
-		return transpiler.TranspileWithDML(source, cfg.packageName, dmlConfig)
+
+		dmlConfig := transpiler.DMLConfig{
+			Backend:          backendType,
+			FallbackBackend:  fallbackBackendType,
+			FallbackExplicit: fallbackExplicit,
+			SQLDialect:       cfg.sqlDialect,
+			StoreVar:         cfg.storeVar,
+			Receiver:         cfg.receiver,
+			ReceiverType:     cfg.receiverType,
+			PreserveGo:       cfg.preserveGo,
+			SequenceMode:     cfg.sequenceMode,
+			NewidMode:        cfg.newidMode,
+			IDServiceVar:     cfg.idServiceVar,
+			SkipDDL:          cfg.skipDDL,
+			StrictDDL:        cfg.strictDDL,
+			ExtractDDL:       cfg.extractDDL,
+			GRPCClientVar:    cfg.grpcClient,
+			ProtoPackage:     cfg.grpcPackage,
+			MockStoreVar:     cfg.mockStore,
+			TableToService:   parseMapping(cfg.tableService),
+			TableToClient:    parseMapping(cfg.tableClient),
+			GRPCMappings:     parseMapping(cfg.grpcMappings),
+			ServiceToPackage: make(map[string]string),
+			UseSPLogger:      cfg.useSPLogger,
+			SPLoggerVar:      cfg.spLoggerVar,
+			SPLoggerType:     cfg.spLoggerType,
+			SPLoggerTable:    cfg.spLoggerTable,
+			SPLoggerFile:     cfg.spLoggerFile,
+			SPLoggerFormat:   cfg.spLoggerFormat,
+			GenLoggerInit:    cfg.genLoggerInit,
+			AnnotateLevel:    cfg.annotateLevel,
+		}
+		
+		// Use extended result to capture DDL for extraction
+		result, err := transpiler.TranspileWithDMLEx(source, cfg.packageName, dmlConfig)
+		if err != nil {
+			return "", err
+		}
+		
+		// Accumulate extracted DDL for later file writing
+		if cfg.extractDDL != "" && len(result.ExtractedDDL) > 0 {
+			cfg.collectedDDL = append(cfg.collectedDDL, result.ExtractedDDL...)
+		}
+		
+		// Print DDL warnings to stderr
+		for _, warning := range result.DDLWarnings {
+			fmt.Fprintf(cfg.stderr, "warning: %s\n", warning)
+		}
+		
+		// Print temp table warnings to stderr
+		for _, warning := range result.TempTableWarnings {
+			fmt.Fprintf(cfg.stderr, "info: %s\n", warning)
+		}
+		
+		return result.Code, nil
 	}
 	return transpiler.Transpile(source, cfg.packageName)
 }
@@ -505,8 +698,58 @@ func showMappings(cfg *config, proto *storage.ProtoParseResult, procedures []*st
 	mappings := mapper.MapAll()
 	stats := mapper.GetStats()
 
+	switch cfg.outputFormat {
+	case "json":
+		return showMappingsJSON(cfg, mappings, stats, procedures)
+	case "markdown", "md":
+		return showMappingsMarkdown(cfg, mappings, stats, procedures)
+	case "html":
+		return showMappingsHTML(cfg, mappings, stats, procedures)
+	default:
+		return showMappingsText(cfg, mappings, stats, procedures)
+	}
+}
+
+// MappingData represents the JSON output structure
+type MappingData struct {
+	Services   []ServiceMappingData `json:"services"`
+	Statistics MappingStats         `json:"statistics"`
+	Unmapped   []string             `json:"unmapped_procedures"`
+}
+
+type ServiceMappingData struct {
+	Name     string          `json:"name"`
+	Mappings []MethodMapping `json:"mappings"`
+}
+
+type MethodMapping struct {
+	RPC        string   `json:"rpc"`
+	Procedure  string   `json:"procedure"`
+	Confidence float64  `json:"confidence"`
+	Signals    []string `json:"signals"`
+	Warnings   []string `json:"warnings,omitempty"`
+}
+
+type MappingStats struct {
+	Total            int `json:"total"`
+	Mapped           int `json:"mapped"`
+	Unmapped         int `json:"unmapped"`
+	HighConfidence   int `json:"high_confidence"`
+	MediumConfidence int `json:"medium_confidence"`
+	LowConfidence    int `json:"low_confidence"`
+}
+
+func showMappingsText(cfg *config, mappings map[string]*storage.MethodMapping, stats storage.MappingStats, procedures []*storage.Procedure) error {
 	fmt.Fprintf(cfg.stdout, "Procedure-to-Method Mappings\n")
 	fmt.Fprintf(cfg.stdout, "============================\n\n")
+
+	// Collect low-confidence mappings for warnings
+	type lowConfMapping struct {
+		key        string
+		methodName string
+		mapping    *storage.MethodMapping
+	}
+	var lowConfMappings []lowConfMapping
 
 	// Group by service
 	serviceMethodMappings := make(map[string][]string)
@@ -524,6 +767,16 @@ func showMappings(cfg *config, proto *storage.ProtoParseResult, procedures []*st
 			mapping.Confidence*100,
 			mapping.MatchReason)
 		serviceMethodMappings[svcName] = append(serviceMethodMappings[svcName], line)
+
+		// Track low-confidence mappings
+		threshold := float64(cfg.warnThreshold) / 100.0
+		if mapping.Confidence < threshold {
+			lowConfMappings = append(lowConfMappings, lowConfMapping{
+				key:        key,
+				methodName: methodName,
+				mapping:    mapping,
+			})
+		}
 	}
 
 	for svcName, methods := range serviceMethodMappings {
@@ -542,6 +795,423 @@ func showMappings(cfg *config, proto *storage.ProtoParseResult, procedures []*st
 	fmt.Fprintf(cfg.stdout, "  Medium confidence (50-80%%): %d\n", stats.MediumConfidence)
 	fmt.Fprintf(cfg.stdout, "  Low confidence (<50%%): %d\n", stats.LowConfidence)
 
+	// Find unmapped procedures
+	mappedProcs := make(map[string]bool)
+	for _, m := range mappings {
+		mappedProcs[m.Procedure.Name] = true
+	}
+	
+	var unmapped []string
+	for _, p := range procedures {
+		if !mappedProcs[p.Name] {
+			unmapped = append(unmapped, p.Name)
+		}
+	}
+
+	// Show actionable warnings for low-confidence mappings
+	if len(lowConfMappings) > 0 {
+		fmt.Fprintf(cfg.stdout, "\nLow-Confidence Warnings (%d):\n", len(lowConfMappings))
+		fmt.Fprintf(cfg.stdout, "  These mappings may be incorrect and should be reviewed:\n\n")
+		
+		for _, lc := range lowConfMappings {
+			fmt.Fprintf(cfg.stdout, "  WARNING: %s -> %s (%.0f%% confidence)\n",
+				lc.methodName, lc.mapping.Procedure.Name, lc.mapping.Confidence*100)
+			
+			// Find potential alternatives from unmapped procedures
+			alternatives := findAlternatives(lc.methodName, unmapped, 3)
+			if len(alternatives) > 0 {
+				fmt.Fprintf(cfg.stdout, "    Possible alternatives from unmapped procedures:\n")
+				for _, alt := range alternatives {
+					fmt.Fprintf(cfg.stdout, "      - %s\n", alt)
+				}
+			}
+			
+			// Show override syntax
+			fmt.Fprintf(cfg.stdout, "    To override: --grpc-mappings=\"%s:%s\"\n\n",
+				lc.mapping.Procedure.Name, lc.key)
+		}
+	}
+
+	if len(unmapped) > 0 {
+		fmt.Fprintf(cfg.stdout, "\nUnmapped Procedures (%d):\n", len(unmapped))
+		fmt.Fprintf(cfg.stdout, "  These stored procedures have no matching RPC method:\n")
+		for _, name := range unmapped {
+			fmt.Fprintf(cfg.stdout, "  - %s\n", name)
+		}
+	}
+
+	return nil
+}
+
+// findAlternatives finds procedures that might be alternatives based on name similarity
+func findAlternatives(methodName string, procedures []string, maxResults int) []string {
+	// Split before lowercasing to preserve camelCase boundaries
+	methodWords := splitWords(methodName)
+	for i := range methodWords {
+		methodWords[i] = strings.ToLower(methodWords[i])
+	}
+	
+	type scored struct {
+		name  string
+		score int
+	}
+	var candidates []scored
+	
+	for _, proc := range procedures {
+		// Remove usp_ prefix for comparison
+		procClean := strings.TrimPrefix(proc, "usp_")
+		procWords := splitWords(procClean)
+		for i := range procWords {
+			procWords[i] = strings.ToLower(procWords[i])
+		}
+		
+		score := 0
+		
+		// Check for substring match (full name)
+		methodLower := strings.ToLower(methodName)
+		procLower := strings.ToLower(procClean)
+		if strings.Contains(procLower, methodLower) || strings.Contains(methodLower, procLower) {
+			score += 3
+		}
+		
+		// Check for word overlap
+		for _, mw := range methodWords {
+			for _, pw := range procWords {
+				if mw == pw {
+					score += 2
+				} else if len(mw) > 2 && len(pw) > 2 && (strings.HasPrefix(pw, mw) || strings.HasPrefix(mw, pw)) {
+					score += 1
+				}
+			}
+		}
+		
+		if score > 0 {
+			candidates = append(candidates, scored{proc, score})
+		}
+	}
+	
+	// Sort by score descending
+	for i := 0; i < len(candidates); i++ {
+		for j := i + 1; j < len(candidates); j++ {
+			if candidates[j].score > candidates[i].score {
+				candidates[i], candidates[j] = candidates[j], candidates[i]
+			}
+		}
+	}
+	
+	// Return top N
+	var results []string
+	for i := 0; i < len(candidates) && i < maxResults; i++ {
+		results = append(results, candidates[i].name)
+	}
+	return results
+}
+
+// splitWords splits a camelCase or snake_case string into words
+func splitWords(s string) []string {
+	// Handle snake_case
+	s = strings.ReplaceAll(s, "_", " ")
+	
+	// Handle camelCase
+	var words []string
+	var current strings.Builder
+	for i, r := range s {
+		if r == ' ' {
+			if current.Len() > 0 {
+				words = append(words, current.String())
+				current.Reset()
+			}
+		} else if i > 0 && r >= 'A' && r <= 'Z' {
+			if current.Len() > 0 {
+				words = append(words, current.String())
+				current.Reset()
+			}
+			current.WriteRune(r + 32) // lowercase
+		} else {
+			current.WriteRune(r)
+		}
+	}
+	if current.Len() > 0 {
+		words = append(words, current.String())
+	}
+	return words
+}
+
+func showMappingsJSON(cfg *config, mappings map[string]*storage.MethodMapping, stats storage.MappingStats, procedures []*storage.Procedure) error {
+	data := MappingData{
+		Statistics: MappingStats{
+			Total:            stats.TotalMethods,
+			Mapped:           stats.MappedMethods,
+			Unmapped:         stats.UnmappedMethods,
+			HighConfidence:   stats.HighConfidence,
+			MediumConfidence: stats.MediumConfidence,
+			LowConfidence:    stats.LowConfidence,
+		},
+	}
+
+	// Group by service
+	serviceMap := make(map[string]*ServiceMappingData)
+	for key, mapping := range mappings {
+		parts := strings.SplitN(key, ".", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		svcName := parts[0]
+		methodName := parts[1]
+
+		if _, ok := serviceMap[svcName]; !ok {
+			serviceMap[svcName] = &ServiceMappingData{Name: svcName}
+		}
+
+		mm := MethodMapping{
+			RPC:        methodName,
+			Procedure:  mapping.Procedure.Name,
+			Confidence: mapping.Confidence,
+			Signals:    strings.Split(mapping.MatchReason, "; "),
+		}
+		if mapping.Confidence < 0.5 {
+			mm.Warnings = append(mm.Warnings, "Low confidence - manual review recommended")
+		}
+		serviceMap[svcName].Mappings = append(serviceMap[svcName].Mappings, mm)
+	}
+
+	for _, svc := range serviceMap {
+		data.Services = append(data.Services, *svc)
+	}
+
+	// Find unmapped procedures
+	mappedProcs := make(map[string]bool)
+	for _, m := range mappings {
+		mappedProcs[m.Procedure.Name] = true
+	}
+	for _, p := range procedures {
+		if !mappedProcs[p.Name] {
+			data.Unmapped = append(data.Unmapped, p.Name)
+		}
+	}
+
+	enc := json.NewEncoder(cfg.stdout)
+	enc.SetIndent("", "  ")
+	return enc.Encode(data)
+}
+
+func showMappingsMarkdown(cfg *config, mappings map[string]*storage.MethodMapping, stats storage.MappingStats, procedures []*storage.Procedure) error {
+	fmt.Fprintf(cfg.stdout, "# Procedure-to-Method Mappings\n\n")
+
+	// Statistics summary
+	fmt.Fprintf(cfg.stdout, "## Summary\n\n")
+	fmt.Fprintf(cfg.stdout, "| Metric | Count |\n")
+	fmt.Fprintf(cfg.stdout, "|--------|-------|\n")
+	fmt.Fprintf(cfg.stdout, "| Total Methods | %d |\n", stats.TotalMethods)
+	fmt.Fprintf(cfg.stdout, "| Mapped | %d |\n", stats.MappedMethods)
+	fmt.Fprintf(cfg.stdout, "| Unmapped | %d |\n", stats.UnmappedMethods)
+	fmt.Fprintf(cfg.stdout, "| High Confidence (>80%%) | %d |\n", stats.HighConfidence)
+	fmt.Fprintf(cfg.stdout, "| Medium Confidence (50-80%%) | %d |\n", stats.MediumConfidence)
+	fmt.Fprintf(cfg.stdout, "| Low Confidence (<50%%) | %d |\n\n", stats.LowConfidence)
+
+	// Group by service
+	serviceMethodMappings := make(map[string][]*storage.MethodMapping)
+	serviceMethodNames := make(map[string][]string)
+	for key, mapping := range mappings {
+		parts := strings.SplitN(key, ".", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		svcName := parts[0]
+		methodName := parts[1]
+		serviceMethodMappings[svcName] = append(serviceMethodMappings[svcName], mapping)
+		serviceMethodNames[svcName] = append(serviceMethodNames[svcName], methodName)
+	}
+
+	fmt.Fprintf(cfg.stdout, "## Mappings by Service\n\n")
+	for svcName, mappingList := range serviceMethodMappings {
+		fmt.Fprintf(cfg.stdout, "### %s\n\n", svcName)
+		fmt.Fprintf(cfg.stdout, "| RPC Method | Stored Procedure | Confidence | Match Reason |\n")
+		fmt.Fprintf(cfg.stdout, "|------------|------------------|------------|-------------|\n")
+		names := serviceMethodNames[svcName]
+		for i, mapping := range mappingList {
+			confStr := fmt.Sprintf("%.0f%%", mapping.Confidence*100)
+			confIcon := "🟢"
+			if mapping.Confidence < 0.5 {
+				confIcon = "🔴"
+			} else if mapping.Confidence < 0.8 {
+				confIcon = "🟡"
+			}
+			fmt.Fprintf(cfg.stdout, "| %s | %s | %s %s | %s |\n",
+				names[i], mapping.Procedure.Name, confIcon, confStr, mapping.MatchReason)
+		}
+		fmt.Fprintln(cfg.stdout)
+	}
+
+	// Unmapped procedures
+	mappedProcs := make(map[string]bool)
+	for _, m := range mappings {
+		mappedProcs[m.Procedure.Name] = true
+	}
+	var unmapped []string
+	for _, p := range procedures {
+		if !mappedProcs[p.Name] {
+			unmapped = append(unmapped, p.Name)
+		}
+	}
+	if len(unmapped) > 0 {
+		fmt.Fprintf(cfg.stdout, "## Unmapped Procedures\n\n")
+		fmt.Fprintf(cfg.stdout, "The following %d procedures have no matching RPC method:\n\n", len(unmapped))
+		for _, name := range unmapped {
+			fmt.Fprintf(cfg.stdout, "- `%s`\n", name)
+		}
+	}
+
+	return nil
+}
+
+func showMappingsHTML(cfg *config, mappings map[string]*storage.MethodMapping, stats storage.MappingStats, procedures []*storage.Procedure) error {
+	// Group by service first
+	serviceMethodMappings := make(map[string][]*storage.MethodMapping)
+	serviceMethodNames := make(map[string][]string)
+	for key, mapping := range mappings {
+		parts := strings.SplitN(key, ".", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		svcName := parts[0]
+		methodName := parts[1]
+		serviceMethodMappings[svcName] = append(serviceMethodMappings[svcName], mapping)
+		serviceMethodNames[svcName] = append(serviceMethodNames[svcName], methodName)
+	}
+
+	// Find unmapped procedures
+	mappedProcs := make(map[string]bool)
+	for _, m := range mappings {
+		mappedProcs[m.Procedure.Name] = true
+	}
+	var unmapped []string
+	for _, p := range procedures {
+		if !mappedProcs[p.Name] {
+			unmapped = append(unmapped, p.Name)
+		}
+	}
+
+	fmt.Fprintf(cfg.stdout, `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>tgpiler Mapping Report</title>
+<style>
+:root { --bg: #f8f9fa; --card: #fff; --text: #1a1a2e; --border: rgba(0,0,0,0.1); --hover: rgba(0,0,0,0.05); --green: #16a34a; --yellow: #ca8a04; --red: #dc2626; --blue: #2563eb; }
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #1a1a2e; --card: #16213e; --text: #eee; --border: rgba(255,255,255,0.1); --hover: rgba(255,255,255,0.1); --green: #4ade80; --yellow: #fbbf24; --red: #f87171; --blue: #60a5fa; }
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); padding: 2rem; }
+h1 { margin-bottom: 1.5rem; }
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 1rem; margin-bottom: 2rem; }
+.stat-card { background: var(--card); padding: 1rem; border-radius: 8px; text-align: center; box-shadow: 0 1px 3px var(--border); }
+.stat-value { font-size: 2rem; font-weight: bold; }
+.stat-label { font-size: 0.875rem; opacity: 0.7; }
+.chart-container { background: var(--card); padding: 1rem; border-radius: 8px; margin-bottom: 2rem; display: flex; gap: 2rem; align-items: center; box-shadow: 0 1px 3px var(--border); }
+.pie-chart { width: 150px; height: 150px; border-radius: 50%%; position: relative; }
+.legend { display: flex; flex-direction: column; gap: 0.5rem; }
+.legend-item { display: flex; align-items: center; gap: 0.5rem; }
+.legend-color { width: 16px; height: 16px; border-radius: 4px; }
+.service { background: var(--card); border-radius: 8px; margin-bottom: 1rem; overflow: hidden; box-shadow: 0 1px 3px var(--border); }
+.service-header { padding: 1rem; background: var(--hover); cursor: pointer; }
+.service-header:hover { background: var(--border); }
+table { width: 100%%; border-collapse: collapse; }
+th, td { padding: 0.75rem 1rem; text-align: left; border-bottom: 1px solid var(--border); }
+th { background: var(--hover); font-weight: 600; }
+.conf-high { color: var(--green); }
+.conf-med { color: var(--yellow); }
+.conf-low { color: var(--red); }
+.filter-bar { margin-bottom: 1rem; display: flex; gap: 1rem; align-items: center; }
+input[type="text"] { padding: 0.5rem 1rem; border-radius: 4px; border: 1px solid var(--border); background: var(--card); color: var(--text); width: 300px; }
+.unmapped { background: var(--card); padding: 1rem; border-radius: 8px; margin-top: 2rem; box-shadow: 0 1px 3px var(--border); }
+.unmapped ul { list-style: none; display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 1rem; }
+.unmapped li { background: var(--hover); padding: 0.25rem 0.75rem; border-radius: 4px; font-family: monospace; font-size: 0.875rem; }
+</style>
+</head>
+<body>
+<h1>tgpiler Mapping Report</h1>
+
+<div class="stats">
+<div class="stat-card"><div class="stat-value">%d</div><div class="stat-label">Total Methods</div></div>
+<div class="stat-card"><div class="stat-value">%d</div><div class="stat-label">Mapped</div></div>
+<div class="stat-card"><div class="stat-value">%d</div><div class="stat-label">Unmapped</div></div>
+<div class="stat-card"><div class="stat-value" style="color:var(--green)">%d</div><div class="stat-label">High (&gt;80%%)</div></div>
+<div class="stat-card"><div class="stat-value" style="color:var(--yellow)">%d</div><div class="stat-label">Medium (50-80%%)</div></div>
+<div class="stat-card"><div class="stat-value" style="color:var(--red)">%d</div><div class="stat-label">Low (&lt;50%%)</div></div>
+</div>
+
+<div class="chart-container">
+<div class="pie-chart" style="background: conic-gradient(var(--green) 0%% %.1f%%, var(--yellow) %.1f%% %.1f%%, var(--red) %.1f%% 100%%);"></div>
+<div class="legend">
+<div class="legend-item"><div class="legend-color" style="background:var(--green)"></div>High Confidence: %d</div>
+<div class="legend-item"><div class="legend-color" style="background:var(--yellow)"></div>Medium Confidence: %d</div>
+<div class="legend-item"><div class="legend-color" style="background:var(--red)"></div>Low Confidence: %d</div>
+</div>
+</div>
+
+<div class="filter-bar">
+<input type="text" id="filter" placeholder="Filter by method or procedure name..." onkeyup="filterTable()">
+</div>
+
+<h2 style="margin-bottom:1rem">Mappings by Service</h2>
+`,
+		stats.TotalMethods, stats.MappedMethods, stats.UnmappedMethods,
+		stats.HighConfidence, stats.MediumConfidence, stats.LowConfidence,
+		float64(stats.HighConfidence)/float64(stats.MappedMethods)*100,
+		float64(stats.HighConfidence)/float64(stats.MappedMethods)*100,
+		float64(stats.HighConfidence+stats.MediumConfidence)/float64(stats.MappedMethods)*100,
+		float64(stats.HighConfidence+stats.MediumConfidence)/float64(stats.MappedMethods)*100,
+		stats.HighConfidence, stats.MediumConfidence, stats.LowConfidence)
+
+	for svcName, mappingList := range serviceMethodMappings {
+		names := serviceMethodNames[svcName]
+		fmt.Fprintf(cfg.stdout, `<div class="service">
+<div class="service-header"><strong>%s</strong> (%d methods)</div>
+<table>
+<thead><tr><th>RPC Method</th><th>Stored Procedure</th><th>Confidence</th><th>Match Reason</th></tr></thead>
+<tbody>
+`, svcName, len(mappingList))
+
+		for i, mapping := range mappingList {
+			confClass := "conf-high"
+			if mapping.Confidence < 0.5 {
+				confClass = "conf-low"
+			} else if mapping.Confidence < 0.8 {
+				confClass = "conf-med"
+			}
+			fmt.Fprintf(cfg.stdout, `<tr><td>%s</td><td><code>%s</code></td><td class="%s">%.0f%%</td><td>%s</td></tr>
+`, names[i], mapping.Procedure.Name, confClass, mapping.Confidence*100, mapping.MatchReason)
+		}
+		fmt.Fprintf(cfg.stdout, "</tbody></table></div>\n")
+	}
+
+	if len(unmapped) > 0 {
+		fmt.Fprintf(cfg.stdout, `<div class="unmapped">
+<h3>Unmapped Procedures (%d)</h3>
+<ul>
+`, len(unmapped))
+		for _, name := range unmapped {
+			fmt.Fprintf(cfg.stdout, "<li>%s</li>\n", name)
+		}
+		fmt.Fprintf(cfg.stdout, "</ul></div>\n")
+	}
+
+	fmt.Fprintf(cfg.stdout, `
+<script>
+function filterTable() {
+  const filter = document.getElementById('filter').value.toLowerCase();
+  document.querySelectorAll('table tbody tr').forEach(row => {
+    const text = row.textContent.toLowerCase();
+    row.style.display = text.includes(filter) ? '' : 'none';
+  });
+}
+</script>
+</body>
+</html>
+`)
 	return nil
 }
 
@@ -572,19 +1242,18 @@ func generateImpl(cfg *config, proto *storage.ProtoParseResult, procedures []*st
 
 	opts := protogen.DefaultServerGenOptions()
 	opts.PackageName = cfg.packageName
+	opts.Dialect = cfg.sqlDialect
 
 	var buf bytes.Buffer
 	if cfg.serviceName != "" {
+		// Single service - use original method
 		if err := gen.GenerateServiceImpl(cfg.serviceName, opts, &buf); err != nil {
 			return err
 		}
 	} else {
-		// Generate for all services
-		for svcName := range proto.AllServices {
-			if err := gen.GenerateServiceImpl(svcName, opts, &buf); err != nil {
-				return err
-			}
-			buf.WriteString("\n")
+		// All services - use consolidated method with single package header
+		if err := gen.GenerateAllServicesImpl(opts, &buf); err != nil {
+			return err
 		}
 	}
 
@@ -657,15 +1326,30 @@ General Options:
   --dml                 Enable DML mode (SELECT, INSERT, temp tables, JSON/XML)
   --dialect <n>         SQL dialect: postgres, mysql, sqlite, sqlserver (default: postgres)
   --store <var>         Store variable name (default: r.db)
+  --receiver <var>      Receiver variable name (default: r, empty for standalone functions)
+  --receiver-type <t>   Receiver type (default: *Repository)
+  --preserve-go         Don't strip GO batch separators (default: strip them)
+  --sequence-mode <m>   Sequence handling: db, uuid, stub (default: db)
+  --annotate[=level]    Add code annotations (default level if no value: standard)
+                        Levels: none, minimal, standard, verbose
+                          minimal  - TODO markers for patterns needing attention
+                          standard - TODOs + original SQL comments
+                          verbose  - All + type annotations + section markers
   -f, --force           Allow overwriting existing files
   -h, --help            Show help
   -v, --version         Show version
 
 Backend Options (requires --dml):
   --backend <type>      Backend: sql, grpc, mock, inline (default: sql)
+  --fallback-backend <type>  Backend for temp tables: sql, mock (default: sql)
   --grpc-client <var>   gRPC client variable name (default: client)
   --grpc-package <path> Import path for generated gRPC package
   --mock-store <var>    Mock store variable name (default: store)
+
+gRPC Mapping Options (requires --dml --backend=grpc):
+  --table-service <map> Table-to-service mappings (format: Table:Service,Table:Service)
+  --table-client <map>  Table-to-client var mappings (format: Table:clientVar,Table:clientVar)
+  --grpc-mappings <map> Procedure-to-method mappings (format: proc:Service.Method,proc:Service.Method)
 
 Proto/gRPC Generation (mutually exclusive with transpilation):
   --proto <file>        Proto file for gRPC operations
@@ -706,6 +1390,17 @@ Examples:
 
   # Show procedure-to-method mappings
   tgpiler --show-mappings --proto-dir ./protos --sql-dir ./procedures
+
+  # gRPC backend with table-to-service mapping
+  tgpiler --dml --backend=grpc --grpc-package=catalogpb \
+    --table-service="Products:CatalogService,Orders:OrderService" \
+    --table-client="Products:catalogClient,Orders:orderClient" \
+    input.sql
+
+  # gRPC backend with explicit procedure mapping
+  tgpiler --dml --backend=grpc --grpc-package=orderpb \
+    --grpc-mappings="usp_ValidateOrder:OrderService.ValidateOrder" \
+    input.sql
 
   # SPLogger with slog (default)
   tgpiler --dml --splogger input.sql

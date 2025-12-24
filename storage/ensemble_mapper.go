@@ -74,8 +74,9 @@ func (m *EnsembleMapper) mapMethodEnsemble(serviceName string, method *ProtoMeth
 		totalScore    float64
 		totalWeight   float64
 		strategyVotes map[string]*StrategyResult
-		agreement     int // How many strategies agree
+		agreement     int  // How many strategies agree
 		hasExactName  bool // Has exact naming match
+		tieBreakScore float64 // Secondary score for tie-breaking
 	}
 
 	scores := make(map[string]*procScore)
@@ -105,6 +106,8 @@ func (m *EnsembleMapper) mapMethodEnsemble(serviceName string, method *ProtoMeth
 		}
 
 		if ps.agreement > 0 {
+			// Compute tie-breaker score using composite method
+			ps.tieBreakScore = m.computeTieBreakScore(method, proc, ctx)
 			scores[proc.Name] = ps
 		}
 	}
@@ -112,6 +115,9 @@ func (m *EnsembleMapper) mapMethodEnsemble(serviceName string, method *ProtoMeth
 	// Find best match considering agreement/disagreement
 	var bestProc *procScore
 	var bestFinalScore float64
+
+	// Total number of strategies available
+	numStrategies := len(m.strategies)
 
 	for _, ps := range scores {
 		if ps.totalWeight == 0 {
@@ -132,6 +138,20 @@ func (m *EnsembleMapper) mapMethodEnsemble(serviceName string, method *ProtoMeth
 			agreementBonus += 0.10
 		}
 
+		// Coverage penalty: penalize when few strategies matched
+		// If only 1 of 4 strategies matched, that's 25% coverage = 15% penalty
+		// If 2 of 4 matched, that's 50% coverage = 10% penalty
+		// If 3 of 4 matched, that's 75% coverage = 5% penalty
+		// If all 4 matched, no penalty
+		coverage := float64(ps.agreement) / float64(numStrategies)
+		coveragePenalty := (1.0 - coverage) * 0.20 // Up to 20% penalty for low coverage
+
+		// Single-strategy penalty: if only 1 strategy matched, apply extra penalty
+		// This prevents a single perfect score from dominating multiple partial matches
+		if ps.agreement == 1 {
+			coveragePenalty += 0.10
+		}
+
 		// Check for disagreement (strategies that matched OTHER procedures with high scores)
 		disagreementPenalty := 0.0
 		for _, otherPS := range scores {
@@ -144,6 +164,11 @@ func (m *EnsembleMapper) mapMethodEnsemble(serviceName string, method *ProtoMeth
 				disagreementPenalty += 0.15
 			}
 			
+			// If another procedure has MORE strategies matching, penalize this one
+			if otherPS.agreement > ps.agreement {
+				disagreementPenalty += 0.05 * float64(otherPS.agreement - ps.agreement)
+			}
+			
 			// If same strategy voted for multiple procedures, small penalty
 			for stratName := range ps.strategyVotes {
 				if _, hasVote := otherPS.strategyVotes[stratName]; hasVote {
@@ -151,11 +176,11 @@ func (m *EnsembleMapper) mapMethodEnsemble(serviceName string, method *ProtoMeth
 				}
 			}
 		}
-		if disagreementPenalty > 0.20 {
-			disagreementPenalty = 0.20 // Cap penalty
+		if disagreementPenalty > 0.25 {
+			disagreementPenalty = 0.25 // Cap penalty
 		}
 
-		finalScore := avgScore + agreementBonus - disagreementPenalty
+		finalScore := avgScore + agreementBonus - coveragePenalty - disagreementPenalty
 		if finalScore > 1.0 {
 			finalScore = 1.0
 		}
@@ -163,10 +188,28 @@ func (m *EnsembleMapper) mapMethodEnsemble(serviceName string, method *ProtoMeth
 			finalScore = 0
 		}
 
-		if finalScore > bestFinalScore {
+		// Use tie-breaker when scores are very close (within 5%)
+		if bestProc == nil {
 			bestFinalScore = finalScore
 			bestProc = ps
+		} else if finalScore > bestFinalScore+0.05 {
+			// Clear winner - more than 5% better
+			bestFinalScore = finalScore
+			bestProc = ps
+		} else if finalScore > bestFinalScore-0.05 {
+			// Scores are within 5% - use tie-breaker
+			if ps.tieBreakScore > bestProc.tieBreakScore {
+				bestFinalScore = finalScore
+				bestProc = ps
+			} else if ps.tieBreakScore == bestProc.tieBreakScore {
+				// Final fallback: lexicographic by name for determinism
+				if ps.proc.Name < bestProc.proc.Name {
+					bestFinalScore = finalScore
+					bestProc = ps
+				}
+			}
 		}
+		// else: bestProc remains (it's more than 5% better)
 	}
 
 	if bestProc == nil {
@@ -194,6 +237,134 @@ func (m *EnsembleMapper) mapMethodEnsemble(serviceName string, method *ProtoMeth
 	mapping.ResultMapping = mapResultsFromContext(method, bestProc.proc, ctx)
 
 	return mapping
+}
+
+// computeTieBreakScore calculates a secondary score for tie-breaking.
+// Uses a composite of: parameter proximity, type compatibility, name specificity,
+// entity-table alignment, and result cardinality.
+func (m *EnsembleMapper) computeTieBreakScore(method *ProtoMethodInfo, proc *Procedure, ctx *MatchContext) float64 {
+	var score float64
+	
+	// 1. Parameter count proximity (weight: 0.25)
+	reqMsg := ctx.AllMessages[method.RequestType]
+	protoFieldCount := 0
+	if reqMsg != nil {
+		protoFieldCount = len(reqMsg.Fields)
+	}
+	procParamCount := len(proc.Parameters)
+	diff := protoFieldCount - procParamCount
+	if diff < 0 {
+		diff = -diff
+	}
+	paramProximity := 1.0 / (1.0 + float64(diff)*0.25)
+	score += paramProximity * 0.25
+
+	// 2. Parameter type compatibility (weight: 0.25)
+	if reqMsg != nil && len(reqMsg.Fields) > 0 {
+		matches := 0
+		for _, field := range reqMsg.Fields {
+			fieldLower := strings.ToLower(field.Name)
+			fieldLower = strings.ReplaceAll(fieldLower, "_", "")
+			for _, param := range proc.Parameters {
+				paramLower := strings.ToLower(param.Name)
+				if fieldLower == paramLower || 
+				   strings.Contains(paramLower, fieldLower) || 
+				   strings.Contains(fieldLower, paramLower) {
+					if isTieBreakTypeCompatible(field.ProtoType, param.GoType) {
+						matches++
+						break
+					}
+				}
+			}
+		}
+		typeCompat := float64(matches) / float64(len(reqMsg.Fields))
+		score += typeCompat * 0.25
+	} else {
+		score += 0.5 * 0.25 // Neutral when no fields
+	}
+
+	// 3. Name specificity (weight: 0.20)
+	// Prefer names that closely match the method name length
+	methodLen := len(method.Name)
+	procNorm := strings.ToLower(proc.Name)
+	for _, prefix := range []string{"usp_", "sp_", "proc_", "p_"} {
+		procNorm = strings.TrimPrefix(procNorm, prefix)
+	}
+	lenDiff := len(procNorm) - methodLen
+	if lenDiff < 0 {
+		lenDiff = -lenDiff
+	}
+	nameSpec := 1.0 / (1.0 + float64(lenDiff)*0.1)
+	score += nameSpec * 0.20
+
+	// 4. Entity-table alignment (weight: 0.20)
+	_, methodEntity := parseVerbEntity(method.Name)
+	if methodEntity != "" {
+		methodEntityLower := strings.ToLower(methodEntity)
+		entityScore := 0.3 // Default if no match
+		for _, op := range proc.Operations {
+			tableLower := strings.ToLower(op.Table)
+			// Exact or singular/plural match
+			if tableLower == methodEntityLower ||
+			   tableLower == methodEntityLower+"s" ||
+			   tableLower+"s" == methodEntityLower {
+				entityScore = 1.0
+				break
+			}
+			if strings.Contains(tableLower, methodEntityLower) || 
+			   strings.Contains(methodEntityLower, tableLower) {
+				if entityScore < 0.8 {
+					entityScore = 0.8
+				}
+			}
+		}
+		score += entityScore * 0.20
+	} else {
+		score += 0.5 * 0.20 // Neutral when no entity
+	}
+
+	// 5. Suffix match bonus (weight: 0.10)
+	// If method has ById/ByEmail etc and proc matches, boost
+	if reqMsg != nil && len(reqMsg.Fields) > 0 {
+		suffixScore := 0.5
+		procLower := strings.ToLower(proc.Name)
+		for _, field := range reqMsg.Fields {
+			fieldLower := strings.ToLower(field.Name)
+			fieldLower = strings.ReplaceAll(fieldLower, "_", "")
+			// Check if proc name has "by" + field name
+			byField := "by" + fieldLower
+			if strings.Contains(procLower, byField) {
+				suffixScore = 1.0
+				break
+			}
+		}
+		score += suffixScore * 0.10
+	} else {
+		score += 0.5 * 0.10
+	}
+
+	return score
+}
+
+// isTieBreakTypeCompatible checks if proto and Go types are compatible
+func isTieBreakTypeCompatible(protoType, goType string) bool {
+	compatMap := map[string][]string{
+		"int32":  {"int", "int32", "int64"},
+		"int64":  {"int", "int32", "int64"},
+		"string": {"string"},
+		"bool":   {"bool"},
+		"double": {"float64", "float32"},
+		"float":  {"float64", "float32"},
+		"bytes":  {"[]byte", "string"},
+	}
+	if goTypes, ok := compatMap[protoType]; ok {
+		for _, gt := range goTypes {
+			if strings.Contains(goType, gt) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // GetStats returns mapping statistics.
@@ -274,33 +445,91 @@ func (s *NamingConventionStrategy) Match(method *ProtoMethodInfo, proc *Procedur
 		// Standard CRUD
 		{"get", []string{"get", "fetch", "retrieve", "find", "load"}, "byid"},
 		{"list", []string{"list", "get", "fetch", "find", "search"}, "s"},
-		{"create", []string{"create", "insert", "add", "new"}, ""},
-		{"update", []string{"update", "modify", "edit", "change", "set"}, ""},
-		{"delete", []string{"delete", "remove", "drop"}, ""},
-		{"change", []string{"change", "update", "modify", "set"}, ""}, // ChangePassword -> usp_ChangePassword
-		
-		// DSL-specific verbs
+		{"create", []string{"create", "insert", "add", "new", "register", "enroll"}, ""},
+		{"update", []string{"update", "modify", "edit", "change", "set", "patch", "amend"}, ""},
+		{"delete", []string{"delete", "remove", "drop", "purge"}, ""},
+		{"change", []string{"change", "update", "modify", "set"}, ""},
+
+		// Validation & verification
 		{"validate", []string{"validate", "check", "verify"}, ""},
 		{"isvalid", []string{"isvalid", "validate", "check"}, ""},
 		{"check", []string{"check", "validate", "verify", "test"}, ""},
 		{"confirm", []string{"confirm", "verify", "validate"}, ""},
+		{"verify", []string{"verify", "validate", "check", "confirm"}, ""},
+
+		// Transformation
 		{"convert", []string{"convert", "transform", "translate"}, ""},
+		{"transform", []string{"transform", "convert", "translate", "normalize"}, ""},
+		{"calculate", []string{"calculate", "calc", "compute", "estimate"}, ""},
+		{"compute", []string{"compute", "calculate", "calc"}, ""},
+		{"generate", []string{"generate", "create", "produce", "build"}, ""},
+		{"aggregate", []string{"aggregate", "summarize", "consolidate"}, ""},
+
+		// Authentication
 		{"authenticate", []string{"authenticate", "auth", "login", "verify"}, ""},
-		{"authorize", []string{"authorize", "auth", "checkpermission"}, ""},
-		
-		// Additional common patterns
+		{"authorize", []string{"authorize", "auth", "checkpermission", "grant"}, ""},
+		{"login", []string{"login", "signin", "authenticate"}, ""},
+		{"logout", []string{"logout", "signout"}, ""},
+
+		// Search & query
 		{"search", []string{"search", "find", "query", "lookup"}, ""},
-		{"process", []string{"process", "execute", "run", "handle"}, ""},
-		{"calculate", []string{"calculate", "calc", "compute"}, ""},
-		{"generate", []string{"generate", "create", "produce"}, ""},
-		{"send", []string{"send", "transmit", "dispatch", "deliver"}, ""},
-		{"receive", []string{"receive", "get", "fetch", "accept"}, ""},
-		{"reserve", []string{"reserve", "hold", "lock", "allocate"}, ""},
+		{"query", []string{"query", "search", "find", "lookup"}, ""},
+
+		// Process & execution
+		{"process", []string{"process", "execute", "run", "handle", "perform"}, ""},
+		{"execute", []string{"execute", "process", "run", "perform"}, ""},
+
+		// Communication
+		{"send", []string{"send", "transmit", "dispatch", "deliver", "forward"}, ""},
+		{"receive", []string{"receive", "get", "fetch", "accept", "collect"}, ""},
+		{"notify", []string{"notify", "alert", "inform", "remind", "broadcast"}, ""},
+		{"publish", []string{"publish", "broadcast", "send", "emit"}, ""},
+
+		// Resource management
+		{"reserve", []string{"reserve", "hold", "lock", "allocate", "claim"}, ""},
 		{"release", []string{"release", "free", "unlock", "deallocate"}, ""},
-		{"cancel", []string{"cancel", "abort", "revoke", "void"}, ""},
-		{"approve", []string{"approve", "accept", "authorize"}, ""},
-		{"reject", []string{"reject", "deny", "decline"}, ""},
-		{"refresh", []string{"refresh", "renew", "update"}, ""},
+		{"acquire", []string{"acquire", "get", "obtain", "claim"}, ""},
+
+		// Lifecycle & state transitions
+		{"cancel", []string{"cancel", "abort", "revoke", "void", "annul"}, ""},
+		{"suspend", []string{"suspend", "pause", "freeze", "hold", "deactivate"}, ""},
+		{"resume", []string{"resume", "reactivate", "unfreeze", "unpause"}, ""},
+		{"activate", []string{"activate", "enable", "start"}, ""},
+		{"deactivate", []string{"deactivate", "disable", "suspend"}, ""},
+		{"complete", []string{"complete", "finish", "finalize", "close"}, ""},
+		{"finalize", []string{"finalize", "complete", "close", "conclude"}, ""},
+		{"initiate", []string{"initiate", "start", "begin", "open", "launch"}, ""},
+		{"start", []string{"start", "begin", "initiate", "launch"}, ""},
+		{"stop", []string{"stop", "end", "terminate", "halt"}, ""},
+		{"terminate", []string{"terminate", "end", "stop", "cancel"}, ""},
+
+		// Approval workflow
+		{"approve", []string{"approve", "accept", "authorize", "grant", "permit"}, ""},
+		{"reject", []string{"reject", "deny", "decline", "refuse"}, ""},
+		{"certify", []string{"certify", "attest", "endorse", "validate", "accredit"}, ""},
+		{"recertify", []string{"recertify", "certify", "renew"}, ""},
+		{"review", []string{"review", "assess", "evaluate", "inspect", "examine"}, ""},
+		{"assess", []string{"assess", "evaluate", "review", "appraise"}, ""},
+		{"audit", []string{"audit", "review", "inspect", "examine"}, ""},
+		{"escalate", []string{"escalate", "elevate", "refer", "delegate"}, ""},
+		{"delegate", []string{"delegate", "assign", "transfer", "refer"}, ""},
+		{"reassign", []string{"reassign", "transfer", "delegate", "assign"}, ""},
+
+		// Acknowledgment & signing
+		{"acknowledge", []string{"acknowledge", "confirm", "accept", "receipt"}, ""},
+		{"sign", []string{"sign", "execute", "approve"}, ""},
+		{"countersign", []string{"countersign", "sign", "approve"}, ""},
+
+		// Synchronization
+		{"sync", []string{"sync", "synchronize", "replicate", "refresh"}, ""},
+		{"refresh", []string{"refresh", "renew", "update", "sync"}, ""},
+		{"archive", []string{"archive", "backup", "store", "preserve"}, ""},
+
+		// Registration
+		{"register", []string{"register", "enroll", "signup", "create"}, ""},
+		{"unregister", []string{"unregister", "deregister", "remove"}, ""},
+		{"subscribe", []string{"subscribe", "register", "enroll", "add"}, ""},
+		{"unsubscribe", []string{"unsubscribe", "remove", "deregister"}, ""},
 	}
 
 	for _, vp := range verbPatterns {
@@ -627,26 +856,122 @@ func (s *VerbEntityStrategy) Match(method *ProtoMethodInfo, proc *Procedure, ctx
 }
 
 func parseVerbEntity(name string) (verb, entity string) {
-	// Known verb patterns (order matters - longer first)
+	// Known verb patterns (order matters - longer first for proper matching)
 	verbs := []string{
+		// Multi-word patterns first (longer matches before shorter)
 		"Authenticate", "Authorize", "IsValid", "Validate", "Calculate", "Generate",
 		"GetActive", "GetValid", "GetAvailable",
-		"CheckDatabase", "Check", "Confirm", "Convert", "Transform",
-		"CreateTransfer", "Create", "Insert", "Add", "New",
-		"UpdateOrder", "Update", "Modify", "Edit", "Change", "Set",
-		"Delete", "Remove", "Drop",
+		"CheckDatabase", "Healthcheck",
+		"CreateTransfer", "UpdateOrder",
+		"Regenerate", "Revalidate", "Reinitialize", "Reconfigure",
+
+		// CRUD operations
+		"Create", "Insert", "Add", "New", "Register", "Enroll", "Subscribe",
+		"Update", "Modify", "Edit", "Change", "Set", "Patch", "Amend",
+		"Delete", "Remove", "Drop", "Unsubscribe", "Deregister", "Purge",
 		"List", "GetAll", "FindAll", "Search", "Query", "Lookup",
-		"Get", "Fetch", "Find", "Load", "Retrieve",
-		"Process", "Execute", "Run", "Handle",
-		"Send", "Transmit", "Dispatch",
-		"Receive", "Accept",
-		"Reserve", "Hold", "Lock", "Allocate",
-		"Release", "Free", "Unlock",
-		"Cancel", "Abort", "Revoke", "Void",
-		"Approve", "Accept",
-		"Reject", "Deny", "Decline",
-		"Refresh", "Renew",
-		"Login", "Logout",
+		"Get", "Fetch", "Find", "Load", "Retrieve", "Read", "Select",
+
+		// Validation & verification
+		"Check", "Confirm", "Verify", "Test", "Validate",
+
+		// Transformation
+		"Convert", "Transform", "Translate", "Parse", "Serialize", "Deserialize",
+		"Encode", "Decode", "Encrypt", "Decrypt", "Compress", "Decompress",
+		"Normalize", "Format", "Sanitize", "Cleanse",
+
+		// Token/session operations
+		"Issue", "Reissue", "Rotate", "Refresh", "Renew", "Extend", "Prolong",
+
+		// Generation & calculation
+		"Compute", "Estimate", "Forecast", "Project", "Calculate", "Calc",
+		"Generate", "Produce", "Build", "Render", "Compile",
+		"Aggregate", "Summarize", "Consolidate", "Merge", "Combine",
+		"Count", "Sum", "Average",
+
+		// Process & execution
+		"Process", "Execute", "Run", "Handle", "Perform", "Invoke",
+		"Batch", "Bulk", "Retry", "Rerun", "Reprocess", "Replay",
+
+		// Communication
+		"Send", "Transmit", "Dispatch", "Deliver", "Forward", "Route",
+		"Receive", "Accept", "Collect",
+		"Notify", "Alert", "Warn", "Inform", "Remind", "Broadcast", "Publish",
+		"Email", "Print",
+
+		// Resource management
+		"Reserve", "Hold", "Lock", "Allocate", "Claim", "Acquire",
+		"Release", "Free", "Unlock", "Deallocate", "Relinquish",
+		"Unclaim", "Take", "Pickup",
+
+		// Lifecycle & state transitions
+		"Cancel", "Abort", "Revoke", "Void", "Annul", "Terminate",
+		"Suspend", "Pause", "Freeze", "Deactivate", "Disable", "Ban",
+		"Resume", "Reactivate", "Unfreeze", "Unpause", "Enable", "Activate", "Unban",
+		"Complete", "Finish", "Finalize", "Close", "Conclude", "End",
+		"Initiate", "Start", "Begin", "Open", "Launch", "Trigger",
+		"Expire", "Invalidate",
+		"Reset", "Initialize", "Configure", "Setup",
+
+		// Approval workflow
+		"Approve", "Grant", "Allow", "Permit", "Sanction",
+		"Reject", "Deny", "Decline", "Refuse", "Disallow", "Veto",
+		"Certify", "Recertify", "Decertify", "Attest", "Endorse", "Accredit", "License",
+		"Review", "Assess", "Evaluate", "Inspect", "Audit", "Examine", "Appraise", "Moderate",
+		"Escalate", "Elevate", "Refer", "Delegate", "Reassign", "Transfer",
+		"Submit", "Propose", "Request",
+
+		// Acknowledgment & signing
+		"Acknowledge", "Receipt",
+		"Sign", "Countersign", "Cosign", "Seal", "Notarize",
+
+		// Synchronization & data movement
+		"Sync", "Synchronize", "Replicate", "Mirror",
+		"Archive", "Backup", "Snapshot", "Preserve", "Store",
+		"Import", "Export", "Upload", "Download", "Copy", "Clone", "Duplicate",
+		"Restore", "Recover", "Rollback",
+		"Migrate", "Move",
+
+		// Authentication
+		"Login", "Logout", "Signin", "Signout",
+
+		// Financial
+		"Bill", "Invoice", "Charge", "Credit", "Debit", "Refund", "Reimburse",
+		"Pay", "Settle", "Post", "Reconcile",
+		"Capture", "Withdraw", "Payout", "Disburse", "Deposit",
+
+		// E-commerce
+		"Checkout", "Purchase", "Buy", "Order", "Return", "Exchange",
+		"Ship", "Fulfill", "Pack",
+
+		// Scheduling & assignment
+		"Book", "Schedule", "Reschedule", "Assign", "Unassign",
+		"Enqueue", "Dequeue", "Queue",
+
+		// Linking & relationships
+		"Attach", "Detach", "Link", "Unlink", "Associate", "Dissociate",
+		"Tag", "Untag", "Label", "Categorize", "Classify",
+		"Flag", "Unflag", "Mark", "Unmark", "Pin", "Unpin",
+
+		// Social actions
+		"Share", "Unshare", "Invite",
+		"Follow", "Unfollow", "Block", "Unblock", "Mute", "Unmute",
+		"Vote", "Rate", "Score", "Rank", "Like", "Upvote", "Downvote",
+
+		// Content & publishing
+		"Publish", "Unpublish", "Draft", "Compose", "Write",
+		"Stage", "Deploy", "Undeploy",
+		"Promote", "Demote", "Upgrade", "Downgrade",
+		"Feature", "Unfeature", "Highlight", "Spotlight",
+
+		// Monitoring
+		"Monitor", "Track", "Observe", "Measure", "Log", "Ping", "Poll", "Probe",
+
+		// Display
+		"Preview", "Display", "Show", "Hide", "Mask", "Reveal",
+
+		// Navigation
+		"Navigate", "Browse", "Explore",
 	}
 
 	nameLower := strings.ToLower(name)
@@ -669,22 +994,130 @@ func parseVerbEntity(name string) (verb, entity string) {
 	return verb, entity
 }
 
-// Verb compatibility groups
+// Verb compatibility groups - verbs in the same group are considered synonymous
 var verbGroups = map[string][]string{
-	"read":   {"get", "fetch", "find", "load", "retrieve", "list", "search", "query", "lookup", "getactive", "getvalid", "getavailable", "getall", "findall"},
-	"create": {"create", "insert", "add", "new", "createtransfer"},
-	"update": {"update", "modify", "edit", "change", "set", "updateorder"},
-	"delete": {"delete", "remove", "drop"},
-	"validate": {"validate", "check", "verify", "isvalid", "checkdatabase", "confirm"},
-	"convert": {"convert", "transform", "translate"},
-	"auth":   {"authenticate", "authorize", "login"},
-	"process": {"process", "execute", "run", "handle"},
-	"reserve": {"reserve", "hold", "lock", "allocate"},
-	"release": {"release", "free", "unlock", "cancel", "abort", "revoke", "void"},
-	"approve": {"approve", "accept"},
-	"reject": {"reject", "deny", "decline"},
-	"send":   {"send", "transmit", "dispatch"},
-	"receive": {"receive", "accept", "get"},
+	// CRUD operations
+	"read":   {"get", "fetch", "find", "load", "retrieve", "list", "search", "query", "lookup", "read", "select", "getactive", "getvalid", "getavailable", "getall", "findall", "browse", "explore", "navigate"},
+	"create": {"create", "insert", "add", "new", "register", "enroll", "subscribe", "generate", "produce", "build", "initialize", "setup", "createtransfer", "issue"},
+	"update": {"update", "modify", "edit", "change", "set", "patch", "amend", "updateorder", "reconfigure", "configure"},
+	"delete": {"delete", "remove", "drop", "unsubscribe", "deregister", "purge", "teardown"},
+
+	// Validation & verification
+	"validate": {"validate", "check", "verify", "isvalid", "checkdatabase", "confirm", "test", "healthcheck", "probe", "ping", "poll"},
+
+	// Token/session operations
+	"refresh": {"refresh", "renew", "extend", "prolong", "revalidate", "reissue", "regenerate", "rotate", "validate"},
+
+	// Transformation & parsing
+	"convert":   {"convert", "transform", "translate", "normalize", "format", "parse", "serialize", "deserialize", "encode", "decode"},
+	"encrypt":   {"encrypt", "decrypt", "encode", "decode", "compress", "decompress"},
+	"sanitize":  {"sanitize", "cleanse", "scrub", "normalize", "format"},
+
+	// Generation & calculation
+	"calculate": {"calculate", "calc", "compute", "estimate", "forecast", "project", "count", "sum", "average"},
+	"generate":  {"generate", "produce", "build", "render", "compile", "create", "issue", "regenerate"},
+	"aggregate": {"aggregate", "summarize", "consolidate", "merge", "combine", "collect"},
+
+	// Authentication & authorization
+	"auth": {"authenticate", "authorize", "login", "logout", "signin", "signout", "refresh", "renew", "rotate"},
+
+	// Process & execution
+	"process": {"process", "execute", "run", "handle", "perform", "invoke", "batch", "bulk"},
+	"retry":   {"retry", "rerun", "reprocess", "replay", "repeat"},
+
+	// Communication
+	"send":    {"send", "transmit", "dispatch", "deliver", "forward", "route", "email", "print", "publish", "broadcast"},
+	"receive": {"receive", "accept", "get", "collect", "retrieve"},
+	"notify":  {"notify", "alert", "warn", "inform", "remind", "broadcast", "publish"},
+
+	// Resource management
+	"reserve": {"reserve", "hold", "lock", "allocate", "claim", "acquire", "book"},
+	"release": {"release", "free", "unlock", "deallocate", "relinquish", "unbook"},
+
+	// Lifecycle & state transitions
+	"cancel":   {"cancel", "abort", "revoke", "void", "annul", "terminate", "stop"},
+	"suspend":  {"suspend", "pause", "freeze", "hold", "deactivate", "disable", "mute", "block", "ban"},
+	"resume":   {"resume", "reactivate", "unfreeze", "unpause", "enable", "activate", "unmute", "unblock", "unban"},
+	"complete": {"complete", "finish", "finalize", "close", "conclude", "end", "fulfill"},
+	"initiate": {"initiate", "start", "begin", "open", "launch", "trigger", "bootstrap"},
+	"expire":   {"expire", "invalidate", "timeout"},
+	"reset":    {"reset", "reinitialize", "clear", "wipe"},
+
+	// Approval workflow
+	"approve":  {"approve", "accept", "grant", "allow", "permit", "sanction", "authorize"},
+	"reject":   {"reject", "deny", "decline", "refuse", "disallow", "veto"},
+	"certify":  {"certify", "recertify", "decertify", "attest", "endorse", "accredit", "license"},
+	"review":   {"review", "assess", "evaluate", "inspect", "audit", "examine", "appraise", "moderate"},
+	"escalate": {"escalate", "elevate", "refer", "delegate", "reassign", "transfer"},
+	"submit":   {"submit", "propose", "request"},
+	"claim":    {"claim", "unclaim", "take", "pickup"},
+
+	// Acknowledgment & signing
+	"acknowledge": {"acknowledge", "confirm", "receipt", "accept"},
+	"sign":        {"sign", "countersign", "cosign", "execute", "seal", "notarize"},
+
+	// Synchronization & data movement
+	"sync":    {"sync", "synchronize", "replicate", "mirror", "refresh"},
+	"archive": {"archive", "backup", "snapshot", "preserve", "store"},
+	"import":  {"import", "upload", "ingest", "load"},
+	"export":  {"export", "download", "extract"},
+	"copy":    {"copy", "clone", "duplicate", "replicate"},
+	"restore": {"restore", "recover", "rollback", "undo"},
+	"migrate": {"migrate", "transfer", "move"},
+
+	// Financial operations
+	"charge":   {"charge", "bill", "invoice", "debit"},
+	"credit":   {"credit", "refund", "reimburse"},
+	"pay":      {"pay", "settle", "clear", "post", "reconcile"},
+	"capture":  {"capture", "collect", "receive"},
+	"withdraw": {"withdraw", "payout", "disburse"},
+	"deposit":  {"deposit", "receive", "credit"},
+
+	// E-commerce
+	"checkout": {"checkout", "purchase", "buy", "order"},
+	"return":   {"return", "exchange", "rma"},
+	"ship":     {"ship", "deliver", "dispatch", "send", "fulfill", "pack"},
+
+	// Scheduling & assignment
+	"schedule": {"schedule", "book", "reserve", "reschedule"},
+	"assign":   {"assign", "allocate", "delegate", "reassign"},
+	"unassign": {"unassign", "deallocate", "release"},
+	"queue":    {"queue", "enqueue", "push"},
+	"dequeue":  {"dequeue", "pop", "pull"},
+
+	// Linking & relationships
+	"attach":     {"attach", "link", "associate", "bind", "connect", "couple"},
+	"detach":     {"detach", "unlink", "dissociate", "unbind", "disconnect", "decouple"},
+	"tag":        {"tag", "label", "categorize", "classify", "mark", "flag", "pin"},
+	"untag":      {"untag", "unlabel", "unmark", "unflag", "unpin"},
+
+	// Social actions
+	"share":    {"share", "publish", "distribute"},
+	"follow":   {"follow", "subscribe", "watch"},
+	"unfollow": {"unfollow", "unsubscribe", "unwatch"},
+	"vote":     {"vote", "rate", "score", "rank", "like", "upvote", "downvote"},
+
+	// Content & publishing
+	"publish":   {"publish", "release", "deploy", "stage", "promote"},
+	"unpublish": {"unpublish", "undeploy", "demote", "retract"},
+	"draft":     {"draft", "compose", "write"},
+	"feature":   {"feature", "highlight", "spotlight"},
+	"unfeature": {"unfeature", "unhighlight"},
+
+	// Version & deployment
+	"upgrade":   {"upgrade", "promote", "update"},
+	"downgrade": {"downgrade", "demote", "rollback"},
+
+	// Fulfillment
+	"fulfill": {"fulfill", "complete", "finish", "satisfy"},
+
+	// Monitoring & logging
+	"monitor": {"monitor", "track", "observe", "watch", "measure"},
+	"log":     {"log", "record", "audit", "trace"},
+
+	// Display & visibility
+	"show": {"show", "display", "reveal", "preview", "render"},
+	"hide": {"hide", "mask", "conceal", "obscure"},
 }
 
 func scoreVerbMatch(v1, v2 string) float64 {

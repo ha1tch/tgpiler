@@ -7,6 +7,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"time"
 )
 
 // ============================================================================
@@ -52,7 +53,6 @@ func (r *UserServiceRepositorySQL) Login(ctx context.Context, req *LoginRequest)
 	// Execute stored procedure and scan results
 	query := "EXEC usp_Login @Email, @PasswordHash"
 	row := r.db.QueryRowContext(ctx, query, req.Email, nil)
-	
 	var result LoginResponse
 	err := row.Scan()
 	if err != nil {
@@ -62,8 +62,7 @@ func (r *UserServiceRepositorySQL) Login(ctx context.Context, req *LoginRequest)
 		return nil, fmt.Errorf("Login: %w", err)
 	}
 	
-	return &LoginResponse{
-	}, nil
+	return &result, nil
 }
 
 
@@ -79,14 +78,19 @@ func (r *UserServiceRepositorySQL) RefreshToken(ctx context.Context, req *Refres
 // VerifyEmail implements the VerifyEmail operation.
 // Mapped to: usp_VerifyEmail (confidence: 100%, exact match: usp_VerifyEmail)
 func (r *UserServiceRepositorySQL) VerifyEmail(ctx context.Context, req *VerifyEmailRequest) (*VerifyEmailResponse, error) {
-	// Execute stored procedure (no result mapping)
+	// Execute stored procedure and scan results
 	query := "EXEC usp_VerifyEmail @Token"
-	_, err := r.db.ExecContext(ctx, query, req.Token)
+	row := r.db.QueryRowContext(ctx, query, req.Token)
+	var result VerifyEmailResponse
+	err := row.Scan(&result.Success)
 	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("VerifyEmail: not found")
+		}
 		return nil, fmt.Errorf("VerifyEmail: %w", err)
 	}
 	
-	return &VerifyEmailResponse{}, nil
+	return &result, nil
 }
 
 
@@ -96,9 +100,8 @@ func (r *UserServiceRepositorySQL) GetUser(ctx context.Context, req *GetUserRequ
 	// Execute stored procedure and scan results
 	query := "EXEC usp_GetUserById @UserId"
 	row := r.db.QueryRowContext(ctx, query, req.ID)
-	
-	var result UserResponse
-	err := row.Scan()
+	var nested User
+	err := row.Scan(&nested.ID, &nested.Email, &nested.Username, &nested.FirstName, &nested.LastName, &nested.Phone, &nested.IsActive, &nested.EmailVerified, &nested.CreatedAt, &nested.UpdatedAt)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, fmt.Errorf("GetUser: not found")
@@ -107,7 +110,7 @@ func (r *UserServiceRepositorySQL) GetUser(ctx context.Context, req *GetUserRequ
 	}
 	
 	return &GetUserResponse{
-		UserResponse: &result,
+		User: &nested,
 	}, nil
 }
 
@@ -118,9 +121,8 @@ func (r *UserServiceRepositorySQL) GetUserByEmail(ctx context.Context, req *GetU
 	// Execute stored procedure and scan results
 	query := "EXEC usp_GetUserByEmail @Email"
 	row := r.db.QueryRowContext(ctx, query, req.Email)
-	
-	var result UserByEmailResponse
-	err := row.Scan()
+	var nested User
+	err := row.Scan(&nested.ID, &nested.Email, &nested.Username, &nested.FirstName, &nested.LastName, &nested.Phone, &nested.IsActive, &nested.EmailVerified, &nested.CreatedAt, &nested.UpdatedAt)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, fmt.Errorf("GetUserByEmail: not found")
@@ -129,7 +131,7 @@ func (r *UserServiceRepositorySQL) GetUserByEmail(ctx context.Context, req *GetU
 	}
 	
 	return &GetUserByEmailResponse{
-		UserByEmailResponse: &result,
+		User: &nested,
 	}, nil
 }
 
@@ -140,9 +142,8 @@ func (r *UserServiceRepositorySQL) UpdateUser(ctx context.Context, req *UpdateUs
 	// Execute stored procedure and scan results
 	query := "EXEC usp_UpdateUser @UserId, @FirstName, @LastName, @Phone"
 	row := r.db.QueryRowContext(ctx, query, req.ID, req.FirstName, req.LastName, req.Phone)
-	
-	var result UpdateUserResponse
-	err := row.Scan()
+	var nested User
+	err := row.Scan(&nested.ID, &nested.Email, &nested.Username, &nested.FirstName, &nested.LastName, &nested.Phone, &nested.IsActive, &nested.EmailVerified, &nested.CreatedAt, &nested.UpdatedAt)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, fmt.Errorf("UpdateUser: not found")
@@ -151,6 +152,7 @@ func (r *UserServiceRepositorySQL) UpdateUser(ctx context.Context, req *UpdateUs
 	}
 	
 	return &UpdateUserResponse{
+		User: &nested,
 	}, nil
 }
 
@@ -158,28 +160,38 @@ func (r *UserServiceRepositorySQL) UpdateUser(ctx context.Context, req *UpdateUs
 // ChangePassword implements the ChangePassword operation.
 // Mapped to: usp_ChangePassword (confidence: 62%, exact match: usp_ChangePassword)
 func (r *UserServiceRepositorySQL) ChangePassword(ctx context.Context, req *ChangePasswordRequest) (*ChangePasswordResponse, error) {
-	// Execute stored procedure (no result mapping)
+	// Execute stored procedure and scan results
 	query := "EXEC usp_ChangePassword @UserId, @CurrentPasswordHash, @NewPasswordHash, @NewSalt"
-	_, err := r.db.ExecContext(ctx, query, req.UserID, nil, nil, nil)
+	row := r.db.QueryRowContext(ctx, query, req.UserID, nil, nil, nil)
+	var result ChangePasswordResponse
+	err := row.Scan(&result.Success)
 	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("ChangePassword: not found")
+		}
 		return nil, fmt.Errorf("ChangePassword: %w", err)
 	}
 	
-	return &ChangePasswordResponse{}, nil
+	return &result, nil
 }
 
 
 // DeactivateUser implements the DeactivateUser operation.
 // Mapped to: usp_DeactivateUser (confidence: 100%, exact match: usp_DeactivateUser)
 func (r *UserServiceRepositorySQL) DeactivateUser(ctx context.Context, req *DeactivateUserRequest) (*DeactivateUserResponse, error) {
-	// Execute stored procedure (no result mapping)
+	// Execute stored procedure and scan results
 	query := "EXEC usp_DeactivateUser @UserId, @Reason"
-	_, err := r.db.ExecContext(ctx, query, req.ID, req.Reason)
+	row := r.db.QueryRowContext(ctx, query, req.ID, req.Reason)
+	var result DeactivateUserResponse
+	err := row.Scan(&result.Success)
 	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("DeactivateUser: not found")
+		}
 		return nil, fmt.Errorf("DeactivateUser: %w", err)
 	}
 	
-	return &DeactivateUserResponse{}, nil
+	return &result, nil
 }
 
 

@@ -1,0 +1,387 @@
+syntax = "proto3";
+
+package moneysend.reporting.v1;
+
+option go_package = "github.com/ha1tch/moneysend/proto/reporting/v1;reportingv1";
+
+import "google/protobuf/timestamp.proto";
+
+// ReportingService provides analytics and business intelligence
+service ReportingService {
+  // Transfer Reports
+  rpc GetDailyTransferSummary(GetDailyTransferSummaryRequest) returns (GetDailyTransferSummaryResponse);
+  rpc GetWeeklyTransferSummary(GetWeeklyTransferSummaryRequest) returns (GetWeeklyTransferSummaryResponse);
+  rpc GetMonthlyTransferSummary(GetMonthlyTransferSummaryRequest) returns (GetMonthlyTransferSummaryResponse);
+  rpc GetCorridorPerformanceReport(GetCorridorPerformanceReportRequest) returns (GetCorridorPerformanceReportResponse);
+  rpc GetPayoutMethodAnalysis(GetPayoutMethodAnalysisRequest) returns (GetPayoutMethodAnalysisResponse);
+  rpc GetFailedTransferAnalysis(GetFailedTransferAnalysisRequest) returns (GetFailedTransferAnalysisResponse);
+  
+  // Customer Reports
+  rpc GetCustomerAcquisitionReport(GetCustomerAcquisitionReportRequest) returns (GetCustomerAcquisitionReportResponse);
+  rpc GetCustomerLifetimeValueReport(GetCustomerLifetimeValueReportRequest) returns (GetCustomerLifetimeValueReportResponse);
+  rpc GetKYCFunnelReport(GetKYCFunnelReportRequest) returns (GetKYCFunnelReportResponse);
+  
+  // Revenue Reports
+  rpc GetRevenueBreakdownReport(GetRevenueBreakdownReportRequest) returns (GetRevenueBreakdownReportResponse);
+  rpc GetPromoCodeUsageReport(GetPromoCodeUsageReportRequest) returns (GetPromoCodeUsageReportResponse);
+  
+  // Operations Reports
+  rpc GetComplianceDashboard(GetComplianceDashboardRequest) returns (GetComplianceDashboardResponse);
+  rpc GetPartnerPerformanceReport(GetPartnerPerformanceReportRequest) returns (GetPartnerPerformanceReportResponse);
+  rpc GetTransactionVelocityReport(GetTransactionVelocityReportRequest) returns (GetTransactionVelocityReportResponse);
+  rpc GetGeographicDistributionReport(GetGeographicDistributionReportRequest) returns (GetGeographicDistributionReportResponse);
+  rpc GetHourlyTransactionPattern(GetHourlyTransactionPatternRequest) returns (GetHourlyTransactionPatternResponse);
+}
+
+// Core Messages
+message TransferSummary {
+  int32 total_transfers = 1;
+  int32 completed_transfers = 2;
+  int32 cancelled_transfers = 3;
+  int32 failed_transfers = 4;
+  int32 flagged_transfers = 5;
+  double total_send_volume = 6;
+  double total_receive_volume = 7;
+  double total_fee_revenue = 8;
+  double total_fx_revenue = 9;
+  double avg_transfer_amount = 10;
+  int32 unique_customers = 11;
+  int32 unique_beneficiaries = 12;
+}
+
+message CorridorPerformance {
+  int32 corridor_id = 1;
+  string corridor_code = 2;
+  string display_name = 3;
+  string origin_country = 4;
+  string destination_country = 5;
+  int32 total_transfers = 6;
+  int32 completed_transfers = 7;
+  double total_volume = 8;
+  double total_fee_revenue = 9;
+  double total_fx_revenue = 10;
+  double avg_transfer_amount = 11;
+  int32 unique_customers = 12;
+  double avg_completion_minutes = 13;
+}
+
+message PayoutMethodStats {
+  string payout_method = 1;
+  int32 total_transfers = 2;
+  int32 completed_transfers = 3;
+  int32 failed_transfers = 4;
+  double success_rate = 5;
+  double total_volume = 6;
+  double avg_transfer_amount = 7;
+  double total_fee_revenue = 8;
+  double avg_completion_minutes = 9;
+}
+
+message CustomerAcquisitionDay {
+  string registration_date = 1;
+  int32 new_customers = 2;
+  int32 verified_customers = 3;
+  int32 active_customers = 4;
+}
+
+message CustomerAcquisitionByCountry {
+  string country = 1;
+  int32 new_customers = 2;
+  int32 verified_customers = 3;
+}
+
+message CustomerLifetimeValue {
+  int64 customer_id = 1;
+  string email = 2;
+  string first_name = 3;
+  string last_name = 4;
+  string country = 5;
+  google.protobuf.Timestamp customer_since = 6;
+  int32 total_transfers = 7;
+  double total_volume = 8;
+  double total_fees_generated = 9;
+  double total_fx_margin_generated = 10;
+  double total_revenue_generated = 11;
+  double avg_transfer_amount = 12;
+  google.protobuf.Timestamp first_transfer_date = 13;
+  google.protobuf.Timestamp last_transfer_date = 14;
+  int32 active_days = 15;
+}
+
+message RevenueByChannel {
+  string channel = 1;
+  double transfer_fee_revenue = 2;
+  double fx_margin_revenue = 3;
+  double total_revenue = 4;
+  int32 transfer_count = 5;
+}
+
+message PromoCodeStats {
+  int32 promo_code_id = 1;
+  string code = 2;
+  string promo_name = 3;
+  string discount_type = 4;
+  double discount_value = 5;
+  google.protobuf.Timestamp valid_from = 6;
+  google.protobuf.Timestamp valid_to = 7;
+  int32 max_uses_total = 8;
+  int32 current_usage_count = 9;
+  int32 usage_in_period = 10;
+  double total_discount_given = 11;
+  double total_volume_generated = 12;
+  double fee_revenue_generated = 13;
+}
+
+message ComplianceMetric {
+  string metric = 1;
+  int32 count = 2;
+}
+
+message PartnerPerformance {
+  int32 partner_id = 1;
+  string partner_code = 2;
+  string partner_name = 3;
+  string partner_type = 4;
+  int32 total_transfers = 5;
+  int32 completed_transfers = 6;
+  int32 failed_transfers = 7;
+  double success_rate = 8;
+  double total_volume_paid_out = 9;
+  double avg_payout_minutes = 10;
+}
+
+message TransactionVelocity {
+  int64 customer_id = 1;
+  string email = 2;
+  string first_name = 3;
+  string last_name = 4;
+  string risk_level = 5;
+  int32 transfer_count = 6;
+  double total_volume = 7;
+  int32 unique_beneficiaries = 8;
+  int32 unique_corridors = 9;
+  google.protobuf.Timestamp first_transfer_time = 10;
+  google.protobuf.Timestamp last_transfer_time = 11;
+}
+
+message GeographicVolume {
+  string country = 1;
+  int32 transfer_count = 2;
+  double total_volume = 3;
+  double total_fees = 4;
+  int32 unique_customers = 5;
+}
+
+message HourlyPattern {
+  int32 hour = 1;
+  int32 transfer_count = 2;
+  double volume = 3;
+}
+
+message FailureByReason {
+  string status_reason = 1;
+  int32 failure_count = 2;
+  double volume_lost = 3;
+}
+
+// Request/Response Messages
+
+message GetDailyTransferSummaryRequest {
+  string date = 1;  // YYYY-MM-DD format
+}
+
+message GetDailyTransferSummaryResponse {
+  string report_date = 1;
+  TransferSummary summary = 2;
+}
+
+message GetWeeklyTransferSummaryRequest {
+  string week_start_date = 1;  // YYYY-MM-DD format
+}
+
+message GetWeeklyTransferSummaryResponse {
+  string week_start = 1;
+  string week_end = 2;
+  TransferSummary summary = 3;
+  repeated DailyBreakdown daily_breakdown = 4;
+}
+
+message DailyBreakdown {
+  string date = 1;
+  int32 transfers = 2;
+  double volume = 3;
+  double fees = 4;
+}
+
+message GetMonthlyTransferSummaryRequest {
+  int32 year = 1;
+  int32 month = 2;
+}
+
+message GetMonthlyTransferSummaryResponse {
+  int32 year = 1;
+  int32 month = 2;
+  TransferSummary summary = 3;
+  double total_revenue = 4;
+  int32 active_corridors = 5;
+}
+
+message GetCorridorPerformanceReportRequest {
+  string start_date = 1;
+  string end_date = 2;
+}
+
+message GetCorridorPerformanceReportResponse {
+  repeated CorridorPerformance corridors = 1;
+}
+
+message GetPayoutMethodAnalysisRequest {
+  string start_date = 1;
+  string end_date = 2;
+}
+
+message GetPayoutMethodAnalysisResponse {
+  repeated PayoutMethodStats methods = 1;
+}
+
+message GetFailedTransferAnalysisRequest {
+  string start_date = 1;
+  string end_date = 2;
+}
+
+message GetFailedTransferAnalysisResponse {
+  repeated FailureByReason by_reason = 1;
+  repeated FailureByChannel by_corridor = 2;
+  repeated FailureByChannel by_partner = 3;
+}
+
+message FailureByChannel {
+  string channel = 1;
+  int32 failure_count = 2;
+  double failure_rate = 3;
+}
+
+message GetCustomerAcquisitionReportRequest {
+  string start_date = 1;
+  string end_date = 2;
+}
+
+message GetCustomerAcquisitionReportResponse {
+  repeated CustomerAcquisitionDay by_day = 1;
+  repeated CustomerAcquisitionByCountry by_country = 2;
+  int32 total_new_customers = 3;
+  int32 customers_with_transfer = 4;
+  double conversion_rate = 5;
+}
+
+message GetCustomerLifetimeValueReportRequest {
+  int32 min_transfers = 1;
+}
+
+message GetCustomerLifetimeValueReportResponse {
+  repeated CustomerLifetimeValue customers = 1;
+}
+
+message GetKYCFunnelReportRequest {
+  string start_date = 1;
+  string end_date = 2;
+}
+
+message GetKYCFunnelReportResponse {
+  int32 total_registrations = 1;
+  int32 pending_kyc = 2;
+  int32 verified_kyc = 3;
+  int32 rejected_kyc = 4;
+  double verification_rate = 5;
+  repeated DocumentTypeStats document_stats = 6;
+}
+
+message DocumentTypeStats {
+  string document_type = 1;
+  int32 total_submitted = 2;
+  int32 approved = 3;
+  int32 rejected = 4;
+  int32 pending = 5;
+  double avg_review_hours = 6;
+}
+
+message GetRevenueBreakdownReportRequest {
+  string start_date = 1;
+  string end_date = 2;
+}
+
+message GetRevenueBreakdownReportResponse {
+  double transfer_fee_revenue = 1;
+  double fx_margin_revenue = 2;
+  double total_revenue = 3;
+  double total_promo_discounts = 4;
+  int32 total_transfers = 5;
+  double total_volume = 6;
+  repeated RevenueByChannel by_corridor = 7;
+  repeated RevenueByChannel by_payout_method = 8;
+}
+
+message GetPromoCodeUsageReportRequest {
+  string start_date = 1;
+  string end_date = 2;
+}
+
+message GetPromoCodeUsageReportResponse {
+  repeated PromoCodeStats promo_codes = 1;
+}
+
+message GetComplianceDashboardRequest {}
+
+message GetComplianceDashboardResponse {
+  repeated ComplianceMetric metrics = 1;
+  repeated FlaggedTransferSummary recent_flagged = 2;
+}
+
+message FlaggedTransferSummary {
+  int64 transfer_id = 1;
+  string transfer_number = 2;
+  double send_amount = 3;
+  string send_currency = 4;
+  string status = 5;
+  string compliance_status = 6;
+  double risk_score = 7;
+  google.protobuf.Timestamp created_at = 8;
+  string customer_email = 9;
+  string customer_risk_level = 10;
+}
+
+message GetPartnerPerformanceReportRequest {
+  string start_date = 1;
+  string end_date = 2;
+}
+
+message GetPartnerPerformanceReportResponse {
+  repeated PartnerPerformance partners = 1;
+}
+
+message GetTransactionVelocityReportRequest {
+  int64 customer_id = 1;
+  int32 hours = 2;
+}
+
+message GetTransactionVelocityReportResponse {
+  repeated TransactionVelocity customers = 1;
+}
+
+message GetGeographicDistributionReportRequest {
+  string start_date = 1;
+  string end_date = 2;
+}
+
+message GetGeographicDistributionReportResponse {
+  repeated GeographicVolume by_origin = 1;
+  repeated GeographicVolume by_destination = 2;
+}
+
+message GetHourlyTransactionPatternRequest {
+  string date = 1;
+}
+
+message GetHourlyTransactionPatternResponse {
+  repeated HourlyPattern patterns = 1;
+}
