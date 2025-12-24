@@ -176,17 +176,44 @@ func unsupportedExpressionError(expr ast.Expression) error {
 }
 
 func (t *transpiler) transpilePrefixExpression(e *ast.PrefixExpression) (string, error) {
-	right, err := t.transpileExpression(e.Right)
-	if err != nil {
-		return "", err
-	}
-
 	op := e.Operator
 	switch strings.ToUpper(op) {
 	case "NOT":
+		// Optimize NOT (x = y) to x != y, and NOT (x <> y) to x == y
+		if infix, ok := e.Right.(*ast.InfixExpression); ok {
+			switch infix.Operator {
+			case "=":
+				// NOT (x = y) -> x != y
+				left, err := t.transpileExpression(infix.Left)
+				if err != nil {
+					return "", err
+				}
+				right, err := t.transpileExpression(infix.Right)
+				if err != nil {
+					return "", err
+				}
+				return fmt.Sprintf("%s != %s", left, right), nil
+			case "<>", "!=":
+				// NOT (x <> y) -> x == y
+				left, err := t.transpileExpression(infix.Left)
+				if err != nil {
+					return "", err
+				}
+				right, err := t.transpileExpression(infix.Right)
+				if err != nil {
+					return "", err
+				}
+				return fmt.Sprintf("%s == %s", left, right), nil
+			}
+		}
 		op = "!"
 	case "~":
 		op = "^" // Bitwise NOT in Go
+	}
+
+	right, err := t.transpileExpression(e.Right)
+	if err != nil {
+		return "", err
 	}
 
 	// Handle unary minus on decimal types
@@ -197,7 +224,13 @@ func (t *transpiler) transpilePrefixExpression(e *ast.PrefixExpression) (string,
 		}
 	}
 
-	return fmt.Sprintf("(%s%s)", op, right), nil
+	// Only wrap in parentheses if needed for precedence
+	// Simple identifiers, function calls, and already-parenthesized expressions don't need wrapping
+	needsParens := strings.ContainsAny(right, " ") && !strings.HasPrefix(right, "(")
+	if needsParens {
+		return fmt.Sprintf("(%s%s)", op, right), nil
+	}
+	return fmt.Sprintf("%s%s", op, right), nil
 }
 
 func (t *transpiler) transpileInfixExpression(e *ast.InfixExpression) (string, error) {
@@ -257,17 +290,17 @@ func (t *transpiler) transpileInfixExpression(e *ast.InfixExpression) (string, e
 		if leftType != nil && leftType.isString {
 			if _, ok := e.Right.(*ast.NullLiteral); ok {
 				if op == "=" {
-					return fmt.Sprintf("(%s == \"\")", left), nil
+					return fmt.Sprintf("%s == \"\"", left), nil
 				}
-				return fmt.Sprintf("(%s != \"\")", left), nil
+				return fmt.Sprintf("%s != \"\"", left), nil
 			}
 		}
 		if rightType != nil && rightType.isString {
 			if _, ok := e.Left.(*ast.NullLiteral); ok {
 				if op == "=" {
-					return fmt.Sprintf("(%s == \"\")", right), nil
+					return fmt.Sprintf("%s == \"\"", right), nil
 				}
-				return fmt.Sprintf("(%s != \"\")", right), nil
+				return fmt.Sprintf("%s != \"\"", right), nil
 			}
 		}
 		
@@ -279,7 +312,7 @@ func (t *transpiler) transpileInfixExpression(e *ast.InfixExpression) (string, e
 				if op == "<>" || op == "!=" {
 					goOp = "!="
 				}
-				return fmt.Sprintf("(%s %s \"%d\")", left, goOp, lit.Value), nil
+				return fmt.Sprintf("%s %s \"%d\"", left, goOp, lit.Value), nil
 			}
 		}
 		if rightType != nil && rightType.isString {
@@ -288,7 +321,7 @@ func (t *transpiler) transpileInfixExpression(e *ast.InfixExpression) (string, e
 				if op == "<>" || op == "!=" {
 					goOp = "!="
 				}
-				return fmt.Sprintf("(\"%d\" %s %s)", lit.Value, goOp, right), nil
+				return fmt.Sprintf("\"%d\" %s %s", lit.Value, goOp, right), nil
 			}
 		}
 	}
@@ -347,6 +380,19 @@ func (t *transpiler) transpileInfixExpression(e *ast.InfixExpression) (string, e
 
 	// Standard operator mapping for non-decimal types
 	goOp := t.mapOperator(e.Operator)
+	
+	// Determine if we need parentheses based on operator type
+	// Comparison and boolean operators don't need wrapping in boolean contexts
+	opUpper := strings.ToUpper(e.Operator)
+	isComparison := opUpper == "=" || opUpper == "<>" || opUpper == "!=" || 
+		opUpper == "<" || opUpper == ">" || opUpper == "<=" || opUpper == ">=" ||
+		opUpper == "!<" || opUpper == "!>"
+	isBoolean := opUpper == "AND" || opUpper == "OR"
+	
+	if isComparison || isBoolean {
+		return fmt.Sprintf("%s %s %s", left, goOp, right), nil
+	}
+	
 	return fmt.Sprintf("(%s %s %s)", left, goOp, right), nil
 }
 
@@ -394,6 +440,11 @@ func (t *transpiler) transpileDecimalInfix(left, right string, leftExpr, rightEx
 	default:
 		// For other operators (AND, OR, etc.), fall back to standard
 		goOp := t.mapOperator(op)
+		// Boolean operators don't need parens
+		opUpper := strings.ToUpper(op)
+		if opUpper == "AND" || opUpper == "OR" {
+			return fmt.Sprintf("%s %s %s", left, goOp, right), nil
+		}
 		return fmt.Sprintf("(%s %s %s)", left, goOp, right), nil
 	}
 }
@@ -1107,19 +1158,19 @@ func (t *transpiler) transpileFunctionCall(fc *ast.FunctionCall) (string, error)
 	case "YEAR":
 		t.imports["time"] = true
 		if len(args) == 1 {
-			return fmt.Sprintf("(%s).Year()", args[0]), nil
+			return fmt.Sprintf("%s.Year()", wrapForMethodCall(args[0])), nil
 		}
 
 	case "MONTH":
 		t.imports["time"] = true
 		if len(args) == 1 {
-			return fmt.Sprintf("int((%s).Month())", args[0]), nil
+			return fmt.Sprintf("int(%s.Month())", wrapForMethodCall(args[0])), nil
 		}
 
 	case "DAY":
 		t.imports["time"] = true
 		if len(args) == 1 {
-			return fmt.Sprintf("(%s).Day()", args[0]), nil
+			return fmt.Sprintf("%s.Day()", wrapForMethodCall(args[0])), nil
 		}
 
 	case "DATEPART":
@@ -1203,19 +1254,20 @@ func (t *transpiler) transpileFunctionCall(fc *ast.FunctionCall) (string, error)
 
 func (t *transpiler) transpileDateAdd(interval, number, date string) (string, error) {
 	interval = strings.ToUpper(interval)
+	dateW := wrapForMethodCall(date)
 	switch interval {
 	case "YEAR", "YY", "YYYY":
-		return fmt.Sprintf("(%s).AddDate(%s, 0, 0)", date, number), nil
+		return fmt.Sprintf("%s.AddDate(%s, 0, 0)", dateW, number), nil
 	case "MONTH", "MM", "M":
-		return fmt.Sprintf("(%s).AddDate(0, %s, 0)", date, number), nil
+		return fmt.Sprintf("%s.AddDate(0, %s, 0)", dateW, number), nil
 	case "DAY", "DD", "D":
-		return fmt.Sprintf("(%s).AddDate(0, 0, %s)", date, number), nil
+		return fmt.Sprintf("%s.AddDate(0, 0, %s)", dateW, number), nil
 	case "HOUR", "HH":
-		return fmt.Sprintf("(%s).Add(time.Duration(%s) * time.Hour)", date, number), nil
+		return fmt.Sprintf("%s.Add(time.Duration(%s) * time.Hour)", dateW, number), nil
 	case "MINUTE", "MI", "N":
-		return fmt.Sprintf("(%s).Add(time.Duration(%s) * time.Minute)", date, number), nil
+		return fmt.Sprintf("%s.Add(time.Duration(%s) * time.Minute)", dateW, number), nil
 	case "SECOND", "SS", "S":
-		return fmt.Sprintf("(%s).Add(time.Duration(%s) * time.Second)", date, number), nil
+		return fmt.Sprintf("%s.Add(time.Duration(%s) * time.Second)", dateW, number), nil
 	default:
 		return "", fmt.Errorf("unsupported DATEADD interval: %s", interval)
 	}
@@ -1223,46 +1275,49 @@ func (t *transpiler) transpileDateAdd(interval, number, date string) (string, er
 
 func (t *transpiler) transpileDateDiff(interval, start, end string) (string, error) {
 	interval = strings.ToUpper(interval)
+	startW := wrapForMethodCall(start)
+	endW := wrapForMethodCall(end)
 	switch interval {
 	case "YEAR", "YY", "YYYY":
-		return fmt.Sprintf("((%s).Year() - (%s).Year())", end, start), nil
+		return fmt.Sprintf("(%s.Year() - %s.Year())", endW, startW), nil
 	case "MONTH", "MM", "M":
-		return fmt.Sprintf("(((%s).Year()-(%s).Year())*12 + int((%s).Month()) - int((%s).Month()))", end, start, end, start), nil
+		return fmt.Sprintf("((%s.Year()-%s.Year())*12 + int(%s.Month()) - int(%s.Month()))", endW, startW, endW, startW), nil
 	case "DAY", "DD", "D":
-		return fmt.Sprintf("int((%s).Sub(%s).Hours() / 24)", end, start), nil
+		return fmt.Sprintf("int(%s.Sub(%s).Hours() / 24)", endW, startW), nil
 	case "HOUR", "HH":
-		return fmt.Sprintf("int((%s).Sub(%s).Hours())", end, start), nil
+		return fmt.Sprintf("int(%s.Sub(%s).Hours())", endW, startW), nil
 	case "MINUTE", "MI", "N":
-		return fmt.Sprintf("int((%s).Sub(%s).Minutes())", end, start), nil
+		return fmt.Sprintf("int(%s.Sub(%s).Minutes())", endW, startW), nil
 	case "SECOND", "SS", "S":
-		return fmt.Sprintf("int((%s).Sub(%s).Seconds())", end, start), nil
+		return fmt.Sprintf("int(%s.Sub(%s).Seconds())", endW, startW), nil
 	default:
 		return "", fmt.Errorf("unsupported DATEDIFF interval: %s", interval)
 	}
 }
 
 func (t *transpiler) transpileDatePart(interval, date string) (string, error) {
+	dateW := wrapForMethodCall(date)
 	switch strings.ToUpper(interval) {
 	case "YEAR", "YY", "YYYY":
-		return fmt.Sprintf("int32((%s).Year())", date), nil
+		return fmt.Sprintf("int32(%s.Year())", dateW), nil
 	case "MONTH", "MM", "M":
-		return fmt.Sprintf("int32((%s).Month())", date), nil
+		return fmt.Sprintf("int32(%s.Month())", dateW), nil
 	case "DAY", "DD", "D":
-		return fmt.Sprintf("int32((%s).Day())", date), nil
+		return fmt.Sprintf("int32(%s.Day())", dateW), nil
 	case "HOUR", "HH":
-		return fmt.Sprintf("int32((%s).Hour())", date), nil
+		return fmt.Sprintf("int32(%s.Hour())", dateW), nil
 	case "MINUTE", "MI", "N":
-		return fmt.Sprintf("int32((%s).Minute())", date), nil
+		return fmt.Sprintf("int32(%s.Minute())", dateW), nil
 	case "SECOND", "SS", "S":
-		return fmt.Sprintf("int32((%s).Second())", date), nil
+		return fmt.Sprintf("int32(%s.Second())", dateW), nil
 	case "WEEKDAY", "DW", "W":
 		// T-SQL: Sunday=1, Monday=2, ... Saturday=7
 		// Go: Sunday=0, Monday=1, ... Saturday=6
-		return fmt.Sprintf("int32((%s).Weekday() + 1)", date), nil
+		return fmt.Sprintf("int32(%s.Weekday() + 1)", dateW), nil
 	case "DAYOFYEAR", "DY", "Y":
-		return fmt.Sprintf("int32((%s).YearDay())", date), nil
+		return fmt.Sprintf("int32(%s.YearDay())", dateW), nil
 	case "QUARTER", "QQ", "Q":
-		return fmt.Sprintf("int32(((%s).Month()-1)/3 + 1)", date), nil
+		return fmt.Sprintf("int32((%s.Month()-1)/3 + 1)", dateW), nil
 	default:
 		return "", fmt.Errorf("unsupported DATEPART interval: %s", interval)
 	}
@@ -1614,6 +1669,29 @@ func (t *transpiler) transpileConvertExpression(c *ast.ConvertExpression) (strin
 }
 
 func (t *transpiler) transpileIsNullExpression(e *ast.IsNullExpression) (string, error) {
+	// Special case: OBJECT_ID('tempdb..#tableName') IS [NOT] NULL
+	// Can be simplified to just tempTables.TempTableExists("#tableName")
+	if fc, ok := e.Expr.(*ast.FunctionCall); ok {
+		if id, ok := fc.Function.(*ast.Identifier); ok && strings.ToUpper(id.Value) == "OBJECT_ID" {
+			if len(fc.Arguments) == 1 {
+				if lit, ok := fc.Arguments[0].(*ast.StringLiteral); ok {
+					objName := lit.Value
+					if strings.Contains(objName, "#") {
+						parts := strings.Split(objName, "#")
+						if len(parts) >= 2 {
+							tableName := "#" + parts[len(parts)-1]
+							t.imports["github.com/ha1tch/tgpiler/tsqlruntime"] = true
+							if e.Not {
+								return fmt.Sprintf("tempTables.TempTableExists(%q)", tableName), nil
+							}
+							return fmt.Sprintf("!tempTables.TempTableExists(%q)", tableName), nil
+						}
+					}
+				}
+			}
+		}
+	}
+
 	expr, err := t.transpileExpression(e.Expr)
 	if err != nil {
 		return "", err
@@ -1625,49 +1703,49 @@ func (t *transpiler) transpileIsNullExpression(e *ast.IsNullExpression) (string,
 	// For string types, NULL check becomes empty string check
 	if exprType != nil && exprType.isString {
 		if e.Not {
-			return fmt.Sprintf("(%s != \"\")", expr), nil
+			return fmt.Sprintf("%s != \"\"", expr), nil
 		}
-		return fmt.Sprintf("(%s == \"\")", expr), nil
+		return fmt.Sprintf("%s == \"\"", expr), nil
 	}
 	
 	// For datetime types (time.Time), use IsZero()
 	if exprType != nil && exprType.isDateTime {
 		if e.Not {
-			return fmt.Sprintf("(!%s.IsZero())", expr), nil
+			return fmt.Sprintf("!%s.IsZero()", expr), nil
 		}
-		return fmt.Sprintf("(%s.IsZero())", expr), nil
+		return fmt.Sprintf("%s.IsZero()", expr), nil
 	}
 	
 	// For decimal types, use IsZero() method
 	if exprType != nil && exprType.isDecimal {
 		if e.Not {
-			return fmt.Sprintf("(!%s.IsZero())", expr), nil
+			return fmt.Sprintf("!%s.IsZero()", expr), nil
 		}
-		return fmt.Sprintf("(%s.IsZero())", expr), nil
+		return fmt.Sprintf("%s.IsZero()", expr), nil
 	}
 	
 	// For numeric types (int32, int64, float64, etc.), use zero comparison
 	if exprType != nil && exprType.isNumeric {
 		if e.Not {
-			return fmt.Sprintf("(%s != 0)", expr), nil
+			return fmt.Sprintf("%s != 0", expr), nil
 		}
-		return fmt.Sprintf("(%s == 0)", expr), nil
+		return fmt.Sprintf("%s == 0", expr), nil
 	}
 	
 	// For bool types, check the value directly
 	if exprType != nil && exprType.isBool {
 		// In T-SQL, NULL for bit is typically false
 		if e.Not {
-			return fmt.Sprintf("(%s)", expr), nil // IS NOT NULL for bool = true
+			return expr, nil // IS NOT NULL for bool = the value itself
 		}
-		return fmt.Sprintf("(!%s)", expr), nil // IS NULL for bool = false
+		return fmt.Sprintf("!%s", expr), nil // IS NULL for bool = negated
 	}
 
 	// Default: use nil check (for interface{} or unknown pointer types)
 	if e.Not {
-		return fmt.Sprintf("(%s != nil)", expr), nil
+		return fmt.Sprintf("%s != nil", expr), nil
 	}
-	return fmt.Sprintf("(%s == nil)", expr), nil
+	return fmt.Sprintf("%s == nil", expr), nil
 }
 
 func (t *transpiler) transpileBetweenExpression(e *ast.BetweenExpression) (string, error) {
@@ -1696,7 +1774,25 @@ func (t *transpiler) transpileInExpression(e *ast.InExpression) (string, error) 
 		return "", err
 	}
 
-	// Build a series of equality checks
+	// Optimization: NOT IN (single_value) -> expr != value
+	if e.Not && len(e.Values) == 1 {
+		v, err := t.transpileExpression(e.Values[0])
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("%s != %s", expr, v), nil
+	}
+
+	// Optimization: IN (single_value) -> expr == value (no parens needed)
+	if !e.Not && len(e.Values) == 1 {
+		v, err := t.transpileExpression(e.Values[0])
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("%s == %s", expr, v), nil
+	}
+
+	// Build a series of equality checks for multiple values
 	var checks []string
 	for _, val := range e.Values {
 		v, err := t.transpileExpression(val)
@@ -1951,4 +2047,29 @@ func (t *transpiler) transpileNewid() (string, error) {
 	default:
 		return "", fmt.Errorf("unknown --newid mode: %s (valid: app, db, grpc, mock, stub)", mode)
 	}
+}
+
+// wrapForMethodCall wraps an expression in parentheses only if needed for method call chaining.
+// Simple expressions like "time.Now()" or variable names don't need wrapping.
+// Complex expressions with operators like "a + b" need wrapping to become "(a + b).Method()".
+func wrapForMethodCall(expr string) string {
+	expr = strings.TrimSpace(expr)
+	
+	// Already wrapped
+	if strings.HasPrefix(expr, "(") && strings.HasSuffix(expr, ")") {
+		return expr
+	}
+	
+	// Simple function call ending with () - no wrap needed
+	if strings.HasSuffix(expr, ")") && !strings.ContainsAny(expr, " +-*/<>=!&|") {
+		return expr
+	}
+	
+	// Simple identifier (variable name) - no wrap needed
+	if !strings.ContainsAny(expr, " +-*/<>=!&|()") {
+		return expr
+	}
+	
+	// Complex expression - needs wrapping
+	return "(" + expr + ")"
 }

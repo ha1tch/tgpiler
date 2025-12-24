@@ -4,6 +4,7 @@ package transpiler
 import (
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/ha1tch/tsqlparser"
@@ -250,8 +251,26 @@ func (t *transpiler) transpile(program *ast.Program) (string, error) {
 	out.WriteString(fmt.Sprintf("package %s\n\n", t.packageName))
 
 	if len(t.imports) > 0 {
-		out.WriteString("import (\n")
+		// Separate stdlib and third-party imports
+		var stdImports, thirdPartyImports []string
 		for imp := range t.imports {
+			if strings.Contains(imp, ".") {
+				thirdPartyImports = append(thirdPartyImports, imp)
+			} else {
+				stdImports = append(stdImports, imp)
+			}
+		}
+		sort.Strings(stdImports)
+		sort.Strings(thirdPartyImports)
+
+		out.WriteString("import (\n")
+		for _, imp := range stdImports {
+			out.WriteString(fmt.Sprintf("\t%q\n", imp))
+		}
+		if len(stdImports) > 0 && len(thirdPartyImports) > 0 {
+			out.WriteString("\n") // Blank line between groups
+		}
+		for _, imp := range thirdPartyImports {
 			out.WriteString(fmt.Sprintf("\t%q\n", imp))
 		}
 		out.WriteString(")\n\n")
@@ -1413,7 +1432,15 @@ func (t *transpiler) transpileDeclare(decl *ast.DeclareStatement) (string, error
 			if ti != nil && ti.isBool && !isNull {
 				valExpr = t.ensureBool(v.Value, valExpr)
 			}
-			parts = append(parts, fmt.Sprintf("%svar %s %s = %s%s", prefix, varName, goType, valExpr, typeComment))
+			// Use short declaration for simple cases where type can be inferred
+			// Only use for bool and string - numeric types need explicit declaration
+			// to ensure correct types (int32 vs int, etc.)
+			useShortDecl := typeComment == "" && (goType == "bool" || goType == "string")
+			if useShortDecl {
+				parts = append(parts, fmt.Sprintf("%s%s := %s", prefix, varName, valExpr))
+			} else {
+				parts = append(parts, fmt.Sprintf("%svar %s %s = %s%s", prefix, varName, goType, valExpr, typeComment))
+			}
 		} else {
 			parts = append(parts, fmt.Sprintf("%svar %s %s%s", prefix, varName, goType, typeComment))
 		}
@@ -1491,6 +1518,9 @@ func (t *transpiler) transpileSet(set *ast.SetStatement) (string, error) {
 		return fmt.Sprintf("%s// SET %s = %s (no-op, skipped)", prefix, varExpr, valExpr), nil
 	}
 
+	// Strip unnecessary outer parentheses from RHS for cleaner assignments
+	valExpr = stripOuterParens(valExpr)
+
 	return fmt.Sprintf("%s%s = %s", prefix, varExpr, valExpr), nil
 }
 
@@ -1507,6 +1537,9 @@ func (t *transpiler) transpileIf(ifStmt *ast.IfStatement) (string, error) {
 	if err != nil {
 		return "", err
 	}
+
+	// Strip unnecessary outer parentheses for more idiomatic Go
+	cond = stripOuterParens(cond)
 
 	// Look up comments for this IF statement
 	sig := t.extractConditionSignature("IF", ifStmt.Condition)
@@ -1641,6 +1674,9 @@ func (t *transpiler) transpileWhile(whileStmt *ast.WhileStatement) (string, erro
 	if err != nil {
 		return "", err
 	}
+
+	// Strip unnecessary outer parentheses for more idiomatic Go
+	cond = stripOuterParens(cond)
 
 	// Look up comments for this WHILE statement
 	sig := t.extractConditionSignature("WHILE", whileStmt.Condition)
@@ -2515,6 +2551,34 @@ func stripTableHints(sql string) string {
 	}
 	
 	return result
+}
+
+// stripOuterParens removes a single layer of outer parentheses from an expression
+// if the entire expression is wrapped. This makes if conditions more idiomatic in Go.
+// It handles nested parens correctly by checking balance.
+func stripOuterParens(expr string) string {
+	expr = strings.TrimSpace(expr)
+	if len(expr) < 2 || expr[0] != '(' || expr[len(expr)-1] != ')' {
+		return expr
+	}
+	
+	// Check if the parens are balanced throughout - if we remove outer parens,
+	// the remaining expression should still be valid
+	depth := 0
+	for i := 0; i < len(expr)-1; i++ {
+		if expr[i] == '(' {
+			depth++
+		} else if expr[i] == ')' {
+			depth--
+		}
+		// If depth drops to 0 before the end, the outer parens don't wrap the whole expr
+		if depth == 0 && i < len(expr)-1 {
+			return expr
+		}
+	}
+	
+	// Safe to remove outer parens
+	return expr[1 : len(expr)-1]
 }
 
 // truncateSQL truncates a SQL string for display in comments
