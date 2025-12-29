@@ -124,6 +124,7 @@ type transpiler struct {
 	inTransaction   bool // Track if we're inside a transaction block
 	hasDMLStatements bool // Track if procedure has DML requiring error return
 	usesRowCount    bool // Track if procedure uses @@ROWCOUNT
+	usesTempTables  bool // Track if procedure uses temp tables (#tables)
 	
 	// Annotation level: none, minimal, standard, verbose
 	annotateLevel string
@@ -871,6 +872,14 @@ func (t *transpiler) transpileCreateProcedure(proc *ast.CreateProcedureStatement
 		out.WriteString("var rowsAffected int32\n")
 	}
 
+	// Pre-scan for temp table usage
+	t.usesTempTables = t.blockUsesTempTables(proc.Body)
+	if t.usesTempTables {
+		out.WriteString(t.indentStr())
+		out.WriteString("tempTables := tsqlruntime.NewTempTableManager()\n")
+		t.imports["github.com/ha1tch/tgpiler/tsqlruntime"] = true
+	}
+
 	// Body
 	t.inProcBody = true
 	if proc.Body != nil {
@@ -908,7 +917,7 @@ func (t *transpiler) transpileCreateProcedure(proc *ast.CreateProcedureStatement
 				var suppressBuilder strings.Builder
 				suppressBuilder.WriteString("\n")
 				suppressBuilder.WriteString(t.indentStr())
-				suppressBuilder.WriteString("// Suppress unused variable warnings\n")
+				suppressBuilder.WriteString("// Unused variables in this scope\n")
 				for _, varName := range unusedVars {
 					suppressBuilder.WriteString(t.indentStr())
 					suppressBuilder.WriteString(fmt.Sprintf("_ = %s\n", varName))
@@ -922,7 +931,7 @@ func (t *transpiler) transpileCreateProcedure(proc *ast.CreateProcedureStatement
 			// Block doesn't end with return - emit at end as before
 			out.WriteString("\n")
 			out.WriteString(t.indentStr())
-			out.WriteString("// Suppress unused variable warnings\n")
+			out.WriteString("// Unused variables in this scope\n")
 			for _, varName := range unusedVars {
 				out.WriteString(t.indentStr())
 				out.WriteString(fmt.Sprintf("_ = %s\n", varName))
@@ -971,7 +980,7 @@ func (t *transpiler) transpileCreateFunction(fn *ast.CreateFunctionStatement) (s
 	}
 
 	// Determine return type
-	returnType := "interface{}"
+	returnType := "any"
 	if fn.ReturnType != nil {
 		var err error
 		returnType, err = t.mapDataType(fn.ReturnType)
@@ -1045,7 +1054,7 @@ func (t *transpiler) transpileCreateFunction(fn *ast.CreateFunctionStatement) (s
 				var suppressBuilder strings.Builder
 				suppressBuilder.WriteString("\n")
 				suppressBuilder.WriteString(t.indentStr())
-				suppressBuilder.WriteString("// Suppress unused variable warnings\n")
+				suppressBuilder.WriteString("// Unused variables in this scope\n")
 				for _, varName := range unusedVars {
 					suppressBuilder.WriteString(t.indentStr())
 					suppressBuilder.WriteString(fmt.Sprintf("_ = %s\n", varName))
@@ -1057,7 +1066,7 @@ func (t *transpiler) transpileCreateFunction(fn *ast.CreateFunctionStatement) (s
 		} else {
 			out.WriteString("\n")
 			out.WriteString(t.indentStr())
-			out.WriteString("// Suppress unused variable warnings\n")
+			out.WriteString("// Unused variables in this scope\n")
 			for _, varName := range unusedVars {
 				out.WriteString(t.indentStr())
 				out.WriteString(fmt.Sprintf("_ = %s\n", varName))
@@ -1208,6 +1217,58 @@ func (t *transpiler) expressionUsesRowCount(expr ast.Expression) bool {
 	}
 }
 
+// blockUsesTempTables checks if a block contains temp table operations (#table)
+func (t *transpiler) blockUsesTempTables(block *ast.BeginEndBlock) bool {
+	if block == nil {
+		return false
+	}
+	for _, stmt := range block.Statements {
+		if t.statementUsesTempTables(stmt) {
+			return true
+		}
+	}
+	return false
+}
+
+// statementUsesTempTables checks if a statement uses temp tables
+func (t *transpiler) statementUsesTempTables(stmt ast.Statement) bool {
+	switch s := stmt.(type) {
+	case *ast.CreateTableStatement:
+		tableName := s.Name.String()
+		return strings.HasPrefix(tableName, "#")
+	case *ast.DropTableStatement:
+		for _, table := range s.Tables {
+			tableName := table.String()
+			if strings.HasPrefix(tableName, "#") {
+				return true
+			}
+		}
+		return false
+	case *ast.IfStatement:
+		if t.statementUsesTempTables(s.Consequence) {
+			return true
+		}
+		if s.Alternative != nil && t.statementUsesTempTables(s.Alternative) {
+			return true
+		}
+		return false
+	case *ast.WhileStatement:
+		return t.statementUsesTempTables(s.Body)
+	case *ast.BeginEndBlock:
+		return t.blockUsesTempTables(s)
+	case *ast.TryCatchStatement:
+		if s.TryBlock != nil && t.blockUsesTempTables(s.TryBlock) {
+			return true
+		}
+		if s.CatchBlock != nil && t.blockUsesTempTables(s.CatchBlock) {
+			return true
+		}
+		return false
+	default:
+		return false
+	}
+}
+
 // procedureHasReturn checks if a procedure has any RETURN statements with values.
 func (t *transpiler) procedureHasReturn(proc *ast.CreateProcedureStatement) bool {
 	if proc.Body == nil {
@@ -1317,13 +1378,12 @@ func (t *transpiler) buildReturnStatement(returnValue ast.Expression) string {
 // buildErrorReturn generates a return statement with error for error handling.
 // Handles TRY/CATCH blocks specially since they're inside anonymous functions.
 func (t *transpiler) buildErrorReturn() string {
-	// In TRY block, we're inside an anonymous func() - cannot return values
-	// Panic with error to let defer/recover catch it
+	// In TRY block, we're inside an anonymous func() error - return the error
 	if t.inTryBlock {
-		return "panic(err)"
+		return "return err"
 	}
 	
-	// In CATCH block, we're inside a defer func - cannot return values
+	// In CATCH block, we're inside an if block - cannot return from outer func
 	// Use _ = err to acknowledge error but continue
 	if t.inCatchBlock {
 		return "_ = err // Operation failed in error handler"
@@ -1513,7 +1573,37 @@ func (t *transpiler) transpileSet(set *ast.SetStatement) (string, error) {
 		valExpr = t.ensureBool(set.Value, valExpr)
 	}
 
-	// Skip self-assignments (e.g., SET @x = ISNULL(@x, 0) for value types becomes x = x)
+	// Detect SET @var = ISNULL(@var, default) pattern
+	// This pattern sets a default value when the variable is NULL (from a failed SELECT)
+	if fc, ok := set.Value.(*ast.FunctionCall); ok {
+		funcName := strings.ToUpper(fc.Function.String())
+		if (funcName == "ISNULL" || funcName == "COALESCE") && len(fc.Arguments) == 2 {
+			// Check if first arg is the same variable
+			if firstArg, ok := fc.Arguments[0].(*ast.Variable); ok {
+				firstArgName := goIdentifier(firstArg.Name)
+				if firstArgName == varExpr {
+					// This is SET @var = ISNULL(@var, default)
+					// Generate code that sets default when previous query returned no rows
+					defaultExpr, err := t.transpileExpression(fc.Arguments[1])
+					if err != nil {
+						return "", err
+					}
+					// Convert default to appropriate type
+					if varType != nil && varType.isBool {
+						defaultExpr = t.ensureBool(fc.Arguments[1], defaultExpr)
+					} else if varType != nil && varType.isDecimal {
+						defaultExpr = t.ensureDecimal(fc.Arguments[1], defaultExpr)
+					}
+					// Generate: if err == sql.ErrNoRows { varExpr = defaultExpr }
+					t.imports["database/sql"] = true
+					return fmt.Sprintf("%sif err == sql.ErrNoRows {\n%s\t%s = %s\n%s}",
+						prefix, t.indentStr(), varExpr, defaultExpr, t.indentStr()), nil
+				}
+			}
+		}
+	}
+
+	// Skip self-assignments (e.g., SET @x = @x)
 	if varExpr == valExpr {
 		return fmt.Sprintf("%s// SET %s = %s (no-op, skipped)", prefix, varExpr, valExpr), nil
 	}
@@ -1562,8 +1652,11 @@ func (t *transpiler) transpileIf(ifStmt *ast.IfStatement) (string, error) {
 	out.WriteString(conseq)
 	// Emit unused variable suppression for this scope before popping
 	unusedVars := t.symbols.getUnusedVars()
-	for _, v := range unusedVars {
-		out.WriteString(t.indentStr() + "_ = " + v + "\n")
+	if len(unusedVars) > 0 {
+		out.WriteString(t.indentStr() + "// Unused variables in this scope\n")
+		for _, v := range unusedVars {
+			out.WriteString(t.indentStr() + "_ = " + v + "\n")
+		}
 	}
 	t.symbols = savedSymbols // Pop scope
 	t.indent--
@@ -1597,8 +1690,11 @@ func (t *transpiler) transpileIf(ifStmt *ast.IfStatement) (string, error) {
 		out.WriteString(alt)
 		// Emit unused variable suppression for else scope before popping
 		unusedVars = t.symbols.getUnusedVars()
-		for _, v := range unusedVars {
-			out.WriteString(t.indentStr() + "_ = " + v + "\n")
+		if len(unusedVars) > 0 {
+			out.WriteString(t.indentStr() + "// Unused variables in this scope\n")
+			for _, v := range unusedVars {
+				out.WriteString(t.indentStr() + "_ = " + v + "\n")
+			}
 		}
 		t.symbols = savedSymbols // Pop scope
 		t.indent--
@@ -1699,8 +1795,11 @@ func (t *transpiler) transpileWhile(whileStmt *ast.WhileStatement) (string, erro
 	out.WriteString(body)
 	// Emit unused variable suppression for loop scope before popping
 	unusedVars := t.symbols.getUnusedVars()
-	for _, v := range unusedVars {
-		out.WriteString(t.indentStr() + "_ = " + v + "\n")
+	if len(unusedVars) > 0 {
+		out.WriteString(t.indentStr() + "// Unused variables in this scope\n")
+		for _, v := range unusedVars {
+			out.WriteString(t.indentStr() + "_ = " + v + "\n")
+		}
 	}
 	t.symbols = savedSymbols // Pop scope
 	t.indent--
@@ -1732,27 +1831,65 @@ func (t *transpiler) transpileTryCatch(tc *ast.TryCatchStatement) (string, error
 
 	// Add TODO marker if requested
 	if t.emitTODOs() {
-		out.WriteString("// TODO(tgpiler): TRY/CATCH converted to defer/recover IIFE - verify error semantics\n")
+		out.WriteString("// TODO(tgpiler): TRY/CATCH converted to error-returning IIFE - verify error semantics\n")
 		out.WriteString(t.indentStr())
 	}
 
-	// Use an IIFE with defer/recover to simulate TRY/CATCH
-	out.WriteString("func() {\n")
+	// Use an IIFE that returns error to simulate TRY/CATCH
+	// Pattern: if _tryErr := func() error { TRY; return nil }(); _tryErr != nil { CATCH }
+	out.WriteString("if _tryErr := func() error {\n")
 	t.indent++
 
+	// TRY block - set flag to handle RETURN statements correctly
+	// Push a new scope for the IIFE - variables declared here are in the IIFE scope
+	wasInTryBlock := t.inTryBlock
+	t.inTryBlock = true
+	savedTrySymbols := t.symbols
+	t.symbols = t.symbols.pushScope()
+	
+	if tc.TryBlock != nil {
+		for _, stmt := range tc.TryBlock.Statements {
+			s, err := t.transpileStatement(stmt)
+			if err != nil {
+				return "", err
+			}
+			if s != "" {
+				out.WriteString(t.indentStr())
+				out.WriteString(s)
+				out.WriteString("\n")
+			}
+		}
+	}
+	
+	// Emit suppression for unused variables declared in this scope (inside the IIFE)
+	unusedVars := t.symbols.getUnusedVars()
+	if len(unusedVars) > 0 {
+		out.WriteString(t.indentStr())
+		out.WriteString("// Unused variables in this scope\n")
+		for _, varName := range unusedVars {
+			out.WriteString(t.indentStr())
+			out.WriteString(fmt.Sprintf("_ = %s\n", varName))
+		}
+	}
+	
+	// Pop the TRY block scope
+	t.symbols = savedTrySymbols
+	t.inTryBlock = wasInTryBlock
+
+	// Return nil at end of TRY block (no error)
 	out.WriteString(t.indentStr())
-	out.WriteString("defer func() {\n")
-	t.indent++
+	out.WriteString("return nil\n")
+	t.indent--
 	out.WriteString(t.indentStr())
-	out.WriteString("if _recovered := recover(); _recovered != nil {\n")
+	out.WriteString("}(); _tryErr != nil {\n")
 	t.indent++
 
-	// CATCH block - _recovered contains the panic value if needed
+	// CATCH block - _tryErr contains the error
 	// Set inCatchBlock so we can handle ERROR_* functions and XML building specially
 	wasInCatchBlock := t.inCatchBlock
 	t.inCatchBlock = true
 	
-	// Push a new scope for the defer func - variables declared here are local
+	// Push a new scope for the CATCH block - variables declared here are local
 	savedSymbols := t.symbols
 	t.symbols = t.symbols.pushScope()
 
@@ -1760,7 +1897,7 @@ func (t *transpiler) transpileTryCatch(tc *ast.TryCatchStatement) (string, error
 	if t.dmlEnabled && t.dmlConfig.UseSPLogger {
 		t.imports["github.com/ha1tch/tgpiler/tsqlruntime"] = true
 		out.WriteString(t.indentStr())
-		out.WriteString(fmt.Sprintf("_spErr := tsqlruntime.CaptureError(%q, _recovered, %s)\n",
+		out.WriteString(fmt.Sprintf("_spErr := tsqlruntime.CaptureError(%q, _tryErr, %s)\n",
 			t.currentProcName, t.buildParamsMap()))
 	}
 
@@ -1799,50 +1936,7 @@ func (t *transpiler) transpileTryCatch(tc *ast.TryCatchStatement) (string, error
 
 	t.indent--
 	out.WriteString(t.indentStr())
-	out.WriteString("}\n")
-	t.indent--
-	out.WriteString(t.indentStr())
-	out.WriteString("}()\n")
-
-	// TRY block - set flag to handle RETURN statements correctly
-	// Push a new scope for the IIFE - variables declared here are in the IIFE scope
-	wasInTryBlock := t.inTryBlock
-	t.inTryBlock = true
-	savedTrySymbols := t.symbols
-	t.symbols = t.symbols.pushScope()
-	
-	if tc.TryBlock != nil {
-		for _, stmt := range tc.TryBlock.Statements {
-			s, err := t.transpileStatement(stmt)
-			if err != nil {
-				return "", err
-			}
-			if s != "" {
-				out.WriteString(t.indentStr())
-				out.WriteString(s)
-				out.WriteString("\n")
-			}
-		}
-	}
-	
-	// Emit suppression for unused variables declared in this scope (inside the IIFE)
-	unusedVars := t.symbols.getUnusedVars()
-	if len(unusedVars) > 0 {
-		out.WriteString(t.indentStr())
-		out.WriteString("// Suppress unused variable warnings\n")
-		for _, varName := range unusedVars {
-			out.WriteString(t.indentStr())
-			out.WriteString(fmt.Sprintf("_ = %s\n", varName))
-		}
-	}
-	
-	// Pop the TRY block scope
-	t.symbols = savedTrySymbols
-	t.inTryBlock = wasInTryBlock
-
-	t.indent--
-	out.WriteString(t.indentStr())
-	out.WriteString("}()")
+	out.WriteString("}")
 
 	return out.String(), nil
 }
@@ -1868,7 +1962,7 @@ func (t *transpiler) buildParamsMap() string {
 		return "nil"
 	}
 
-	return "map[string]interface{}{" + strings.Join(parts, ", ") + "}"
+	return "map[string]any{" + strings.Join(parts, ", ") + "}"
 }
 
 // isErrorLoggingInsert checks if an INSERT is an error logging pattern
@@ -1925,14 +2019,14 @@ func (t *transpiler) isXMLParameterDeclare(decl *ast.DeclareStatement) bool {
 }
 
 func (t *transpiler) transpileReturn(ret *ast.ReturnStatement) (string, error) {
-	// Inside a TRY block (anonymous function), just return to exit the IIFE
+	// Inside a TRY block (error-returning IIFE), return nil to exit successfully
 	// The actual return values are set via named return parameters
 	if t.inTryBlock {
-		return "return", nil
+		return "return nil", nil
 	}
 	
-	// Inside a CATCH block (defer function), just return to exit the defer
-	// Cannot return values from a defer - values are set via named return params
+	// Inside a CATCH block (after IIFE), just return to exit
+	// Cannot return values here - values are set via named return params
 	if t.inCatchBlock {
 		return "return", nil
 	}
@@ -1980,13 +2074,15 @@ func (t *transpiler) transpileBeginTransaction(s *ast.BeginTransactionStatement)
 	out.WriteString(t.indentStr())
 	out.WriteString("}\n")
 	out.WriteString(t.indentStr())
+	// Safety net for unexpected panics (programmer errors, nil pointers, etc.)
+	// Normal errors flow through explicit returns, not panics
 	out.WriteString("defer func() {\n")
 	out.WriteString(t.indentStr())
 	out.WriteString("\tif p := recover(); p != nil {\n")
 	out.WriteString(t.indentStr())
-	out.WriteString("\t\ttx.Rollback()\n")
+	out.WriteString("\t\t_ = tx.Rollback() // Safety rollback on unexpected panic\n")
 	out.WriteString(t.indentStr())
-	out.WriteString("\t\tpanic(p)\n")
+	out.WriteString("\t\tpanic(p) // Re-panic after rollback\n")
 	out.WriteString(t.indentStr())
 	out.WriteString("\t}\n")
 	out.WriteString(t.indentStr())
@@ -2197,8 +2293,8 @@ func (t *transpiler) transpileSubqueryExpression(subq *ast.SubqueryExpression) (
 	}
 	
 	// Generate an anonymous function that executes and returns the result
-	return fmt.Sprintf("func() interface{} {\n"+
-		"\t\tvar result interface{}\n"+
+	return fmt.Sprintf("func() any {\n"+
+		"\t\tvar result any\n"+
 		"\t\t_ = %s.QueryRowContext(ctx, %q%s).Scan(&result)\n"+
 		"\t\treturn result\n"+
 		"\t}()", t.dmlConfig.StoreVar, substitutedSQL, argsStr), nil

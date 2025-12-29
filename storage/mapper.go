@@ -39,6 +39,7 @@ type ResultMapping struct {
 	ResultSetIndex  int    // Which result set (0-indexed)
 	NestedFieldName string // If response wraps a nested message, the field name (e.g., "customer")
 	NestedTypeName  string // If response wraps a nested message, the type name (e.g., "Customer")
+	IsRepeated      bool   // If true, response field is repeated (requires Query + loop, not QueryRow)
 	FieldMappings   []FieldMapping
 }
 
@@ -381,15 +382,27 @@ func (m *ProtoToSQLMapper) mapResults(method *ProtoMethodInfo, proc *Procedure) 
 	}
 
 	// Build lookup of proto fields
-	// First check if response has a single nested message field (common pattern)
-	// e.g., GetCustomerResponse { Customer customer = 1; }
+	// Check for nested message field patterns:
+	// 1. Single message: GetCustomerResponse { Customer customer = 1; }
+	// 2. Repeated message: ListCustomersResponse { repeated Customer customers = 1; }
+	// 3. Repeated + extras: GetActivityLogResponse { repeated Entry entries = 1; int32 total = 2; }
 	protoFields := make(map[string]*ProtoFieldInfo)
 	nestedMsgName := ""
 	
-	if len(respMsg.Fields) == 1 && !isScalarType(respMsg.Fields[0].ProtoType) {
-		// Single nested message field - look up that message's fields
-		nestedType := respMsg.Fields[0].ProtoType
-		nestedMsgName = respMsg.Fields[0].Name
+	// Find the first non-scalar field (message type) - this is typically the main result
+	var primaryField *ProtoFieldInfo
+	for i := range respMsg.Fields {
+		field := &respMsg.Fields[i]
+		if !isScalarType(field.ProtoType) {
+			primaryField = field
+			break
+		}
+	}
+	
+	if primaryField != nil {
+		// Found a message field - look up its fields for mapping
+		nestedType := primaryField.ProtoType
+		nestedMsgName = primaryField.Name
 		if nestedMsg, ok := m.proto.AllMessages[nestedType]; ok {
 			for i := range nestedMsg.Fields {
 				field := &nestedMsg.Fields[i]
@@ -398,6 +411,7 @@ func (m *ProtoToSQLMapper) mapResults(method *ProtoMethodInfo, proc *Procedure) 
 			}
 			rm.NestedFieldName = nestedMsgName
 			rm.NestedTypeName = nestedType
+			rm.IsRepeated = primaryField.IsRepeated
 		}
 	}
 	

@@ -153,13 +153,12 @@ func (dt *dmlTranspiler) emitResultHandling(out *strings.Builder, comment string
 // buildErrorReturn generates a return statement with error for DML operations
 // In CATCH blocks (defer func), cannot return values - operations fail silently
 func (dt *dmlTranspiler) buildErrorReturn() string {
-	// In TRY block, we're inside an anonymous func() - cannot return values
-	// Panic with error to let defer/recover catch it
+	// In TRY block, we're inside an anonymous func() error - return the error
 	if dt.transpiler.inTryBlock {
-		return "panic(err)"
+		return "return err"
 	}
 	
-	// In CATCH block, we're inside a defer func - cannot return values
+	// In CATCH block, we're inside an if block - cannot return from outer func
 	// Use _ = err to acknowledge error but continue
 	if dt.transpiler.inCatchBlock {
 		return "_ = err // Operation failed in error handler"
@@ -354,7 +353,21 @@ func (dt *dmlTranspiler) transpileSelectIntoVars(s *ast.SelectStatement, assignm
 	out.WriteString(dt.buildErrorReturn())
 	out.WriteString("\n")
 	out.WriteString(dt.indentStr())
-	out.WriteString("}")
+	out.WriteString("}\n")
+	
+	// Update rowsAffected for @@ROWCOUNT support
+	if dt.usesRowCount {
+		out.WriteString(dt.indentStr())
+		out.WriteString("if err == nil {\n")
+		out.WriteString(dt.indentStr())
+		out.WriteString("\trowsAffected = 1\n")
+		out.WriteString(dt.indentStr())
+		out.WriteString("} else {\n")
+		out.WriteString(dt.indentStr())
+		out.WriteString("\trowsAffected = 0\n")
+		out.WriteString(dt.indentStr())
+		out.WriteString("}")
+	}
 
 	return out.String(), nil
 }
@@ -511,7 +524,7 @@ func (dt *dmlTranspiler) transpileSelectInline(s *ast.SelectStatement) (string, 
 	var out strings.Builder
 	out.WriteString(fmt.Sprintf("query := %q\n", query))
 	out.WriteString(dt.indentStr())
-	out.WriteString("args := []interface{}{")
+	out.WriteString("args := []any{")
 	out.WriteString(strings.Join(args, ", "))
 	out.WriteString("}\n")
 	out.WriteString(dt.indentStr())
@@ -1486,10 +1499,14 @@ func (dt *dmlTranspiler) transpileWithDelete(ws *ast.WithStatement, del *ast.Del
 }
 
 // substituteVariablesInQuery replaces @variable references with parameter placeholders
+// Same variable appearing multiple times reuses the same placeholder number.
 func (dt *dmlTranspiler) substituteVariablesInQuery(query string) (string, []string) {
 	var args []string
 	var result strings.Builder
 	paramIndex := 1 // Start at 1 for the existing getPlaceholder
+	
+	// Track variable -> placeholder index mapping for reuse
+	varToPlaceholder := make(map[string]int)
 	
 	pos := 0
 	inSingleQuote := false
@@ -1535,12 +1552,23 @@ func (dt *dmlTranspiler) substituteVariablesInQuery(query string) (string, []str
 				
 				varName := query[pos+1 : end]
 				goVar := goIdentifier(varName)
+				varKey := strings.ToLower(varName) // Case-insensitive lookup
 				
-				// Generate placeholder based on dialect
-				placeholder := dt.getPlaceholder(paramIndex)
-				result.WriteString(placeholder)
-				args = append(args, goVar)
-				paramIndex++
+				// Check if we've seen this variable before
+				if existingIdx, seen := varToPlaceholder[varKey]; seen {
+					// Reuse existing placeholder
+					placeholder := dt.getPlaceholder(existingIdx)
+					result.WriteString(placeholder)
+				} else {
+					// New variable - assign next placeholder
+					placeholder := dt.getPlaceholder(paramIndex)
+					result.WriteString(placeholder)
+					varToPlaceholder[varKey] = paramIndex
+					args = append(args, goVar)
+					// Mark variable as used (read) for unused variable detection
+					dt.symbols.markUsed(goVar)
+					paramIndex++
+				}
 				
 				pos = end
 				continue
@@ -2255,9 +2283,9 @@ func (dt *dmlTranspiler) recordTempTable(name string) {
 
 func (dt *dmlTranspiler) buildSelectQuery(s *ast.SelectStatement) (string, []string) {
 	// Build dialect-appropriate SELECT query
+	// NOTE: This function does NOT substitute @variables - it preserves them
+	// for substituteVariablesInQuery to handle in one coordinated pass
 	var query strings.Builder
-	var args []string
-	argNum := 1
 
 	query.WriteString("SELECT ")
 
@@ -2285,15 +2313,14 @@ func (dt *dmlTranspiler) buildSelectQuery(s *ast.SelectStatement) (string, []str
 		query.WriteString(strings.Join(tables, ", "))
 	}
 
-	// WHERE
+	// WHERE - preserve @variables, don't substitute yet
 	if s.Where != nil {
 		query.WriteString(" WHERE ")
-		whereSQL, whereArgs := dt.buildWhereClause(s.Where, &argNum)
-		query.WriteString(whereSQL)
-		args = append(args, whereArgs...)
+		query.WriteString(s.Where.String())
 	}
 
-	return stripTableHints(query.String()), args
+	// No args returned - all substitution done by substituteVariablesInQuery
+	return stripTableHints(query.String()), nil
 }
 
 func (dt *dmlTranspiler) buildInsertQuery(s *ast.InsertStatement) (string, []string) {
@@ -2512,63 +2539,67 @@ func (dt *dmlTranspiler) exprContainsColumnRef(expr ast.Expression) bool {
 
 // buildSQLExprWithPlaceholders builds a SQL expression string, replacing only variables with placeholders
 func (dt *dmlTranspiler) buildSQLExprWithPlaceholders(expr ast.Expression, argNum *int) (string, []string) {
+	// Legacy wrapper without tracking - each call gets fresh tracker
+	pt := &paramTracker{nextNum: *argNum, varToNum: make(map[string]int), args: nil}
+	sql := dt.buildSQLExprTracked(expr, pt)
+	*argNum = pt.nextNum
+	return sql, pt.args
+}
+
+// buildSQLExprTracked builds a SQL expression with parameter tracking for variable deduplication
+func (dt *dmlTranspiler) buildSQLExprTracked(expr ast.Expression, pt *paramTracker) string {
 	if expr == nil {
-		return "", nil
+		return ""
 	}
-	
-	var args []string
 	
 	switch e := expr.(type) {
 	case *ast.Variable:
-		// Replace variable with placeholder
-		placeholder := dt.getPlaceholder(*argNum)
-		*argNum++
-		varName := goIdentifier(strings.TrimPrefix(e.Name, "@"))
-		args = append(args, varName)
-		return placeholder, args
+		// Replace variable with placeholder, reusing if seen before
+		varName := strings.TrimPrefix(e.Name, "@")
+		goVarName := goIdentifier(varName)
+		num, isNew := pt.getOrAssign(varName)
+		if isNew {
+			pt.addArg(goVarName)
+			// Mark variable as used (read) for unused variable detection
+			dt.symbols.markUsed(goVarName)
+		}
+		return dt.getPlaceholder(num)
 		
 	case *ast.Identifier:
-		// Keep column name as-is
-		return e.Value, nil
+		return e.Value
 		
 	case *ast.QualifiedIdentifier:
-		return e.String(), nil
+		return e.String()
 		
 	case *ast.IntegerLiteral:
-		return fmt.Sprintf("%d", e.Value), nil
+		return fmt.Sprintf("%d", e.Value)
 		
 	case *ast.FloatLiteral:
-		return fmt.Sprintf("%v", e.Value), nil
+		return fmt.Sprintf("%v", e.Value)
 		
 	case *ast.StringLiteral:
-		return fmt.Sprintf("'%s'", e.Value), nil
+		return fmt.Sprintf("'%s'", e.Value)
 		
 	case *ast.InfixExpression:
-		leftSQL, leftArgs := dt.buildSQLExprWithPlaceholders(e.Left, argNum)
-		rightSQL, rightArgs := dt.buildSQLExprWithPlaceholders(e.Right, argNum)
-		args = append(args, leftArgs...)
-		args = append(args, rightArgs...)
-		return fmt.Sprintf("%s %s %s", leftSQL, e.Operator, rightSQL), args
+		leftSQL := dt.buildSQLExprTracked(e.Left, pt)
+		rightSQL := dt.buildSQLExprTracked(e.Right, pt)
+		return fmt.Sprintf("%s %s %s", leftSQL, e.Operator, rightSQL)
 		
 	case *ast.PrefixExpression:
-		rightSQL, rightArgs := dt.buildSQLExprWithPlaceholders(e.Right, argNum)
-		args = append(args, rightArgs...)
-		return fmt.Sprintf("%s%s", e.Operator, rightSQL), args
+		rightSQL := dt.buildSQLExprTracked(e.Right, pt)
+		return fmt.Sprintf("%s%s", e.Operator, rightSQL)
 		
 	case *ast.FunctionCall:
-		// Function call - keep function name, process arguments
 		var funcArgs []string
 		for _, arg := range e.Arguments {
-			argSQL, argArgs := dt.buildSQLExprWithPlaceholders(arg, argNum)
+			argSQL := dt.buildSQLExprTracked(arg, pt)
 			funcArgs = append(funcArgs, argSQL)
-			args = append(args, argArgs...)
 		}
 		funcName := e.Function.String()
-		return fmt.Sprintf("%s(%s)", funcName, strings.Join(funcArgs, ", ")), args
+		return fmt.Sprintf("%s(%s)", funcName, strings.Join(funcArgs, ", "))
 	}
 	
-	// Fallback - use string representation
-	return expr.String(), nil
+	return expr.String()
 }
 
 func (dt *dmlTranspiler) buildDeleteQuery(s *ast.DeleteStatement) (string, []string) {
@@ -2593,35 +2624,79 @@ func (dt *dmlTranspiler) buildDeleteQuery(s *ast.DeleteStatement) (string, []str
 }
 
 func (dt *dmlTranspiler) buildWhereClause(expr ast.Expression, argNum *int) (string, []string) {
-	var args []string
+	// Legacy wrapper - create a tracker and use the new implementation
+	pt := &paramTracker{nextNum: *argNum, varToNum: make(map[string]int), args: nil}
+	sql := dt.buildWhereClauseTracked(expr, pt)
+	*argNum = pt.nextNum
+	return sql, pt.args
+}
 
+func (dt *dmlTranspiler) buildWhereClauseTracked(expr ast.Expression, pt *paramTracker) string {
 	switch e := expr.(type) {
 	case *ast.InfixExpression:
 		op := strings.ToUpper(e.Operator)
 		if op == "AND" || op == "OR" {
-			leftSQL, leftArgs := dt.buildWhereClause(e.Left, argNum)
-			rightSQL, rightArgs := dt.buildWhereClause(e.Right, argNum)
-			args = append(args, leftArgs...)
-			args = append(args, rightArgs...)
-			return fmt.Sprintf("(%s %s %s)", leftSQL, op, rightSQL), args
+			leftSQL := dt.buildWhereClauseTracked(e.Left, pt)
+			rightSQL := dt.buildWhereClauseTracked(e.Right, pt)
+			return fmt.Sprintf("(%s %s %s)", leftSQL, op, rightSQL)
 		}
 
 		// column op @variable
 		left := dt.exprToString(e.Left)
 		if v, ok := e.Right.(*ast.Variable); ok {
-			placeholder := dt.getPlaceholder(*argNum)
-			*argNum++
-			varName := goIdentifier(strings.TrimPrefix(v.Name, "@"))
-			args = append(args, varName)
-			return fmt.Sprintf("%s %s %s", left, e.Operator, placeholder), args
+			varName := strings.TrimPrefix(v.Name, "@")
+			goVarName := goIdentifier(varName)
+			num, isNew := pt.getOrAssign(varName)
+			if isNew {
+				pt.addArg(goVarName)
+				// Mark variable as used (read) for unused variable detection
+				dt.symbols.markUsed(goVarName)
+			}
+			placeholder := dt.getPlaceholder(num)
+			return fmt.Sprintf("%s %s %s", left, e.Operator, placeholder)
 		}
 
 		// column op literal
 		right := dt.exprToString(e.Right)
-		return fmt.Sprintf("%s %s %s", left, e.Operator, right), args
+		return fmt.Sprintf("%s %s %s", left, e.Operator, right)
 	}
 
-	return dt.exprToString(expr), args
+	return dt.exprToString(expr)
+}
+
+// paramTracker tracks variable-to-placeholder mappings to ensure
+// the same variable uses the same placeholder number throughout a query.
+type paramTracker struct {
+	nextNum      int            // Next placeholder number to assign
+	varToNum     map[string]int // Variable name (lowercase) -> placeholder number
+	args         []string       // Ordered list of Go variable names for arguments
+}
+
+// newParamTracker creates a new parameter tracker starting at placeholder 1
+func newParamTracker() *paramTracker {
+	return &paramTracker{
+		nextNum:  1,
+		varToNum: make(map[string]int),
+		args:     nil,
+	}
+}
+
+// getOrAssign returns the placeholder number for a variable, assigning a new one if needed.
+// Returns the placeholder number and whether this is a new variable (requiring an arg).
+func (pt *paramTracker) getOrAssign(varName string) (int, bool) {
+	key := strings.ToLower(varName)
+	if num, exists := pt.varToNum[key]; exists {
+		return num, false
+	}
+	num := pt.nextNum
+	pt.varToNum[key] = num
+	pt.nextNum++
+	return num, true
+}
+
+// addArg adds a Go variable name to the argument list
+func (pt *paramTracker) addArg(goVarName string) {
+	pt.args = append(pt.args, goVarName)
 }
 
 func (dt *dmlTranspiler) getPlaceholder(n int) string {
@@ -2941,7 +3016,10 @@ func (dt *dmlTranspiler) exprToGoValue(expr ast.Expression) string {
 	}
 	switch e := expr.(type) {
 	case *ast.Variable:
-		return goIdentifier(strings.TrimPrefix(e.Name, "@"))
+		goVar := goIdentifier(strings.TrimPrefix(e.Name, "@"))
+		// Mark variable as used (read) for unused variable detection
+		dt.symbols.markUsed(goVar)
+		return goVar
 	case *ast.IntegerLiteral:
 		return fmt.Sprintf("%d", e.Value)
 	case *ast.FloatLiteral:
@@ -3427,9 +3505,9 @@ func (dt *dmlTranspiler) generateScanTargets(columns []selectColumn) (string, st
 		}
 		
 		// First, try to infer type from the actual expression
-		goType := "interface{}"
+		goType := "any"
 		if col.expression != nil {
-			if ti := dt.transpiler.inferType(col.expression); ti != nil && ti.goType != "" && ti.goType != "interface{}" {
+			if ti := dt.transpiler.inferType(col.expression); ti != nil && ti.goType != "" && ti.goType != "any" {
 				goType = ti.goType
 				// Add imports if needed
 				if ti.goType == "decimal.Decimal" {
@@ -3441,7 +3519,7 @@ func (dt *dmlTranspiler) generateScanTargets(columns []selectColumn) (string, st
 		}
 		
 		// If expression-based inference didn't work, fall back to name heuristics
-		if goType == "interface{}" {
+		if goType == "any" {
 			lowerName := strings.ToLower(col.name)
 			switch {
 			case strings.HasSuffix(lowerName, "id"):

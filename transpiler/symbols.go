@@ -116,7 +116,7 @@ func (st *symbolTable) getUnusedVars() []string {
 // typeInfoFromDataType creates typeInfo from a T-SQL DataType.
 func typeInfoFromDataType(dt *ast.DataType) *typeInfo {
 	if dt == nil {
-		return &typeInfo{goType: "interface{}"}
+		return &typeInfo{goType: "any"}
 	}
 
 	goType, isDecimal, isNumeric, isString, isDateTime, isBool := classifyDataType(dt)
@@ -156,7 +156,7 @@ func classifyDataType(dt *ast.DataType) (goType string, isDecimal, isNumeric, is
 	case "UNIQUEIDENTIFIER", "XML":
 		return "string", false, false, true, false, false
 	default:
-		return "interface{}", false, false, false, false, false
+		return "any", false, false, false, false, false
 	}
 }
 

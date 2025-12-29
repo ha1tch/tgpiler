@@ -535,7 +535,7 @@ func (t *transpiler) inferType(expr ast.Expression) *typeInfo {
 	case *ast.StringLiteral:
 		return &typeInfo{goType: "string", isString: true}
 	case *ast.NullLiteral:
-		return &typeInfo{goType: "interface{}"}
+		return &typeInfo{goType: "any"}
 	case *ast.MoneyLiteral:
 		return &typeInfo{goType: "decimal.Decimal", isDecimal: true, isNumeric: true}
 	case *ast.PrefixExpression:
@@ -630,11 +630,11 @@ func (t *transpiler) inferType(expr ast.Expression) *typeInfo {
 		case "exist":
 			return &typeInfo{goType: "bool", isBool: true}
 		case "nodes":
-			return &typeInfo{goType: "[]map[string]interface{}"}
+			return &typeInfo{goType: "[]map[string]any"}
 		case "modify":
 			return &typeInfo{goType: "string", isString: true}
 		default:
-			return &typeInfo{goType: "interface{}"}
+			return &typeInfo{goType: "any"}
 		}
 	case *ast.CaseExpression:
 		// CASE expression type is determined by the result expressions
@@ -656,7 +656,7 @@ func (t *transpiler) inferType(expr ast.Expression) *typeInfo {
 	}
 
 	// Default: unknown type
-	return &typeInfo{goType: "interface{}"}
+	return &typeInfo{goType: "any"}
 }
 
 // inferFunctionReturnType returns type info for known T-SQL functions.
@@ -683,7 +683,7 @@ func (t *transpiler) inferFunctionReturnType(funcName string) *typeInfo {
 		return &typeInfo{goType: "int32", isNumeric: true}
 	// XML functions
 	case "XML_VALUE", "XMLVALUE":
-		return &typeInfo{goType: "interface{}"}
+		return &typeInfo{goType: "any"}
 	case "XML_QUERY", "XMLQUERY":
 		return &typeInfo{goType: "string", isString: true}
 	case "XML_EXIST", "XMLEXIST":
@@ -701,7 +701,7 @@ func (t *transpiler) inferFunctionReturnType(funcName string) *typeInfo {
 		// These need argument type - handled specially in inferType
 		return &typeInfo{goType: "decimal.Decimal", isDecimal: true, isNumeric: true}
 	default:
-		return &typeInfo{goType: "interface{}"}
+		return &typeInfo{goType: "any"}
 	}
 }
 
@@ -724,7 +724,7 @@ func (t *transpiler) inferWindowFunctionType(funcName string, fc *ast.FunctionCa
 				return argType
 			}
 		}
-		return &typeInfo{goType: "interface{}"}
+		return &typeInfo{goType: "any"}
 	
 	// Aggregate functions with OVER - COUNT always returns int64
 	case "COUNT":
@@ -753,7 +753,7 @@ func (t *transpiler) inferWindowFunctionType(funcName string, fc *ast.FunctionCa
 				return argType
 			}
 		}
-		return &typeInfo{goType: "interface{}"}
+		return &typeInfo{goType: "any"}
 	
 	default:
 		// Fall back to regular function type inference
@@ -1052,7 +1052,7 @@ func (t *transpiler) transpileFunctionCall(fc *ast.FunctionCall) (string, error)
 	case "NULLIF":
 		// NULLIF(a, b) -> if a == b { nil } else { a }
 		if len(args) == 2 {
-			return fmt.Sprintf("func() interface{} { if %s == %s { return nil }; return %s }()", args[0], args[1], args[0]), nil
+			return fmt.Sprintf("func() any { if %s == %s { return nil }; return %s }()", args[0], args[1], args[0]), nil
 		}
 
 	case "ABS":
@@ -1187,13 +1187,13 @@ func (t *transpiler) transpileFunctionCall(fc *ast.FunctionCall) (string, error)
 	case "IIF":
 		// IIF(condition, true_value, false_value)
 		if len(args) == 3 {
-			return fmt.Sprintf("func() interface{} { if %s { return %s }; return %s }()", args[0], args[1], args[2]), nil
+			return fmt.Sprintf("func() any { if %s { return %s }; return %s }()", args[0], args[1], args[2]), nil
 		}
 
-	// Error functions for TRY/CATCH - _recovered is set in the CATCH block
+	// Error functions for TRY/CATCH - _tryErr is set in the CATCH block
 	case "ERROR_MESSAGE":
-		t.imports["fmt"] = true
-		return "fmt.Sprintf(\"%v\", _recovered)", nil
+		// _tryErr is the error from the TRY block
+		return "_tryErr.Error()", nil
 
 	case "ERROR_NUMBER":
 		// No direct equivalent in Go - return 0
@@ -1240,7 +1240,7 @@ func (t *transpiler) transpileFunctionCall(fc *ast.FunctionCall) (string, error)
 				if len(parts) >= 2 {
 					tableName := "#" + parts[len(parts)-1]
 					// Return a value that can be null-checked: nil if not exists, 1 if exists
-					return fmt.Sprintf("func() interface{} { if tempTables.TempTableExists(%q) { return 1 }; return nil }()", tableName), nil
+					return fmt.Sprintf("func() any { if tempTables.TempTableExists(%q) { return 1 }; return nil }()", tableName), nil
 				}
 			}
 			// For other objects, generate a comment
@@ -1404,13 +1404,13 @@ func (t *transpiler) inferCaseResultType(c *ast.CaseExpression) string {
 		return t.inferExpressionType(c.ElseClause)
 	}
 	
-	return "interface{}"
+	return "any"
 }
 
 // inferExpressionType returns a Go type string for an expression
 func (t *transpiler) inferExpressionType(expr ast.Expression) string {
 	if expr == nil {
-		return "interface{}"
+		return "any"
 	}
 	
 	switch e := expr.(type) {
@@ -1434,7 +1434,7 @@ func (t *transpiler) inferExpressionType(expr ast.Expression) string {
 			t.imports["github.com/shopspring/decimal"] = true
 			return "decimal.Decimal"
 		}
-		return "interface{}"
+		return "any"
 	case *ast.InfixExpression:
 		// For arithmetic, infer from operands
 		leftType := t.inferExpressionType(e.Left)
@@ -1491,7 +1491,7 @@ func (t *transpiler) inferExpressionType(expr ast.Expression) string {
 		return "bool"
 	}
 	
-	return "interface{}"
+	return "any"
 }
 
 // zeroValueFor returns the zero value for a Go type

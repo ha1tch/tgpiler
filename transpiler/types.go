@@ -58,7 +58,7 @@ func (t *transpiler) mapDataType(dt *ast.DataType) (string, error) {
 	case "XML":
 		return "string", nil
 	case "SQL_VARIANT":
-		return "interface{}", nil
+		return "any", nil
 
 	default:
 		return "", fmt.Errorf("unsupported data type: %s", dt.Name)
